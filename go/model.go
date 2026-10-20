@@ -26,6 +26,38 @@ const (
 	typeDateTime       = "DATE_TIME" // a template key, not an EditType: a DATE field holding a time of day
 )
 
+// fetched names the edit attribute that carries a fetchHandler, by the type that fetches options.
+var fetched = map[string]string{"CHOICE": "choiceType", "MULTI_CHOICE": "multiChoiceType", "TAGS": "tagsType"}
+
+// FieldCode is a field's own code, run by the node when the erupt server invokes it (PROTOCOL.md §5.5) with
+// the form's values. Return Fail(...) to refuse with a message.
+type FieldCode struct {
+	Fetch    func(ctx context.Context, form M) ([]Option, error)               // the options of a CHOICE / MULTI_CHOICE
+	Tags     func(ctx context.Context, form M) ([]string, error)               // the tags of a TAGS
+	Onchange func(ctx context.Context, form M) (Change, error)                 // any field, when its value changes
+	Complete func(ctx context.Context, form M, typed string) ([]string, error) // the suggestions of an AUTO_COMPLETE
+	Click    func(ctx context.Context, form M) (Click, error)                  // a BUTTON
+}
+
+// Option is a fetched option of a CHOICE or MULTI_CHOICE.
+type Option struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// Change is what an onchange does to the form.
+type Change struct {
+	FormData M `json:"formData,omitempty"` // field -> new value
+	EditExpr M `json:"editExpr,omitempty"` // field -> edit expressions
+}
+
+// Click is what a BUTTON does: Eval is run as JavaScript in the browser, so only return code you wrote.
+type Click struct {
+	Eval     string `json:"eval,omitempty"`
+	FormData M      `json:"formData,omitempty"`
+	EditExpr M      `json:"editExpr,omitempty"`
+}
+
 type choice struct{ value, label string }
 
 type field struct {
@@ -38,9 +70,13 @@ type field struct {
 	ref, label, tree              string
 	target                        *Model
 	view, edit                    map[string]any
+	code                          FieldCode
 }
 
 func (f *field) isReference() bool { return f.typ == typeReferenceTable || f.typ == typeReferenceTree }
+
+// isCollection is a field holding many records of another model, stored as the JSON list of their keys.
+func (f *field) isCollection() bool { return f.typ == "CHECKBOX" || f.typ == "TAB_TREE" }
 
 // stored lists the fields a repository keeps, in declaration order: every field but the virtual ones.
 func (m *Model) stored() []*field {
@@ -66,6 +102,8 @@ type Model struct {
 	orderBy     []Order
 	proxies     []DataProxy
 	vis         map[string]view // view code -> what the node applies to that view's table queries
+	linkTree    string          // the reference field a @LinkTree beside the table filters
+	dependNode  bool            // a @LinkTree table shows no rows until a tree node is picked
 }
 
 // view is a @Vis view's own filter and order, run on the node and kept out of the build.
@@ -113,6 +151,7 @@ type modelConfig struct {
 	raw     any
 	edits   map[string]any
 	views   map[string]any
+	codes   map[string]FieldCode
 	ops     []Operation
 	proxies []DataProxy
 }
@@ -146,6 +185,12 @@ func WithFieldEdit(field string, edit any) ModelOption {
 // WithFieldView passes raw @View attributes (an M or a View) for one field.
 func WithFieldView(field string, view any) ModelOption {
 	return func(c *modelConfig) { c.views[field] = view }
+}
+
+// WithFieldCode attaches code to one field: fetched options (a CHOICE, or a slice MULTI_CHOICE, without
+// choices tag), tags, onchange, auto-complete or a button click.
+func WithFieldCode(field string, code FieldCode) ModelOption {
+	return func(c *modelConfig) { c.codes[field] = code }
 }
 
 // WithOperations declares row operations.
@@ -215,8 +260,11 @@ func hook[T any](ctx context.Context, m *Model, h func(DataProxy, context.Contex
 //	type=TEXTAREA         an EditType; otherwise inferred from the Go type
 //	choices=a:A,b:B       a CHOICE field
 //	ref=Category          references a record of another model (registered first); label=name, tree=parent
+//	type=CHECKBOX;ref=Tag records of another model (also TAB_TREE), stored as the JSON list of their keys
+//	type=BUTTON           a form-only button (virtual), its click given by WithFieldCode
 //
-// A slice or map field (MULTI_CHOICE, KEY_VALUE) holds a JSON value, kept as JSON text by SQL repositories.
+// A slice or map field (MULTI_CHOICE, KEY_VALUE) holds a JSON value, kept as JSON text by SQL repositories;
+// a slice field with choices (or a FieldCode.Fetch) is a MULTI_CHOICE.
 // The field name is the json tag name, else the Go field name. Every raw attribute is checked against the
 // erupt annotation schema here, so a misspelt key fails at declaration instead of in the browser.
 func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error) {
@@ -227,7 +275,8 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	if t == nil || t.Kind() != reflect.Struct {
 		return nil, errors.New("erupt: a model is declared with a struct")
 	}
-	cfg := &modelConfig{power: map[string]bool{}, edits: map[string]any{}, views: map[string]any{}}
+	cfg := &modelConfig{power: map[string]bool{}, edits: map[string]any{}, views: map[string]any{},
+		codes: map[string]FieldCode{}}
 	for _, opt := range opts {
 		opt(cfg)
 	}
@@ -263,7 +312,7 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 		if !ok || tag == "-" {
 			continue
 		}
-		f, err := parseField(m.name, sf, tag)
+		f, err := parseField(m.name, sf, tag, cfg.codes)
 		if err != nil {
 			return nil, err
 		}
@@ -279,6 +328,11 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 		}
 		if m.byName[name].edit, err = rawObject(edit, "Edit", m.name+"."+name+".edit"); err != nil {
 			return nil, err
+		}
+	}
+	for name := range cfg.codes {
+		if m.byName[name] == nil {
+			return nil, fmt.Errorf("%s: WithFieldCode names no field '%s'", m.name, name)
 		}
 	}
 	for name, view := range cfg.views {
@@ -311,6 +365,12 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	}
 	if m.orderBy, err = m.parseOrder(cfg.orderBy); err != nil {
 		return nil, err
+	}
+	if lt, _ := m.raw["linkTree"].(map[string]any); lt != nil && str(lt["field"]) != "" {
+		m.linkTree, m.dependNode = str(lt["field"]), lt["dependNode"] == true
+		if f := m.byName[m.linkTree]; f == nil || !f.isReference() {
+			return nil, fmt.Errorf("%s: linkTree.field '%s' must be a reference field", m.name, m.linkTree)
+		}
 	}
 	m.vis = map[string]view{}
 	for code, v := range views {
@@ -376,7 +436,7 @@ func pullVis(raw any, path string) (any, map[string]NodeVis, error) {
 	return v, views, nil
 }
 
-func parseField(model string, sf reflect.StructField, tag string) (*field, error) {
+func parseField(model string, sf reflect.StructField, tag string, codes map[string]FieldCode) (*field, error) {
 	f := &field{name: sf.Name, table: true, form: true, label: "name"}
 	if j := strings.Split(sf.Tag.Get("json"), ",")[0]; j != "" && j != "-" {
 		f.name = j
@@ -428,16 +488,24 @@ func parseField(model string, sf reflect.StructField, tag string) (*field, error
 			return nil, fmt.Errorf("%s: unknown erupt tag '%s'", path, key)
 		}
 	}
+	f.code = codes[f.name]
 	if f.pk {
 		f.typ = ""
 		return f, nil
 	}
-	f.typ = resolveType(f, sf.Type)
 	ft := sf.Type
 	for ft.Kind() == reflect.Pointer {
 		ft = ft.Elem()
 	}
 	f.json = ft.Kind() == reflect.Map || (ft.Kind() == reflect.Slice && ft.Elem().Kind() != reflect.Uint8)
+	f.typ = resolveType(f, sf.Type)
+	f.json = f.json || f.isCollection()
+	f.virtual = f.virtual || f.typ == "BUTTON"
+	c := f.code
+	if (c.Fetch != nil && f.typ != "CHOICE" && f.typ != "MULTI_CHOICE") || (c.Tags != nil && f.typ != "TAGS") ||
+		(c.Complete != nil && f.typ != "AUTO_COMPLETE") || (c.Click != nil && f.typ != "BUTTON") {
+		return nil, fmt.Errorf("%s: Fetch, Tags, Complete and Click belong to CHOICE / MULTI_CHOICE, TAGS, AUTO_COMPLETE and BUTTON", path)
+	}
 	if f.virtual && (f.search || f.sortable || f.notNull) {
 		return nil, fmt.Errorf("%s: a virtual field cannot be searched, sorted or required", path)
 	}
@@ -451,6 +519,9 @@ func parseField(model string, sf reflect.StructField, tag string) (*field, error
 }
 
 func resolveType(f *field, t reflect.Type) string {
+	if f.typ == "CHECKBOX" || f.typ == "TAB_TREE" {
+		return f.typ
+	}
 	if f.ref != "" {
 		if f.tree != "" {
 			return typeReferenceTree
@@ -460,7 +531,10 @@ func resolveType(f *field, t reflect.Type) string {
 	if f.typ != "" {
 		return f.typ
 	}
-	if f.choices != nil {
+	if f.choices != nil || f.code.Fetch != nil {
+		if f.json {
+			return "MULTI_CHOICE"
+		}
 		return "CHOICE"
 	}
 	for t.Kind() == reflect.Pointer {
@@ -522,7 +596,7 @@ func (m *Model) parseOrder(orderBy string) ([]Order, error) {
 // resolve binds reference fields to their target models.
 func (m *Model) resolve(lookup func(string) *Model) error {
 	for _, f := range m.fields {
-		if !f.isReference() {
+		if !f.isReference() && !f.isCollection() {
 			continue
 		}
 		target := lookup(f.ref)
@@ -536,7 +610,7 @@ func (m *Model) resolve(lookup func(string) *Model) error {
 			return fmt.Errorf("%s.%s: %s has no primary key", m.name, f.name, target.name)
 		}
 		keys := []string{f.label}
-		if f.tree != "" {
+		if f.isReference() && f.tree != "" {
 			keys = append(keys, f.tree)
 		}
 		for _, key := range keys {
@@ -569,7 +643,10 @@ func (f *field) build() map[string]any {
 	}
 	efj := tpl["eruptFieldJson"].(map[string]any)
 	edit := efj["edit"].(map[string]any)
-	view := efj["views"].([]any)[0].(map[string]any)
+	view := M{} // a BUTTON is a form element only: its template has no table column
+	if views := efj["views"].([]any); len(views) > 0 {
+		view = views[0].(map[string]any)
+	}
 	edit["title"], edit["notNull"], edit["show"] = f.title, f.notNull, f.form
 	edit["search"].(map[string]any)["value"] = f.search
 	view["title"], view["sortable"] = f.title, f.sortable
@@ -584,6 +661,16 @@ func (f *field) build() map[string]any {
 		tpl["fieldReturnName"] = f.target.name
 		merge(edit["referenceTreeType"].(map[string]any), M{"id": f.target.pk, "label": f.label, "pid": f.tree})
 		view["column"] = f.label
+	case "CHECKBOX", "TAB_TREE":
+		// the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+		tpl["fieldReturnName"] = f.target.name
+		view["column"] = f.label
+	}
+	if attr := fetched[f.typ]; attr != "" && (f.code.Fetch != nil || f.code.Tags != nil) {
+		edit[attr].(map[string]any)["fetchHandler"] = []any{"invoke"}
+	}
+	if f.code.Onchange != nil {
+		edit["onchange"] = "invoke"
 	}
 	merge(edit, f.edit)
 	merge(view, f.view)
@@ -647,6 +734,9 @@ func (f *field) coerce(v any) (any, error) {
 			v = obj[f.target.pk]
 		}
 		return f.target.byName[f.target.pk].coerce(v)
+	}
+	if f.isCollection() {
+		return f.coerceKeys(v)
 	}
 	if v == nil || v == "" {
 		return nil, nil
@@ -720,6 +810,35 @@ func (f *field) coerce(v any) (any, error) {
 		return nil, fmt.Errorf("%s: illegal option '%s'", f.title, s)
 	}
 	return str(v), nil
+}
+
+// coerceKeys turns picked records, [{id: key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), plain keys or their JSON
+// text, into the list of keys stored.
+func (f *field) coerceKeys(v any) (any, error) {
+	if s, ok := v.(string); ok && s != "" {
+		if err := decode([]byte(s), &v); err != nil {
+			return nil, fmt.Errorf("illegal value '%s'", s)
+		}
+	}
+	items, ok := v.([]any)
+	if !ok && v != nil && v != "" {
+		return nil, fmt.Errorf("illegal value '%s'", str(v))
+	}
+	pk := f.target.byName[f.target.pk]
+	keys := make([]any, len(items))
+	for i, item := range items {
+		if obj, ok := item.(map[string]any); ok {
+			if item, ok = obj[f.target.pk]; !ok {
+				item = obj["id"]
+			}
+		}
+		key, err := pk.coerce(item)
+		if err != nil {
+			return nil, err
+		}
+		keys[i] = key
+	}
+	return keys, nil
 }
 
 // jsonValue renders a stored value for the browser.

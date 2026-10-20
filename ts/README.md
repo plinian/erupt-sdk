@@ -132,6 +132,39 @@ model("Task", { /* ... */ }, {
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`erupt.tree` (`{ id: "id", label: "name", pid: "parent" }`) shows the model as a tree, and
+`erupt.linkTree` (`{ field: "category" }`) puts the tree of a reference field beside the table: the erupt server
+builds both trees from the node's table, and the node keeps the rows under the picked tree node
+(`dependNode: true` shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the named factories, `field.of` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores
+the upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR` (all text). `field.button(title,
+click)` is a form-only BUTTON, and `field.checkbox(target, title)` / `field.tabTree(target, title)` hold the
+picked records of `target`, stored as the JSON list of their keys. `field.json` with `choices` (or `fetch`) is a
+`MULTI_CHOICE`.
+
+A field can run its own code (sync or async); the erupt server calls it through the node's `invoke` endpoint
+with the form's values:
+
+```ts
+const Order = model("Order", {
+  id: field.pk(),
+  status: field.choice("Status", {}, { fetch: (form) => ({ new: "New", paid: "Paid" }) }), // options, also TAGS: [...]
+  qty: field.number("Qty", { onchange: (form) => ({ formData: { total: form.qty * 9 }, editExpr: {} }) }),
+  city: field.of("AUTO_COMPLETE", "City", { complete: async (form, typed) => lookup(typed) }),
+  total: field.number("Total"),
+  recalc: field.button("Recalc", (form) => ({ eval: "alert('done')", formData: {} })),
+  tags: field.checkbox(Tag, "Tags"),
+});
+```
+
+`fetch` belongs to `CHOICE` / `MULTI_CHOICE` (`{ value: label }` or pairs) and `TAGS` (a list), `complete` to
+`AUTO_COMPLETE`, `click` to `BUTTON`; `onchange` to any field. Throw `Fail` to refuse with a message.
+
 ## Storage
 
 A `Repository` implements `bind`, `page`, `get`, `add`, `update`, `delete` (sync or async). `page` must apply
@@ -172,8 +205,8 @@ its local fields, which is how pg and mysql2 build it from a column without a ti
 `options: { useUTC: false }`, since it builds them in UTC by default. Numbers that drivers return as text or bigint (pg
 `bigint` / `numeric`) come back as numbers when they are exact.
 
-Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload,
-Excel, i18n of messages.
+Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of reference tables, i18n of messages. Trees, file
+upload and Excel are done by the erupt server.
 
 ## Without a registry
 

@@ -119,6 +119,31 @@ module NodeFixture
     field :owner, "Owner"
     field :done, "Done", :boolean
   end
+
+  class Doc
+    extend Erupt::Model
+    erupt "Doc", linkTree: { field: "topic", dependNode: true }
+    field :id, pk: true
+    field :title, "Title"
+    field :topic, "Topic", Category, tree: :parent
+  end
+
+  class Order
+    extend Erupt::Model
+    erupt "Order"
+    field :id, pk: true
+    field :status, "Status", fetch: ->(form) { { new: "New", (form["note"] || "x") => "From form" } }
+    field :tags, "Tags", type: Erupt::EditType::TAGS, fetch: ->(_form) { %w[red blue] }
+    field :qty, "Qty", Integer, onchange: ->(form) { { formData: { note: "#{form["qty"]} items" } } }
+    field :note, "Note"
+    field :city, "City", type: Erupt::EditType::AUTO_COMPLETE, complete: ->(_form, typed) { %w[Paris Tokyo].select { |c| c.downcase.include?(typed.downcase) } }
+    field :body, "Body", type: Erupt::EditType::MARKDOWN
+    field :files, "Files", type: Erupt::EditType::ATTACHMENT
+    field :cats, "Categories", Array, type: Erupt::EditType::CHECKBOX, ref: Category
+    field :sections, "Sections", Array, type: Erupt::EditType::TAB_TREE, ref: Category
+    field :calc, "Calc", type: Erupt::EditType::BUTTON, click: ->(_form) { { eval: "alert(1)", formData: { qty: 2 } } }
+    field :stop, "Stop", type: Erupt::EditType::BUTTON, click: ->(_form) { raise Erupt::Fail, "not now" }
+  end
 end
 
 class NodeTest < Minitest::Test
@@ -144,6 +169,8 @@ class NodeTest < Minitest::Test
     @node.register(Note, Erupt::MemoryRepository.new)
     @node.register(Widget, widget_repo)
     @node.register(Memo, Erupt::MemoryRepository.new)
+    @node.register(Doc, Erupt::MemoryRepository.new([{ title: "a", topic: 1 }, { title: "b", topic: 2 }, { title: "c", topic: 3 }]))
+    @node.register(Order, Erupt::MemoryRepository.new)
     CALLS.clear
     MemoProxy::CALLS.clear
   end
@@ -331,16 +358,49 @@ class NodeTest < Minitest::Test
                   [:before_delete, "b"], [:after_delete, "b"]], MemoProxy::CALLS
   end
 
+  def test_link_tree
+    titles = ->(body) { call("POST", "/erupt-api/data/table/Doc", body, erupt: "Doc")[1]["list"].map { |r| r["title"] } }
+    assert_equal [], titles.({}), "dependNode: nothing until a tree node is picked"
+    assert_equal ["b"], titles.({ "linkTreeVal" => [2] })
+    assert_equal %w[a b], titles.({ "linkTreeVal" => %w[1 2] })
+  end
+
+  def test_field_types_and_invoke
+    _, build = call("GET", "/erupt-api/build/Order", erupt: "Order")
+    fields = build["eruptModel"]["eruptFieldModels"].to_h { |f| [f["fieldName"], f] }
+    edit = fields.transform_values { |f| f["eruptFieldJson"]["edit"] }
+    assert_equal ["invoke"], edit["status"]["choiceType"]["fetchHandler"]
+    assert_equal ["invoke"], edit["tags"]["tagsType"]["fetchHandler"]
+    assert_equal "invoke", edit["qty"]["onchange"]
+    assert_equal %w[MARKDOWN ATTACHMENT BUTTON], [edit["body"]["type"], edit["files"]["type"], edit["calc"]["type"]]
+    assert_equal %w[Category Category], [fields["cats"]["fieldReturnName"], fields["sections"]["fieldReturnName"]]
+
+    invoke = ->(kind, field, form = {}, value = nil) { call("POST", "/erupt-api/invoke/Order/#{kind}/#{field}", { form: form, value: value }, erupt: "Order") }
+    assert_equal [{ "value" => "new", "label" => "New" }, { "value" => "n", "label" => "From form" }], invoke.("options", "status", { note: "n" })[1]["data"]
+    assert_equal %w[red blue], invoke.("options", "tags")[1]["data"]
+    assert_equal({ "formData" => { "note" => "3 items" } }, invoke.("onchange", "qty", { qty: 3 })[1]["data"])
+    assert_equal ["Paris"], invoke.("autocomplete", "city", {}, "pa")[1]["data"]
+    assert_equal "alert(1)", invoke.("button", "calc")[1]["data"]["eval"]
+    assert_equal [false, "not now"], invoke.("button", "stop")[1].values_at("success", "message")
+    assert_equal 404, invoke.("button", "qty")[0], "a field without that code"
+    assert_equal 404, invoke.("options", "missing")[0]
+
+    # picked records arrive as [{id: key}] and are stored as their keys
+    _, r = call("POST", "/erupt-api/data/modify/Order", { cats: [{ id: 1 }, { id: "2" }], sections: [{ id: 3 }], tags: '["red"]' }, erupt: "Order")
+    assert r["success"], r
+    row = call("POST", "/erupt-api/data/table/Order", {}, erupt: "Order")[1]["list"][0]
+    assert_equal [[1, 2], [3]], row.values_at("cats", "sections")
+    refute row.key?("calc")
+  end
+
   def test_before_fetch_needs_sql
     @node.register(Task, Erupt::MemoryRepository.new)
     assert_equal 500, call("POST", "/erupt-api/data/table/Task", {}, erupt: "Task").first
   end
 
   def test_reference
-    _, page = call("POST", "/erupt-api/data/Article/reference-table/category",
-                   { pageIndex: 1, pageSize: 10, condition: [{ key: "name", expression: "LIKE", value: "py" }] })
-    assert_equal [{ "id" => 2, "name" => "Python", "parent" => 1 }], page["list"]
-    assert_equal 404, call("POST", "/erupt-api/data/Article/reference-table/topic", {}).first
+    # the picker is the server's: it reads the referenced model's own table
+    assert_equal 404, call("POST", "/erupt-api/data/Article/reference-table/category", {}).first
 
     add(title: "Ref", category: { id: "2", name: "Python" }, topic: { id: 1, name: "Tech" })
     row = table["list"].first
@@ -362,7 +422,7 @@ class NodeTest < Minitest::Test
     add(title: "A")
     add(title: "B")
     ids = table["list"].map { |r| r["id"] }
-    path = "/erupt-api/data/Article/operator/"
+    path = "/erupt-api/invoke/Article/operation/"
     refute call("POST", "#{path}publish", { ids: ids, param: {} }).last["success"] # the form's required note is missing
     _, r = call("POST", "#{path}publish", { ids: ids, param: { note: "go" } })
     assert_equal "Executed successfully", r["message"]
@@ -375,8 +435,10 @@ class NodeTest < Minitest::Test
     assert call("POST", "#{path}rebuild", { ids: nil, param: nil }, account: "root").last["success"]
     assert_equal [:rebuild, [], nil], CALLS.last
     assert_equal 404, call("POST", "#{path}missing", {}).first
-    assert_equal [200, { "note" => nil }], call("POST", "#{path}publish/form-value?ids=#{ids.first}")
-    assert_equal 404, call("POST", "#{path}feature/form-value").first
+    form = "/erupt-api/invoke/Article/operation-form/"
+    assert_equal({ "note" => nil }, call("POST", "#{form}publish", {}).last["data"])
+    assert_nil call("POST", "#{form}feature", {}).last["data"] # an operation without a form
+    assert_equal 404, call("POST", "/erupt-api/data/Article/operator/publish", { ids: ids }).first
   end
 
   def test_default_order
@@ -467,6 +529,7 @@ class DeclarationTest < Minitest::Test
       -> { declare(orderBy: "id") } => "Erupt has no attribute 'orderBy'",
       -> { declare(layout: { pageSize: "10" }) } => "expected integer",
       -> { declare { field :id, pk: true } } => "declared twice",
+      -> { declare { field :title, "T", click: ->(_form) {} } } => "click belong to",
       -> { declare { operation(:go, "Go", mode: "ALL") { nil } } } => "is not a RowOperationMode",
       -> { declare { operation(:go, "Go", colour: "red") { nil } } } => "RowOperation has no attribute 'colour'",
       -> { declare { operation(:go, "Go", form: String) { nil } } } => "form must be a model class",

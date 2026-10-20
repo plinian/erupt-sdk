@@ -91,6 +91,12 @@ final class Note
 {
     #[Field(pk: true)] public int $id;
     #[Field('Text')] public string $text;
+    #[Field('Ping', type: 'BUTTON', click: 'ping')] public ?string $ping;
+
+    public static function ping(array $form): array
+    {
+        return ['eval' => 'pong:' . ($form['text'] ?? '')];
+    }
 }
 
 $pdo = new \PDO('sqlite:' . getenv('ERUPT_DB'));

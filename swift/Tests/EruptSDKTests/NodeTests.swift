@@ -12,6 +12,7 @@ func articleModel() throws -> (Model, Model) {
         Field("name", "Name", search: true)
         Field("parent", "Parent", .number)
     }
+    let noteForm = try Model("NoteForm") { Field("note", "Note") }
     let article = try Model("Article", orderBy: "id desc") {
         Field("id", pk: true)
         Field("title", "Title", search: true, notNull: true, sortable: true)
@@ -22,6 +23,8 @@ func articleModel() throws -> (Model, Model) {
         Field("tags", "Tags", .json, search: true, choices: ["a": "A", "b": "B"], edit: Edit(type: .multiChoice))
         Field("divider", "Divider", edit: Edit(type: .divide), virtual: true)
         RowAction("hello", "Hello", mode: .button) { _ in "alert('hi')" }
+        RowAction("note", "Note", mode: .button, form: noteForm) { op in op.param!["note"]!.text }
+        RowAction("secret", "Secret", mode: .button, show: { _ in false }) { _ in nil }
     }
     return (category, article)
 }
@@ -145,7 +148,18 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(call(n, "GET", "/erupt-api/data/Article/\(pk.text)").1?["title"] == "B")
         #expect(call(n, "POST", "/erupt-api/data/modify/Article/delete", body: [pk]).1?["success"] == true)
         #expect(table([:])["total"] == 1)
-        #expect(call(n, "POST", "/erupt-api/data/Article/operator/hello", body: [:]).1?["data"] == "alert('hi')")
+        let op = "/erupt-api/invoke/Article/operation/", form = "/erupt-api/invoke/Article/operation-form/"
+        #expect(call(n, "POST", op + "hello", body: ["ids": [], "param": [:]]).1?["data"] == "alert('hi')")
+        #expect(call(n, "POST", op + "note", body: ["param": ["note": "go"]]).1?["data"] == "go")
+        #expect(call(n, "POST", op + "secret", body: [:]).0 == 403)
+        #expect(call(n, "POST", op + "missing", body: [:]).0 == 404)
+        #expect(call(n, "POST", form + "note", body: [:]).1?["data"] == ["note": nil])
+        #expect(call(n, "POST", form + "hello", body: [:]).1?["data"] == .null, "an operation without a form")
+        #expect(call(n, "POST", form + "secret", body: [:]).0 == 403)
+        // the old routes are gone; the picker is the server's, it reads the referenced model's own table
+        #expect(call(n, "POST", "/erupt-api/data/Article/operator/hello", body: [:]).0 == 404)
+        #expect(call(n, "POST", "/erupt-api/data/Article/operator/note/form-value", body: [:]).0 == 404)
+        #expect(call(n, "POST", "/erupt-api/data/Article/reference-table/category", body: [:]).0 == 404)
     }
 
     @Test func dataProxy() throws {
@@ -193,6 +207,81 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(throws: DeclarationError.self) {
             try Model("Task", erupt: Erupt(vis: [Vis(title: "A")]), visQuery: ["A": VisQuery(orderBy: "nope")]) { Field("id", pk: true) }
         }
+    }
+
+    @Test func linkTree() throws {
+        let n = try node()
+        let category = try articleModel().0
+        let doc = try Model("Doc", erupt: Erupt(linkTree: LinkTree(dependNode: true, field: "topic"))) {
+            Field("id", pk: true)
+            Field("title", "Title")
+            Field("topic", "Topic", .tree(category, pid: "parent"))
+        }
+        try n.register(doc, MemoryRepository([["title": "a", "topic": 1], ["title": "b", "topic": 2], ["title": "c", "topic": 3]]))
+        let titles: (JSON) -> [String]? = { body in
+            call(n, "POST", "/erupt-api/data/table/Doc", erupt: "Doc", body: body).1?["list"]?.array?.map { $0["title"]!.text }
+        }
+        #expect(titles([:]) == [], "dependNode: nothing until a tree node is picked")
+        #expect(titles(["linkTreeVal": [2]]) == ["b"])
+        #expect(titles(["linkTreeVal": ["1", "2"]]) == ["a", "b"])
+        #expect(throws: DeclarationError.self) {
+            try Model("Doc", erupt: Erupt(linkTree: LinkTree(field: "title"))) { Field("id", pk: true); Field("title", "Title") }
+        }
+    }
+
+    @Test func fieldTypesAndInvoke() throws {
+        let n = try node()
+        let category = try articleModel().0
+        let order = try Model("Order") {
+            Field("id", pk: true)
+            Field("status", "Status", fetch: .options { form in [("new", "New"), (form["note"]?.string ?? "x", "From form")] })
+            Field("tags", "Tags", type: .tags, fetch: .tags { _ in ["red", "blue"] })
+            Field("qty", "Qty", .number, onchange: { form in FormChange(formData: ["note": .string("\(form["qty"]!.text) items")]) })
+            Field("note", "Note")
+            Field("city", "City", type: .autoComplete, complete: { _, typed in ["Paris", "Tokyo"].filter { $0.lowercased().contains(typed.lowercased()) } })
+            Field("body", "Body", type: .markdown)
+            Field("files", "Files", type: .attachment)
+            Field("cats", "Categories", .ref(category), type: .checkbox)
+            Field("sections", "Sections", .ref(category), type: .tabTree)
+            Field("calc", "Calc", type: .button, click: { _ in FormChange(eval: "alert(1)", formData: ["qty": 2]) })
+            Field("stop", "Stop", type: .button, click: { _ in throw EruptFailure("not now") })
+        }
+        try n.register(order, MemoryRepository())
+        let build = call(n, "GET", "/erupt-api/build/Order", erupt: "Order").1?["eruptModel"]?["eruptFieldModels"]?.array ?? []
+        let fields = Dictionary(uniqueKeysWithValues: build.map { ($0["fieldName"]!.text, $0) })
+        let edit = fields.mapValues { $0["eruptFieldJson"]!["edit"]! }
+        for f in build { try Schema.check("EruptField", f["eruptFieldJson"]!, partial: false) }
+        #expect(edit["status"]?["choiceType"]?["fetchHandler"] == ["invoke"])
+        #expect(edit["tags"]?["tagsType"]?["fetchHandler"] == ["invoke"])
+        #expect(edit["qty"]?["onchange"] == "invoke")
+        #expect([edit["body"]?["type"], edit["files"]?["type"], edit["calc"]?["type"]] == ["MARKDOWN", "ATTACHMENT", "BUTTON"])
+        #expect(fields["calc"]?["eruptFieldJson"]?["views"] == [])
+        #expect([fields["cats"]?["fieldReturnName"], fields["sections"]?["fieldReturnName"]] == ["Category", "Category"])
+
+        let invoke: (String, String, JSON, JSON) -> (Int, JSON?) = { kind, field, form, value in
+            call(n, "POST", "/erupt-api/invoke/Order/\(kind)/\(field)", erupt: "Order", body: ["form": form, "value": value])
+        }
+        #expect(invoke("options", "status", ["note": "n"], nil).1?["data"] == [["value": "new", "label": "New"], ["value": "n", "label": "From form"]])
+        #expect(invoke("options", "tags", [:], nil).1?["data"] == ["red", "blue"])
+        #expect(invoke("onchange", "qty", ["qty": 3], nil).1?["data"]?["formData"] == ["note": "3 items"])
+        #expect(invoke("autocomplete", "city", [:], "pa").1?["data"] == ["Paris"])
+        #expect(invoke("button", "calc", [:], nil).1?["data"]?["eval"] == "alert(1)")
+        let stop = invoke("button", "stop", [:], nil).1
+        #expect(stop?["success"] == false && stop?["message"] == "not now")
+        #expect(invoke("button", "qty", [:], nil).0 == 404, "a field without that code")
+        #expect(invoke("options", "missing", [:], nil).0 == 404)
+
+        // picked records arrive as [{id: key}] and are stored as their keys
+        let add = call(n, "POST", "/erupt-api/data/modify/Order", erupt: "Order",
+                       body: ["cats": [["id": 1], ["id": "2"]], "sections": [["id": 3]], "tags": "[\"red\"]"]).1
+        #expect(add?["success"] == true)
+        let row = call(n, "POST", "/erupt-api/data/table/Order", erupt: "Order", body: [:]).1?["list"]?[0]
+        #expect(row?["cats"] == [1, 2] && row?["sections"] == [3])
+        #expect(row?["calc"] == nil)
+
+        #expect(throws: DeclarationError.self) { try Model("M") { Field("id", pk: true); Field("a", "A", click: { _ in FormChange() }) } }
+        #expect(throws: DeclarationError.self) { try Model("M") { Field("id", pk: true); Field("a", "A", fetch: .tags { _ in [] }) } }
+        #expect(throws: DeclarationError.self) { try Model("M") { Field("id", pk: true); Field("a", "A", type: .checkbox) } }
     }
 
     @Test func beforeFetchNeedsSQL() throws {

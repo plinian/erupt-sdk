@@ -166,6 +166,38 @@ let task = try Model(
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`Erupt(tree: Tree(id: "id", label: "name", pid: "parent"))` shows the model as a tree, and
+`Erupt(linkTree: LinkTree(field: "category"))` puts the tree of a reference field beside the table: the erupt
+server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+(`dependNode: true` shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the inferred types, `type:` takes `.tags`, `.autoComplete`, `.attachment` (the erupt server stores the
+upload, the node keeps its path), `.htmlEditor`, `.markdown`, `.codeEditor` (all text), `.button` (form only),
+and `.checkbox` / `.tabTree` with a `.ref(model)` kind: the picked records, stored as the JSON list of their keys.
+A `.json` field with `choices:` is a MULTI_CHOICE.
+
+A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
+values:
+
+```swift
+let order = try Model("Order") {
+    Field("id", pk: true)
+    Field("status", "Status", fetch: .options { form in [("new", "New"), ("paid", "Paid")] })  // TAGS: .tags { ... }
+    Field("qty", "Qty", .number, onchange: { form in FormChange(formData: ["total": .int(form["qty"]!.int! * 9)]) })
+    Field("city", "City", type: .autoComplete, complete: { form, typed in lookup(typed) })
+    Field("total", "Total", .number)
+    Field("recalc", "Recalc", type: .button, click: { form in FormChange(eval: "alert('done')") })
+    Field("tags", "Tags", .ref(tag), type: .checkbox)
+}
+```
+
+`fetch: .options` belongs to CHOICE / MULTI_CHOICE, `.tags` to TAGS, `complete` to AUTO_COMPLETE, `click` to
+BUTTON; `onchange` to any field. Throw an `EruptFailure` to refuse with a message.
+
 ## Storage
 
 Storage is any `Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:

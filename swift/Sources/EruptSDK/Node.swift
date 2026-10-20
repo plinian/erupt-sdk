@@ -150,7 +150,7 @@ public final class Node: @unchecked Sendable {
         return [
             "instanceId": .string(instanceId), "nodeName": .string(name), "accessToken": .string(accessToken),
             "version": .string("swift-\(Node.version)"), "nodeAddress": [.string(address ?? "")], "eruptModules": [],
-            "erupts": .array(erupts.map(JSON.string)), "resources": [:],
+            "erupts": .array(erupts.map(JSON.string)), "resources": [:], "capabilities": ["invoke"],
         ]
     }
 
@@ -187,22 +187,21 @@ public final class Node: @unchecked Sendable {
     private static let routes: [Route] = [
         ("GET", ["build", "*"], { $0.build }),
         ("POST", ["data", "table", "*"], { $0.table }),
-        ("POST", ["data", "*", "reference-table", "*"], { $0.referenceTable }),
-        ("POST", ["data", "*", "operator", "*", "form-value"], { $0.operationFormValue }),
-        ("POST", ["data", "*", "operator", "*"], { $0.operation }),
         ("GET", ["data", "init-value", "*"], { $0.initValue }),
         ("GET", ["data", "*", "*"], { $0.get }),
         ("POST", ["data", "modify", "*"], { $0.add }),
         ("POST", ["data", "modify", "*", "update"], { $0.update }),
         ("POST", ["data", "modify", "*", "delete"], { $0.delete }),
+        ("POST", ["invoke", "*", "*", "*"], { $0.invoke }),
     ]
 
-    /// One request being served: its model, repository and the path parameter after the erupt name.
+    /// One request being served: its model, repository and the path parameters after the erupt name.
     private struct Context {
         let request: NodeRequest
         let model: Model
         let repo: Repository
-        let arg: String?
+        let args: [String]
+        var arg: String? { args.first }
         let enforced: [String]
         var user: User? { User.current }
     }
@@ -234,7 +233,7 @@ public final class Node: @unchecked Sendable {
                 }
                 return User(json)
             }
-            let context = Context(request: req, model: entry.model, repo: entry.repo, arg: captures.count > 1 ? captures[1] : nil, enforced: enforced)
+            let context = Context(request: req, model: entry.model, repo: entry.repo, args: Array(captures.dropFirst()), enforced: enforced)
             return try User.$current.withValue(user) { try route.handler(self)(context) }
         }
         throw Reply(status: 404)
@@ -265,16 +264,6 @@ public final class Node: @unchecked Sendable {
         return try page(c.model, c.repo, try readObject(c))
     }
 
-    private func referenceTable(_ c: Context) throws -> JSON {
-        guard let f = c.model.field(c.arg!), f.type == EditType.referenceTable.rawValue, let target = f.reference?.target else {
-            throw Reply(status: 404)
-        }
-        guard let entry = lock.locked({ models[target.name] }), entry.model === target else {
-            throw DeclarationError("referenced erupt '\(target.name)' is not registered on this node")
-        }
-        return try page(target, entry.repo, try readObject(c))
-    }
-
     private func page(_ model: Model, _ repo: Repository, _ body: [String: JSON]) throws -> JSON {
         let pageIndex = max(try int(body["pageIndex"] ?? 1), 1)
         let pageSize = min(max(try int(body["pageSize"] ?? 10), 1), Node.maxPageSize)
@@ -285,11 +274,14 @@ public final class Node: @unchecked Sendable {
             guard let f = model.field(fieldName), f.sortable || f.pk else { throw EruptFailure("illegal sort field '\(fieldName)'") }
             query.sort.append((f.name, (s["direction"]?.text ?? "").uppercased() == "DESC"))
         }
+        // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+        let picked = body["linkTreeVal"].flatMap { $0 == .null ? nil : $0 }
+        if let link = model.linkTree, let picked { query.conditions.append(try condition(model.field(link.field)!, "IN", picked)) }
         // a @Vis view's own filter and order, then the DataProxy's
         let vis = body["vis"]?.string.flatMap { model.vis[$0] }
         if query.sort.isEmpty { query.sort = vis?.order.isEmpty == false ? vis!.order : model.order }
         query.filters = (vis?.filters ?? []) + (try model.filters(query.conditions))
-        let (total, records) = try repo.page(query)
+        let (total, records) = model.linkTree?.dependNode == true && picked == nil ? (0, []) : try repo.page(query)
         var list = rows(model, records)
         try model.hook { try $0.afterFetch(&list) }
         return [
@@ -376,6 +368,26 @@ public final class Node: @unchecked Sendable {
         return r()
     }
 
+    /// The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the operation
+    /// code, or a field's fetched options, onchange, auto-complete or button with the form's values.
+    private func invoke(_ c: Context) throws -> JSON {
+        if c.args[0] == "operation" { return try operation(c) }
+        if c.args[0] == "operation-form" { return r(data: try operationFormValue(c)) }
+        guard let f = c.model.declared.first(where: { $0.name == c.args[1] }) else { throw Reply(status: 404) }
+        let body = try readObject(c)
+        let form = body["form"]?.object ?? [:]
+        switch (c.args[0], f.fetch) {
+        case ("options", .options(let fetch)?):
+            return r(data: .array(try fetch(form).map { ["value": .string($0.value), "label": .string($0.label)] }))
+        case ("options", .tags(let fetch)?): return r(data: .array(try fetch(form).map(JSON.string)))
+        case ("onchange", _) where f.onchange != nil: return r(data: try f.onchange!(form).json)
+        case ("autocomplete", _) where f.complete != nil:
+            return r(data: .array(try f.complete!(form, body["value"].flatMap { $0 == .null ? nil : $0.text } ?? "").map(JSON.string)))
+        case ("button", _) where f.click != nil: return r(data: try f.click!(form).json)
+        default: throw Reply(status: 404)
+        }
+    }
+
     /// Records to browser rows. A reference stays its key: the server resolves its label, the flattened
     /// <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
     private func rows(_ model: Model, _ records: [Record]) -> [Record] {
@@ -383,15 +395,15 @@ public final class Node: @unchecked Sendable {
     }
 
     private func action(_ c: Context) throws -> RowAction {
-        guard let a = c.model.action(c.arg!) else { throw Reply(status: 404) }
+        guard let a = c.model.action(c.args[1]) else { throw Reply(status: 404) }
         // a hidden operation does not exist for this user, exactly like the Java proxy filters it out
         guard a.isVisible(to: c.user) else { throw Reply(status: 403) }
         return a
     }
 
     private func operationFormValue(_ c: Context) throws -> JSON {
-        // the browser ignores a 404 here and opens an empty form
-        guard let form = try action(c).form else { throw Reply(status: 404) }
+        // none without a form: the server answers the browser a 404, and it opens an empty one
+        guard let form = try action(c).form else { return .null }
         return .object(Dictionary(uniqueKeysWithValues: form.fieldNames.map { ($0, JSON.null) }))
     }
 

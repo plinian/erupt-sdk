@@ -27,6 +27,9 @@ const OPS = new Set(["EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", 
 
 const MAX_PAGE_SIZE = 1000;
 
+// invoke kind -> the field option holding its code
+const INVOKED: Record<string, "fetch" | "onchange" | "complete" | "click"> = { options: "fetch", onchange: "onchange", autocomplete: "complete", button: "click" };
+
 
 const MAX_BODY = 16 * 1024 * 1024;
 
@@ -84,14 +87,12 @@ export class Node {
     this.routes = [
       ["GET", /^\/erupt-api\/build\/([^/]+)$/, this.build],
       ["POST", /^\/erupt-api\/data\/table\/([^/]+)$/, this.table],
-      ["POST", /^\/erupt-api\/data\/([^/]+)\/reference-table\/([^/]+)$/, this.referenceTable],
-      ["POST", /^\/erupt-api\/data\/([^/]+)\/operator\/([^/]+)\/form-value$/, this.operationFormValue],
-      ["POST", /^\/erupt-api\/data\/([^/]+)\/operator\/([^/]+)$/, this.operation],
       ["GET", /^\/erupt-api\/data\/init-value\/([^/]+)$/, this.initValue],
       ["GET", /^\/erupt-api\/data\/([^/]+)\/([^/]+)$/, this.get],
       ["POST", /^\/erupt-api\/data\/modify\/([^/]+)$/, this.add],
       ["POST", /^\/erupt-api\/data\/modify\/([^/]+)\/update$/, this.update],
       ["POST", /^\/erupt-api\/data\/modify\/([^/]+)\/delete$/, this.delete],
+      ["POST", /^\/erupt-api\/invoke\/([^/]+)\/([^/]+)\/([^/]+)$/, this.invoke],
     ];
   }
 
@@ -101,12 +102,6 @@ export class Node {
     repository.bind(model);
     this.models.set(model.name, [model, repository]);
     return this;
-  }
-
-  private repoOf(target: Model): Repository {
-    const entry = this.models.get(target.name);
-    if (!entry || entry[0] !== target) throw new Error(`referenced erupt '${target.name}' is not registered on this node`);
-    return entry[1];
   }
 
   // ---------------------------------------------------------------- HTTP
@@ -200,11 +195,6 @@ export class Node {
     return this.page(model, repo, objectBody(req));
   }
 
-  private async referenceTable(model: Model, _repo: Repository, req: Request, field: string): Promise<unknown> {
-    const target = referenceField(model, field, "REFERENCE_TABLE").target!;
-    return this.page(target, this.repoOf(target), objectBody(req));
-  }
-
   private async page(model: Model, repo: Repository, body: Record<string, any>): Promise<unknown> {
     const pageIndex = Math.max(Math.trunc(Number(body.pageIndex)) || 1, 1);
     const pageSize = Math.min(Math.max(Math.trunc(Number(body.pageSize)) || 10, 1), MAX_PAGE_SIZE);
@@ -215,11 +205,14 @@ export class Node {
       if (!f || !(f.sortable || f.pk)) throw new Fail(`illegal sort field '${isObject(s) ? s.field : s}'`);
       query.sort.push([f.name, String((s as Record<string, unknown>).direction ?? "ASC").toUpperCase() === "DESC"]);
     }
+    // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+    const picked = body.linkTreeVal;
+    if (model.linkTree && picked != null) query.conditions.push(condition(model.fields[model.linkTree[0]], "IN", picked));
     // a @Vis view's own filter and order, then the DataProxy's
     const [filters, sort] = model.vis.get(body.vis) ?? [[], []];
     if (!query.sort.length) query.sort = [...(sort.length ? sort : model.orderBy)];
     query.filters = [...filters, ...await model.filters(query.conditions)];
-    const [total, records] = await repo.page(query);
+    const [total, records] = model.linkTree?.[1] && picked == null ? [0, []] : await repo.page(query);
     const rows = this.rows(model, records);
     await model.hook("afterFetch", rows);
     return {
@@ -281,6 +274,27 @@ export class Node {
   }
 
   /**
+   * The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the
+   * operation code, or a field's fetched options, onchange, auto-complete or button with the form's values.
+   */
+  private async invoke(model: Model, repo: Repository, req: Request, kind: string, name: string): Promise<unknown> {
+    if (kind === "operation") return this.operation(model, repo, req, name);
+    if (kind === "operation-form") return r(true, null, this.operationFormValue(model, name));
+    const f = model.declared.find((f) => f.name === name);
+    const fn = f && Object.hasOwn(INVOKED, kind) ? f.options[INVOKED[kind]] : undefined;
+    if (!fn) throw new Reply(404);
+    const body = objectBody(req);
+    const form = isObject(body.form) ? body.form : {};
+    if (kind === "autocomplete") return r(true, null, [...await f!.options.complete!(form, String(body.value ?? ""))]);
+    let answer = await (fn as (form: Record<string, any>) => unknown)(form);
+    if (kind === "options" && f!.type !== "TAGS") {
+      // {value: label} or [value, label] pairs, as the choices of a field
+      answer = (Array.isArray(answer) ? answer : Object.entries(answer as object)).map(([value, label]) => ({ value: String(value), label }));
+    }
+    return r(true, null, answer);
+  }
+
+  /**
    * Records to browser rows. A reference stays its key: the server resolves its label, the flattened
    * <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
    */
@@ -296,10 +310,10 @@ export class Node {
     return op;
   }
 
-  private async operationFormValue(model: Model, _repo: Repository, _req: Request, code: string): Promise<unknown> {
+  private operationFormValue(model: Model, code: string): Record<string, null> | null {
     const op = this.operationOf(model, code);
-    if (!op.form) throw new Reply(404); // the browser ignores a 404 here and opens an empty form
-    return Object.fromEntries(Object.keys(op.form.fields).map((name) => [name, null]));
+    // none without a form: the server answers the browser a 404, and it opens an empty one
+    return op.form ? Object.fromEntries(Object.keys(op.form.fields).map((name) => [name, null])) : null;
   }
 
   private async operation(model: Model, repo: Repository, req: Request, code: string): Promise<unknown> {
@@ -364,6 +378,7 @@ export class Node {
     return {
       instanceId: this.instanceId, nodeName: this.name, accessToken: this.accessToken, version: `ts-${VERSION}`,
       nodeAddress: [this.address], eruptModules: [], erupts: [...this.models.keys()], resources: {},
+      capabilities: ["invoke"],
     };
   }
 
@@ -458,12 +473,6 @@ function objectBody(req: Request): Record<string, any> {
 }
 
 const asList = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
-
-function referenceField(model: Model, field: string, editType?: string): Field {
-  const f = model.fields[field];
-  if (!f || !f.isReference || (editType && f.type !== editType)) throw new Reply(404);
-  return f;
-}
 
 function conditions(model: Model, c: unknown): Cond[] {
   const key = isObject(c) ? c.key : undefined;

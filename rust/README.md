@@ -128,6 +128,42 @@ let task = Model::new("Task", "Task")
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`.raw(json!({"tree": {"id": "id", "label": "name", "pid": "parent"}}))` shows the model as a tree, and
+`.raw(json!({"linkTree": {"field": "category"}}))` puts the tree of a reference field beside the table: the
+erupt server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+(`"dependNode": true` shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the constructors above, `Field::of(EditType::…)` takes `Tags`, `AutoComplete`, `Attachment` (the erupt
+server stores the upload, the node keeps its path), `HtmlEditor`, `Markdown`, `CodeEditor` (all text) and
+`Button` (form only); `Field::multi_choice` is a `MULTI_CHOICE`, and `Field::checkbox` / `Field::tab_tree`
+take another model: the picked records, stored as the JSON list of their keys.
+
+A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
+values:
+
+```rust
+let order = Model::new("Order", "Order")
+    .field("id", Field::pk())
+    .field("status", Field::choice("Status", &[])            // options, fetched when the form opens
+        .fetch(|form| Ok(vec![("new".into(), "New".into()), ("paid".into(), "Paid".into())])))
+    .field("qty", Field::number("Qty")
+        .onchange(|form| Ok(json!({"formData": {"total": as_f64(&form["qty"]).unwrap_or(0.0) * 9.0}, "editExpr": {}}))))
+    .field("city", Field::of(EditType::AutoComplete, "City").complete(|form, typed| lookup(typed)))
+    .field("total", Field::number("Total"))
+    .field("recalc", Field::of(EditType::Button, "Recalc")
+        .click(|form| Ok(json!({"eval": "alert('done')", "formData": {}}))))
+    .field("tags", Field::checkbox(&tag, "Tags"))
+    .build()?;
+```
+
+`fetch` belongs to `CHOICE` / `MULTI_CHOICE`, `fetch_tags` (a `Vec<String>`) to `TAGS`, `complete` to
+`AUTO_COMPLETE`, `click` to `BUTTON`, `onchange` to any field; another type fails at `build()`. Return
+`Err(Error::fail(msg))` to refuse with a message.
+
 ## Storage
 
 `Repository` (`bind`, `page`, `get`, `add`, `update`, `delete`) puts a model on anything; without a sort it

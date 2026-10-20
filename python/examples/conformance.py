@@ -57,6 +57,7 @@ class NoteProxy(DataProxy):
 class Note:
     id: int = Field(pk=True)
     text: str = Field("Text")
+    ping = Field("Ping", type="BUTTON", click=lambda form: {"eval": f"pong:{form.get('text')}"})
 
 
 if __name__ == "__main__":

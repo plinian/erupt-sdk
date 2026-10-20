@@ -172,17 +172,6 @@ impl Node {
         self.models.iter().find(|(m, _)| m.name() == name)
     }
 
-    fn repo_of(&self, target: &Model) -> std::result::Result<&dyn Repository, Reply> {
-        self.entry(target.name())
-            .map(|(_, r)| r.as_ref())
-            .ok_or_else(|| {
-                Reply::Other(format!(
-                    "referenced erupt '{}' is not registered on this node",
-                    target.name()
-                ))
-            })
-    }
-
     // ------------------------------------------------------------------ requests
 
     /// Answer one forwarded request; mount this in any HTTP server.
@@ -226,18 +215,12 @@ impl Node {
         let route = match (m, segments.as_slice()) {
             ("GET", ["build", e]) => Some((*e, Route::Build)),
             ("POST", ["data", "table", e]) => Some((*e, Route::Table)),
-            ("POST", ["data", e, "reference-table", f]) => {
-                Some((*e, Route::ReferenceTable(decode(f))))
-            }
-            ("POST", ["data", e, "operator", c, "form-value"]) => {
-                Some((*e, Route::FormValue(decode(c))))
-            }
-            ("POST", ["data", e, "operator", c]) => Some((*e, Route::Operation(decode(c)))),
             ("GET", ["data", "init-value", e]) => Some((*e, Route::InitValue)),
             ("GET", ["data", e, id]) => Some((*e, Route::Get(decode(id)))),
             ("POST", ["data", "modify", e]) => Some((*e, Route::Add)),
             ("POST", ["data", "modify", e, "update"]) => Some((*e, Route::Update)),
             ("POST", ["data", "modify", e, "delete"]) => Some((*e, Route::Delete)),
+            ("POST", ["invoke", e, kind, f]) => Some((*e, Route::Invoke(decode(kind), decode(f)))),
             _ => None,
         };
         let Some((erupt, route)) = route else {
@@ -272,21 +255,6 @@ impl Node {
                 self.require(model, req, "query")?;
                 self.page(model, repo, &body_object(req)?)
             }
-            Route::ReferenceTable(field) => {
-                let target = reference_field(model, &field)?.target();
-                self.page(target, self.repo_of(target)?, &body_object(req)?)
-            }
-            Route::FormValue(code) => {
-                let op = operation_of(model, &code)?;
-                let form = op.form.as_ref().ok_or(Reply::Status(404))?; // the browser ignores a 404 here
-                Ok(Value::Object(
-                    form.fields
-                        .iter()
-                        .map(|f| (f.name.clone(), Value::Null))
-                        .collect(),
-                ))
-            }
-            Route::Operation(code) => self.operation(model, repo, req, &code),
             Route::InitValue => {
                 self.require(model, req, "add")?;
                 let mut record: Record = model
@@ -359,6 +327,42 @@ impl Node {
                 }
                 Ok(r_ok())
             }
+            // a row operation and its form's opening values under the operation code (erupt-cloud/PROTOCOL.md §5.5)
+            Route::Invoke(kind, code) if kind == "operation" => {
+                self.operation(model, repo, req, &code)
+            }
+            Route::Invoke(kind, code) if kind == "operation-form" => {
+                // none without a form: the server answers the browser a 404, and it opens an empty one
+                let mut r = r_ok();
+                r["data"] = operation_of(model, &code)?
+                    .form
+                    .as_ref()
+                    .map_or(Value::Null, |form| {
+                        form.fields
+                            .iter()
+                            .map(|f| (f.name.clone(), Value::Null))
+                            .collect()
+                    });
+                Ok(r)
+            }
+            Route::Invoke(kind, field) => {
+                // a field's own code, with the form's values
+                let body = body_object(req)?;
+                let form = body.get("form").and_then(Value::as_object);
+                let answer = model
+                    .field(&field)
+                    .and_then(|f| {
+                        f.invoke(
+                            &kind,
+                            form.unwrap_or(&Map::new()),
+                            body.get("value").unwrap_or(&Value::Null),
+                        )
+                    })
+                    .ok_or(Reply::Status(404))??;
+                let mut r = r_ok();
+                r["data"] = answer;
+                Ok(r)
+            }
         }
     }
 
@@ -402,6 +406,14 @@ impl Node {
                 .unwrap_or(false);
             query.sort.push((f.name.clone(), desc));
         }
+        // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+        let picked = body.get("linkTreeVal").filter(|v| !v.is_null());
+        if let (Some((name, _)), Some(keys)) = (&model.link_tree, picked) {
+            let f = model.field(name).expect("linkTree field");
+            query
+                .conditions
+                .push(field_condition(f, "IN", keys.clone())?);
+        }
         // a @Vis view's own filter and order, then the DataProxy's
         let (filters, sort) = body
             .get("vis")
@@ -418,7 +430,10 @@ impl Node {
         }
         query.filters = filters;
         query.filters.extend(model.filters(&query.conditions)?);
-        let (total, records) = repo.page(&query)?;
+        let (total, records) = match &model.link_tree {
+            Some((_, true)) if picked.is_none() => (0, Vec::new()),
+            _ => repo.page(&query)?,
+        };
         let mut rows = self.rows(model, records);
         model.hook(|p| p.after_fetch(&mut rows))?;
         Ok(json!({
@@ -631,6 +646,7 @@ impl Node {
             "instanceId": self.instance_id, "nodeName": self.name, "accessToken": self.access_token,
             "version": format!("rust-{VERSION}"), "nodeAddress": [self.address], "eruptModules": [],
             "erupts": self.models.iter().map(|(m, _)| m.name()).collect::<Vec<_>>(), "resources": {},
+            "capabilities": ["invoke"],
         })
     }
 
@@ -745,25 +761,17 @@ impl Node {
 enum Route {
     Build,
     Table,
-    ReferenceTable(String),
-    FormValue(String),
-    Operation(String),
     InitValue,
     Get(String),
     Add,
     Update,
     Delete,
+    /// kind, field or operation code
+    Invoke(String, String),
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn reference_field<'a>(model: &'a Model, name: &str) -> std::result::Result<&'a Field, Reply> {
-    model
-        .field(name)
-        .filter(|f| f.kind == "REFERENCE_TABLE")
-        .ok_or(Reply::Status(404))
 }
 
 fn operation_of<'a>(
@@ -816,11 +824,15 @@ fn condition(model: &Model, c: &Value) -> std::result::Result<Cond, Reply> {
         .map(text)
         .filter(|e| !e.is_empty() && e != "None")
         .unwrap_or_else(|| "EQ".into());
-    let op = match QueryExpression::from_str(&name) {
+    field_condition(f, &name, c.get("value").cloned().unwrap_or(Value::Null))
+}
+
+/// A condition on a field, its value coerced to the field.
+fn field_condition(f: &Field, name: &str, value: Value) -> std::result::Result<Cond, Reply> {
+    let op = match QueryExpression::from_str(name) {
         Ok(op) if op != QueryExpression::Auto => op,
         _ => return fail(format!("illegal operator '{name}'")),
     };
-    let value = c.get("value").cloned().unwrap_or(Value::Null);
     use QueryExpression::*;
     if matches!(op, Null | NotNull) {
         return Ok(Cond::new(&f.name, op, Value::Null));

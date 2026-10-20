@@ -139,6 +139,38 @@ final class Task
     #[Field('Done')] public bool $done;
 }
 
+#[Erupt('Doc', raw: ['linkTree' => ['field' => 'topic', 'dependNode' => true]])]
+final class Doc
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Title')] public string $title;
+    #[Field('Topic', tree: 'parent')] public ?Tag $topic;
+}
+
+#[Erupt('Order')]
+final class Order
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Status', fetch: 'statusOptions')] public string $status;
+    #[Field('Tags', type: 'TAGS', fetch: 'tagOptions')] public string $tags;
+    #[Field('Qty', onchange: 'qtyChanged')] public int $qty;
+    #[Field('Note')] public string $note;
+    #[Field('City', type: 'AUTO_COMPLETE', complete: 'city')] public string $city;
+    #[Field('Body', type: 'MARKDOWN')] public string $body;
+    #[Field('Files', type: 'ATTACHMENT')] public string $files;
+    #[Field('Tags', type: 'CHECKBOX', ref: Tag::class)] public array $cats;
+    #[Field('Sections', type: 'TAB_TREE', ref: Tag::class)] public array $sections;
+    #[Field('Calc', type: 'BUTTON', click: 'calc')] public ?string $calc;
+    #[Field('Stop', type: 'BUTTON', click: 'refuse')] public ?string $stop;
+
+    public static function statusOptions(array $form): array { return ['new' => 'New', ($form['note'] ?? '') ?: 'x' => 'From form']; }
+    public static function tagOptions(array $form): array { return ['red', 'blue']; }
+    public static function qtyChanged(array $form): array { return ['formData' => ['note' => "{$form['qty']} items"]]; }
+    public static function city(array $form, string $typed): array { return array_values(array_filter(['Paris', 'Tokyo'], fn($c) => stripos($c, $typed) !== false)); }
+    public static function calc(array $form): array { return ['eval' => 'alert(1)', 'formData' => ['qty' => 2]]; }
+    public static function refuse(array $form): array { throw new Fail('not now'); }
+}
+
 #[Erupt('Bad1')] final class BadEditKey { #[Field(pk: true)] public int $id; #[Field('T', edit: ['inputTyp' => ['length' => 9]])] public string $t; }
 #[Erupt('Bad2')] final class BadViewType { #[Field(pk: true)] public int $id; #[Field('T', view: ['sortable' => 'yes'])] public string $t; }
 #[Erupt('Bad3')] final class BadEditType { #[Field(pk: true)] public int $id; #[Field('T', type: 'INPUTT')] public string $t; }
@@ -153,6 +185,10 @@ final class Task
 #[Erupt('Bad11')] final class BadOpStatic { #[Field(pk: true)] public int $id; #[Operation('Go')] public function go(): void {} }
 #[Erupt('Bad12')] final class BadLabel { #[Field(pk: true)] public int $id; #[Field('Tag', label: 'title')] public ?Tag $tag; }
 #[Erupt('Bad13')] final class TwoPks { #[Field(pk: true)] public int $id; #[Field(pk: true)] public int $id2; }
+#[Erupt('Bad14', raw: ['linkTree' => ['field' => 't']])] final class BadLinkTree { #[Field(pk: true)] public int $id; #[Field('T')] public string $t; }
+#[Erupt('Bad15')] final class BadClick { #[Field(pk: true)] public int $id; #[Field('T', click: 'go')] public string $t; public static function go(): void {} }
+#[Erupt('Bad16')] final class BadFetch { #[Field(pk: true)] public int $id; #[Field('T', type: 'TAGS', fetch: 'missing')] public string $t; }
+#[Erupt('Bad17')] final class BadCheckbox { #[Field(pk: true)] public int $id; #[Field('T', type: 'CHECKBOX')] public array $t; }
 
 // ---------------------------------------------------------------- runner
 
@@ -195,6 +231,10 @@ $test('declarations are checked against the schema', function () {
         [BadOpStatic::class, '/public static/'],
         [BadLabel::class, "/has no field 'title'/"],
         [TwoPks::class, '/at most one/'],
+        [BadLinkTree::class, "/linkTree.field 't' must be a reference field/"],
+        [BadClick::class, '/click belong to .* BUTTON/'],
+        [BadFetch::class, '/fetch must name a static method of BadFetch/'],
+        [BadCheckbox::class, '/CHECKBOX needs ref/'],
     ];
     foreach ($cases as [$class, $pattern]) {
         throws($pattern, fn() => Model::of($class), $class);
@@ -341,13 +381,15 @@ $test('handle() serves the protocol', function () {
         // a reference travels as its key: the server resolves the label and the flattened column
         eq([200, 4, 2, '2026-01-05T10:30:00.000'], [$status, $row['views'], $row['tag'], $row['at']], 'row');
         eq(false, array_key_exists('tag_name', $row), 'no flattened reference column');
-        eq(false, $call('POST', '/erupt-api/data/Post/operator/touch', ['ids' => [1, 2]])[1]['success'], 'SINGLE takes one row');
-        eq('ok()', $call('POST', '/erupt-api/data/Post/operator/touch', ['ids' => [1]])[1]['data'], 'script');
+        eq(false, $call('POST', '/erupt-api/invoke/Post/operation/touch', ['ids' => [1, 2]])[1]['success'], 'SINGLE takes one row');
+        eq('ok()', $call('POST', '/erupt-api/invoke/Post/operation/touch', ['ids' => [1]])[1]['data'], 'script');
         $malformed = $node->handle('POST', '/erupt-api/data/modify/Post', ['Access-Token' => 'secret', 'erupt' => 'Post', 'token' => 't1'], '{x');
         eq([200, 'malformed JSON body'], [$malformed->status, json_decode($malformed->body, true)['message']], 'malformed body');
-        eq(404, $call('POST', '/erupt-api/data/Post/operator/missing', [])[0], 'unknown operation');
+        eq(404, $call('POST', '/erupt-api/invoke/Post/operation/missing', [])[0], 'unknown operation');
+        eq([200, null], [($r = $call('POST', '/erupt-api/invoke/Post/operation-form/touch', []))[0], $r[1]['data']], 'an operation without a form');
+        eq(404, $call('POST', '/erupt-api/data/Post/operator/touch', ['ids' => [1]])[0], 'the old operation route');
         eq(404, $call('GET', '/erupt-api/data/Post/reference-tree/tag')[0], 'reference-tree is the server\'s');
-        eq(['Tech', 'Php'], array_column($call('POST', '/erupt-api/data/Post/reference-table/tag', [])[1]['list'], 'name'), 'picker');
+        eq(404, $call('POST', '/erupt-api/data/Post/reference-table/tag', [])[0], 'the picker is the server\'s');
         // signed calls: no token needed; Erupt-Enforced: power skips the (failing) erupt-power callback
         $signed = function (string $method, string $target, mixed $body, ?string $enforced, array $over = []) use ($node) {
             $raw = $body === null ? '' : json_encode($body);
@@ -460,6 +502,57 @@ $test('DataProxy beforeFetch', function () {
     $repo = new PdoRepository(new \PDO('sqlite::memory:'), 'task');
     $repo->bind(Model::of(Task::class));
     throws("/2 '\\?' for 1 params/", fn() => $repo->page(new Query(filters: [['owner = ? or owner = ?', ['admin']]])), 'placeholder count');
+});
+
+$test('LinkTree filters the table', function () {
+    $repo = new MemoryRepository([['title' => 'a', 'topic' => 1], ['title' => 'b', 'topic' => 2], ['title' => 'c', 'topic' => 3]]);
+    $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Doc::class, $repo);
+    $titles = function (array $body) use ($node) {
+        $raw = json_encode($body);
+        $ts = time();
+        $target = '/erupt-api/data/table/Doc';
+        $headers = ['erupt' => 'Doc', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
+        $headers['Erupt-Signature'] = Signature::sign('secret', 'POST', $target, $ts, 'power', 'dXNlcg==', $raw);
+        return array_column(json_decode($node->handle('POST', $target, $headers, $raw, [], $target)->body, true)['list'], 'title');
+    };
+    eq([], $titles([]), 'dependNode: nothing until a tree node is picked');
+    eq(['b'], $titles(['linkTreeVal' => [2]]));
+    eq(['a', 'b'], $titles(['linkTreeVal' => ['1', '2']]));
+});
+
+$test('field types and invoke', function () {
+    $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))
+        ->register(Tag::class, new MemoryRepository())->register(Order::class, new PdoRepository(new \PDO('sqlite::memory:'), 'orders'));
+    $call = function (string $method, string $target, mixed $body = null) use ($node) {
+        $raw = $body === null ? '' : json_encode($body);
+        $ts = time();
+        $headers = ['erupt' => 'Order', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
+        $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', 'dXNlcg==', $raw);
+        $response = $node->handle($method, $target, $headers, $raw, [], $target);
+        return [$response->status, json_decode($response->body, true)];
+    };
+    $fields = array_column($call('GET', '/erupt-api/build/Order')[1]['eruptModel']['eruptFieldModels'], null, 'fieldName');
+    $edit = array_map(fn($f) => $f['eruptFieldJson']['edit'], $fields);
+    eq(['invoke'], $edit['status']['choiceType']['fetchHandler'], 'choice fetchHandler');
+    eq(['invoke'], $edit['tags']['tagsType']['fetchHandler'], 'tags fetchHandler');
+    eq('invoke', $edit['qty']['onchange'], 'onchange');
+    eq(['MARKDOWN', 'ATTACHMENT', 'BUTTON'], [$edit['body']['type'], $edit['files']['type'], $edit['calc']['type']], 'types');
+    eq([[], 'Tag', 'Tag'], [$fields['calc']['eruptFieldJson']['views'], $fields['cats']['fieldReturnName'], $fields['sections']['fieldReturnName']], 'button and collections');
+    $invoke = fn(string $kind, string $field, array $form = [], ?string $value = null) =>
+        $call('POST', "/erupt-api/invoke/Order/$kind/$field", ['form' => $form ?: new \stdClass(), 'value' => $value]);
+    eq([['value' => 'new', 'label' => 'New'], ['value' => 'n', 'label' => 'From form']], $invoke('options', 'status', ['note' => 'n'])[1]['data'], 'options');
+    eq(['red', 'blue'], $invoke('options', 'tags')[1]['data'], 'tags');
+    eq(['formData' => ['note' => '3 items']], $invoke('onchange', 'qty', ['qty' => 3])[1]['data'], 'onchange');
+    eq(['Paris'], $invoke('autocomplete', 'city', [], 'pa')[1]['data'], 'autocomplete');
+    eq('alert(1)', $invoke('button', 'calc')[1]['data']['eval'], 'button');
+    eq([false, 'not now'], [$invoke('button', 'stop')[1]['success'], $invoke('button', 'stop')[1]['message']], 'Fail');
+    eq(404, $invoke('button', 'qty')[0], 'a field without that code');
+    eq(404, $invoke('options', 'missing')[0], 'unknown field');
+    // picked records arrive as [{id: key}] and are stored as their keys
+    eq(true, $call('POST', '/erupt-api/data/modify/Order', ['cats' => [['id' => 1], ['id' => '2']], 'sections' => [['id' => 3]], 'tags' => '["red"]'])[1]['success'], 'add');
+    $row = $call('POST', '/erupt-api/data/table/Order', [])[1]['list'][0];
+    eq([[1, 2], [3], false], [$row['cats'], $row['sections'], array_key_exists('calc', $row)], 'row');
+    eq([5], Model::of(Order::class)->fields['cats']->coerce('[5]'), 'a JSON string');
 });
 
 $failed = 0;

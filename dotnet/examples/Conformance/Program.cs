@@ -29,7 +29,8 @@ node.Register(EruptModel.Of<Article>()
     .Operation("rebuild", new OperationOptions { Title = "Rebuild", Mode = RowOperationMode.BUTTON, Show = user => user?.Account == "root" },
         _ => Task.CompletedTask), new MemoryRepository());
 
-node.Register(EruptModel.Of<Note>().Power(new Power { Delete = false }), new MemoryRepository());
+node.Register(EruptModel.Of<Note>().Power(new Power { Delete = false })
+    .Click(n => n.Ping, form => new FieldUpdate { Eval = $"pong:{form.GetValueOrDefault("text")}" }), new MemoryRepository());
 
 await node.RunAsync(port, "127.0.0.1");
 
@@ -67,6 +68,7 @@ internal sealed class Note
 {
     [Pk] public long Id { get; set; }
     [Field("Text")] public string? Text { get; set; }
+    [Field("Ping", Type = EditType.BUTTON)] public object? Ping { get; set; }
 }
 
 internal sealed class NoteProxy : IDataProxy

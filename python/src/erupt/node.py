@@ -59,6 +59,10 @@ class _Reply(Exception):
         self.status, self.body = status, body
 
 
+# invoke kind -> the Field attribute holding its code
+_INVOKED = {"options": "fetch", "onchange": "onchange", "autocomplete": "complete", "button": "click"}
+
+
 class Fail(Exception):
     """A business error shown to the user as a message: raise it from a DataProxy hook or an operation."""
 
@@ -85,14 +89,12 @@ class Node:
         self._routes = [
             ("GET", re.compile(r"^/erupt-api/build/([^/]+)$"), self._build),
             ("POST", re.compile(r"^/erupt-api/data/table/([^/]+)$"), self._table),
-            ("POST", re.compile(r"^/erupt-api/data/([^/]+)/reference-table/([^/]+)$"), self._reference_table),
-            ("POST", re.compile(r"^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$"), self._operation_form_value),
-            ("POST", re.compile(r"^/erupt-api/data/([^/]+)/operator/([^/]+)$"), self._operation),
             ("GET", re.compile(r"^/erupt-api/data/init-value/([^/]+)$"), self._init_value),
             ("GET", re.compile(r"^/erupt-api/data/([^/]+)/([^/]+)$"), self._get),
             ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)$"), self._add),
             ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/update$"), self._update),
             ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/delete$"), self._delete),
+            ("POST", re.compile(r"^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$"), self._invoke),
         ]
 
     def register(self, cls, repository):
@@ -106,14 +108,6 @@ class Node:
         repository.bind(model)
         self.models[model.name] = (model, repository)
         return self
-
-    def _repo_of(self, target):
-        entry = self.models.get(target.name)
-        if entry is None or entry[0] is not target:
-            raise ValueError(f"referenced erupt '{target.name}' is not registered on this node")
-        return entry[1]
-
-    # ---------------------------------------------------------------- WSGI
 
     def __call__(self, environ, start_response):
         try:
@@ -190,17 +184,6 @@ class Node:
         self._require(model, environ, "query")
         return self._page(model, repo, _read_json(environ) or {})
 
-    def _reference_table(self, model, repo, environ, field):
-        f = self._reference_field(model, field, "REFERENCE_TABLE")
-        return self._page(f.target, self._repo_of(f.target), _read_json(environ) or {})
-
-    @staticmethod
-    def _reference_field(model, field, edit_type=None):
-        f = model.fields.get(field)
-        if f is None or f.type not in ("REFERENCE_TABLE", "REFERENCE_TREE") or (edit_type and f.type != edit_type):
-            raise _Reply(404, "")
-        return f
-
     def _page(self, model, repo, body):
         page_index = max(int(body.get("pageIndex") or 1), 1)
         page_size = min(max(int(body.get("pageSize") or 10), 1), _MAX_PAGE_SIZE)
@@ -212,12 +195,16 @@ class Node:
             if f is None or not (f.sortable or f.pk):
                 raise Fail(f"illegal sort field '{s.get('field')}'")
             query.sort.append((f.name, str(s.get("direction", "ASC")).upper() == "DESC"))
+        # a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+        picked = body.get("linkTreeVal")
+        if model.link_tree and picked is not None:
+            query.conditions.append(self._condition(model.fields[model.link_tree[0]], "IN", picked))
         # a @Vis view's own filter and order, then the DataProxy's
         filters, sort = model.vis.get(body.get("vis"), ([], []))
         if not query.sort:
             query.sort = list(sort or model.order_by)
         query.filters = filters + model.filters(query.conditions)
-        total, records = repo.page(query)
+        total, records = (0, []) if model.link_tree and model.link_tree[1] and picked is None else repo.page(query)
         rows = self._rows(model, records)
         model.hook("after_fetch", rows)
         return {"pageIndex": page_index, "pageSize": page_size, "total": total,
@@ -313,6 +300,27 @@ class Node:
             model.hook("after_delete", record)
         return _r()
 
+    def _invoke(self, model, repo, environ, kind, name):
+        """The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the
+        operation code, or a field's fetched options, onchange, auto-complete or button with the form's values."""
+        if kind == "operation":
+            return self._operation(model, repo, environ, name)
+        if kind == "operation-form":
+            return _r(data=self._operation_form_value(model, name))
+        f = next((f for f in model.declared if f.name == name), None)
+        fn = getattr(f, _INVOKED.get(kind, ""), None) if f else None
+        if fn is None:
+            raise _Reply(404, "")
+        body = _read_json(environ) or {}
+        form = body.get("form") or {}
+        if kind == "autocomplete":
+            return _r(data=list(fn(form, body.get("value") or "")))
+        answer = fn(form)
+        if kind == "options" and f.type != "TAGS":
+            # {value: label} or [(value, label)], as the choices of a field
+            answer = [{"value": str(v), "label": label} for v, label in (answer.items() if isinstance(answer, dict) else answer)]
+        return _r(data=answer)
+
     @staticmethod
     def _rows(model, records):
         """Records to browser rows. A reference stays its key: the server resolves its label, the flattened
@@ -326,11 +334,10 @@ class Node:
             raise _Reply(404 if op is None else 403, "")
         return op
 
-    def _operation_form_value(self, model, repo, environ, code):
+    def _operation_form_value(self, model, code):
         op = self._operation_of(model, code)
-        if not op.form:
-            raise _Reply(404, "")  # the browser ignores a 404 here and opens an empty form
-        return {name: None for name in op.form_model.fields}
+        # none without a form: the server answers the browser a 404, and it opens an empty one
+        return {name: None for name in op.form_model.fields} if op.form else None
 
     def _operation(self, model, repo, environ, code):
         op = self._operation_of(model, code)
@@ -417,7 +424,7 @@ class Node:
     def _node_info(self):
         return {"instanceId": self._instance_id, "nodeName": self.name, "accessToken": self.access_token,
                 "version": f"python-{__version__}", "nodeAddress": [self.address],
-                "eruptModules": [], "erupts": list(self.models), "resources": {}}
+                "eruptModules": [], "erupts": list(self.models), "resources": {}, "capabilities": ["invoke"]}
 
     def _heartbeat_loop(self):
         failing = False

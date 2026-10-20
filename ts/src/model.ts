@@ -33,6 +33,10 @@ const TEMPLATES = DEFAULTS as unknown as {
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const REFERENCES = ["REFERENCE_TABLE", "REFERENCE_TREE"];
+// many records of another model, stored as the JSON list of their keys
+const COLLECTIONS = ["CHECKBOX", "TAB_TREE"];
+// the edit attribute that names a fetchHandler, by the type that fetches options
+const FETCHED: Record<string, string> = { CHOICE: "choiceType", MULTI_CHOICE: "multiChoiceType", TAGS: "tagsType" };
 
 export const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -59,6 +63,15 @@ export interface FieldOptions {
   edit?: Edit;
   /** a form-only element (DIVIDE, CALLOUT, EMPTY, GROUP): in the build, never read or written */
   virtual?: boolean;
+  // the field's own code, run by the node when the server invokes it with the form's values
+  /** CHOICE / MULTI_CHOICE: the options, `{value: label}` or `[value, label]` pairs; TAGS: the tags */
+  fetch?: (form: Json) => Awaitable<Record<string, string> | [unknown, string][] | string[]>;
+  /** any field: run when its value changes in the form */
+  onchange?: (form: Json) => Awaitable<{ formData?: Json; editExpr?: Json }>;
+  /** AUTO_COMPLETE: the suggestions for what was typed */
+  complete?: (form: Json, typed: string) => Awaitable<unknown[]>;
+  /** BUTTON: run on a click; `eval` is executed as JavaScript in the browser, so only return code you wrote */
+  click?: (form: Json) => Awaitable<{ eval?: string; formData?: Json; editExpr?: Json }>;
 }
 
 export interface RefOptions extends FieldOptions {
@@ -71,7 +84,7 @@ export interface RefOptions extends FieldOptions {
 /** One column. Create it with the `field.*` factories. */
 export class Field {
   name = "";
-  /** holds a JSON value (MULTI_CHOICE array, KEY_VALUE object): SQL repositories store it as JSON text */
+  /** holds a JSON value (MULTI_CHOICE array, KEY_VALUE object, picked keys): SQL repositories store it as JSON text */
   json = false;
 
   constructor(
@@ -106,11 +119,15 @@ export class Field {
   }
 
   get virtual(): boolean {
-    return !!this.options.virtual;
+    return !!this.options.virtual || this.type === "BUTTON";
   }
 
   get isReference(): boolean {
     return REFERENCES.includes(this.type!);
+  }
+
+  get isCollection(): boolean {
+    return COLLECTIONS.includes(this.type!);
   }
 
   build(): Json {
@@ -120,7 +137,8 @@ export class Field {
     if (this.pk) return tpl;
     const efj = tpl.eruptFieldJson;
     const edit = efj.edit;
-    const view = efj.views[0];
+    // a BUTTON is a form element only: its template has no table column
+    const view = efj.views[0] ?? {};
     Object.assign(edit, { title: this.title, notNull: this.notNull, show: this.form });
     edit.search.value = this.search;
     Object.assign(view, { title: this.title, sortable: this.sortable });
@@ -134,7 +152,13 @@ export class Field {
       tpl.fieldReturnName = this.target!.name;
       Object.assign(edit.referenceTreeType, { id: this.target!.pk, label: this.label, pid: this.tree });
       view.column = this.label;
+    } else if (this.isCollection) {
+      // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+      tpl.fieldReturnName = this.target!.name;
+      view.column = this.label;
     }
+    if (this.options.fetch && FETCHED[this.type!]) edit[FETCHED[this.type!]].fetchHandler = ["invoke"];
+    if (this.options.onchange) edit.onchange = "invoke";
     merge(edit, (this.options.edit ?? {}) as Json);
     merge(view, (this.options.view ?? {}) as Json);
     if (this.options.table === false) efj.views = [];
@@ -152,6 +176,13 @@ export class Field {
       const target = this.target!;
       if (isObject(value)) value = value[target.pk!];
       return target.fields[target.pk!].coerce(value);
+    }
+    if (this.isCollection) {
+      // picked records arrive as [{id: key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), and are stored as keys
+      const items = typeof value === "string" ? JSON.parse(value || "[]") : value ?? [];
+      if (!Array.isArray(items)) throw new Error("must be a list");
+      const pk = this.target!.fields[this.target!.pk!];
+      return items.map((v) => pk.coerce(isObject(v) ? v[pk.name] ?? v.id : v));
     }
     if (value === null || value === undefined || value === "") return null;
     if (this.pk) return toInteger(value);
@@ -249,15 +280,15 @@ export const field = {
   boolean: (title: string, options?: FieldOptions) => new Field(title, "BOOLEAN", options),
   date: (title: string, options?: FieldOptions) => new Field(title, "DATE", options),
   dateTime: (title: string, options?: FieldOptions) => new Field(title, "DATE_TIME", options),
-  /** a select over `{value: label}` */
+  /** a select over `{value: label}`, or over what `options.fetch` returns */
   choice: (title: string, choices: Record<string, string>, options?: FieldOptions) =>
-    new Field(title, "CHOICE", options, { ...choices }),
+    new Field(title, "CHOICE", options, pairs(choices)),
   /**
-   * a JSON value: an array (MULTI_CHOICE, its options in `choices`) or an object (KEY_VALUE); set the edit
-   * type in `options.edit`
+   * a JSON value: an array (MULTI_CHOICE, its options in `choices` or `options.fetch`) or an object (KEY_VALUE,
+   * set the edit type in `options.edit`)
    */
   json: (title: string, options?: FieldOptions, choices?: Record<string, string>) => {
-    const f = new Field(title, "INPUT", options, choices ? { ...choices } : null);
+    const f = new Field(title, choices || options?.fetch ? "MULTI_CHOICE" : "INPUT", options, pairs(choices));
     f.json = true;
     return f;
   },
@@ -265,7 +296,22 @@ export const field = {
   ref: (target: Model, title: string, options: RefOptions = {}) =>
     new Field(title, options.tree ? "REFERENCE_TREE" : "REFERENCE_TABLE", options, null, target,
       options.label ?? "name", options.tree ?? null),
+  /** records of `target` picked by checkboxes: the repository stores the JSON list of their keys */
+  checkbox: (target: Model, title: string, options: RefOptions = {}) => collection("CHECKBOX", target, title, options),
+  /** records of `target` picked in its own tree (`erupt.tree`), stored as `checkbox` stores them */
+  tabTree: (target: Model, title: string, options: RefOptions = {}) => collection("TAB_TREE", target, title, options),
+  /** a form-only button whose `click` runs on the node */
+  button: (title: string, click: NonNullable<FieldOptions["click"]>, options?: FieldOptions) =>
+    new Field(title, "BUTTON", { ...options, click }),
 };
+
+const pairs = (choices?: Record<string, string>) => (choices && Object.keys(choices).length ? { ...choices } : null);
+
+function collection(type: string, target: Model, title: string, options: RefOptions): Field {
+  const f = new Field(title, type, options, null, target, options.label ?? "name");
+  f.json = true;
+  return f;
+}
 
 /** What an operation handler receives. */
 export interface OperationContext {
@@ -401,6 +447,8 @@ export class Model {
   /** null: only usable as an operation form */
   readonly pk: string | null;
   readonly orderBy: [string, boolean][];
+  /** [field, dependNode] of a @LinkTree: the reference the tree beside the table filters */
+  readonly linkTree: [string, boolean] | null;
   readonly proxies: DataProxy[];
   /** view code -> the filters and order the node applies to that view's table */
   readonly vis = new Map<string, [[string, unknown[]][], [string, boolean][]]>();
@@ -423,7 +471,11 @@ export class Model {
       if (f.type !== null && !(f.type in TEMPLATES.fields)) throw new Error(`${path}: edit type ${f.type} is not supported yet`);
       check("View", f.options.view ?? {}, `${path}.view`);
       check("Edit", f.options.edit ?? {}, `${path}.edit`);
-      if (f.isReference) this.checkReference(f);
+      if (f.isReference || f.isCollection) this.checkReference(f);
+      const { fetch, complete, click } = f.options;
+      if ((fetch && !FETCHED[f.type!]) || (complete && f.type !== "AUTO_COMPLETE") || (click && f.type !== "BUTTON")) {
+        throw new Error(`${path}: fetch, complete and click belong to CHOICE / MULTI_CHOICE / TAGS, AUTO_COMPLETE and BUTTON`);
+      }
       this.declared.push(f);
       if (!f.virtual) this.fields[attr] = f;
     }
@@ -438,6 +490,11 @@ export class Model {
     if (pks.length > 1) throw new Error(`${name}: at most one field.pk()`);
     this.pk = pks[0]?.name ?? null;
     this.orderBy = this.parseOrder(options.orderBy);
+    const linkTree = erupt.linkTree ?? {};
+    this.linkTree = linkTree.field ? [linkTree.field, !!linkTree.dependNode] : null;
+    if (this.linkTree && !this.fields[this.linkTree[0]]?.isReference) {
+      throw new Error(`${name}: linkTree.field '${this.linkTree[0]}' must be a reference field`);
+    }
     for (const [view, filter, orderBy] of views) this.vis.set(view.code, [[filter ?? []].flat().map((sql) => [sql, []]), this.parseOrder(orderBy)]);
     this.proxies = [options.dataProxy ?? []].flat();
     if (!this.proxies.every(isObject)) throw new Error(`${name}: dataProxy must be a DataProxy`);

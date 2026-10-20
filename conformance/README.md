@@ -66,3 +66,5 @@ Operations, in this order:
 
 **Note**, power `delete` off: `id` pk; `text` Text (INPUT). Its DataProxy opens a new form with `text` `new`
 (`addBehavior`) and refuses a record whose `text` is `forbidden` with the message `forbidden text` (`validate`).
+A form-only BUTTON field `ping` (title Ping) answers its click with `{"eval": "pong:" + form.text}`, for a node
+registered with the `invoke` capability.

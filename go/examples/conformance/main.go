@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -36,6 +37,7 @@ type Article struct {
 type Note struct {
 	ID   int64  `json:"id" erupt:"pk"`
 	Text string `json:"text" erupt:"title=Text"`
+	Ping any    `json:"ping" erupt:"title=Ping;type=BUTTON"`
 }
 
 type NoteProxy struct{ erupt.BaseDataProxy }
@@ -75,7 +77,10 @@ func main() {
 				Show:    func(u *erupt.User) bool { return u != nil && u.Account == "root" },
 				Handler: func(*erupt.OpContext) (string, error) { return "", nil }},
 		)))
-	note := must(erupt.NewModel(Note{}, "Note", erupt.WithPower(map[string]bool{"delete": false}), erupt.WithDataProxy(NoteProxy{})))
+	note := must(erupt.NewModel(Note{}, "Note", erupt.WithPower(map[string]bool{"delete": false}), erupt.WithDataProxy(NoteProxy{}),
+		erupt.WithFieldCode("ping", erupt.FieldCode{Click: func(_ context.Context, form erupt.M) (erupt.Click, error) {
+			return erupt.Click{Eval: fmt.Sprint("pong:", form["text"])}, nil
+		}})))
 
 	port := os.Getenv("PORT")
 	node := must(erupt.NewNode(erupt.Config{Name: "conformance", AccessToken: os.Getenv("ERUPT_ACCESS_TOKEN"),

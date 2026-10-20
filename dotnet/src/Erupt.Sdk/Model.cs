@@ -33,6 +33,9 @@ public partial class EruptModel
     /// <summary>View code -> the filters and order the node applies to that <c>@Vis</c> view's table queries.</summary>
     internal Dictionary<string, (List<SqlFilter> Filters, List<(string Field, bool Desc)> Sort)> Views { get; } = [];
 
+    /// <summary>The reference field a <c>@LinkTree</c> filters the table by, and whether a tree node must be picked first.</summary>
+    internal (string Field, bool DependNode)? LinkTree { get; private protected set; }
+
     internal JsonObject PowerJson { get; private protected set; } = Schema.Defaults["power"]!.DeepClone().AsObject();
 
     internal JsonObject Raw { get; } = [];
@@ -184,6 +187,12 @@ public sealed class EruptModel<T> : EruptModel
     public EruptModel<T> Options(EruptOptions options)
     {
         Json.Merge(Raw, Schema.Override("Erupt", options, $"[EruptModel] {Name}"));
+        if (Raw["linkTree"]?["field"]?.GetValue<string>() is { Length: > 0 } link)
+        {
+            if (!FieldMap.TryGetValue(link, out var f) || !f.IsReference)
+                throw new ArgumentException($"{Name}: linkTree.field '{link}' must be a reference field");
+            LinkTree = (link, Raw["linkTree"]?["dependNode"]?.GetValue<bool>() == true);
+        }
         if (options.Vis is null) return this;
         Views.Clear();
         foreach (var entry in Raw["vis"]!.AsArray()) View(entry!.AsObject(), [], []);
@@ -237,6 +246,54 @@ public sealed class EruptModel<T> : EruptModel
             await handler(op);
             return null;
         });
+
+    /// <summary>
+    /// The options of a CHOICE / MULTI_CHOICE field, fetched with the form's values whenever the browser lists them.
+    /// Throw <see cref="EruptFailure"/> to refuse with a message, here and in the field code below.
+    /// </summary>
+    public EruptModel<T> Fetch<TProp>(Expression<Func<T, TProp>> property, Func<Record, Task<IEnumerable<(string Value, string Label)>>> options) =>
+        Invoke(property, "options", ["CHOICE", "MULTI_CHOICE"], async (form, _) =>
+            new JsonArray([.. (await options(form)).Select(o => (JsonNode)new JsonObject { ["value"] = o.Value, ["label"] = o.Label })]));
+
+    public EruptModel<T> Fetch<TProp>(Expression<Func<T, TProp>> property, Func<Record, IEnumerable<(string Value, string Label)>> options) =>
+        Fetch(property, form => Task.FromResult(options(form)));
+
+    /// <summary>The suggestions of a TAGS field, fetched with the form's values.</summary>
+    public EruptModel<T> Fetch<TProp>(Expression<Func<T, TProp>> property, Func<Record, Task<IEnumerable<string>>> tags) =>
+        Invoke(property, "options", ["TAGS"], async (form, _) => Values.ToJson(await tags(form)));
+
+    public EruptModel<T> Fetch<TProp>(Expression<Func<T, TProp>> property, Func<Record, IEnumerable<string>> tags) =>
+        Fetch(property, form => Task.FromResult(tags(form)));
+
+    /// <summary>Run when the field changes in the form: values and expressions to apply to the form.</summary>
+    public EruptModel<T> OnChange<TProp>(Expression<Func<T, TProp>> property, Func<Record, Task<FieldUpdate>> onchange) =>
+        Invoke(property, "onchange", null, async (form, _) => (await onchange(form)).ToJson(button: false));
+
+    public EruptModel<T> OnChange<TProp>(Expression<Func<T, TProp>> property, Func<Record, FieldUpdate> onchange) =>
+        OnChange(property, form => Task.FromResult(onchange(form)));
+
+    /// <summary>The suggestions of an AUTO_COMPLETE field for what the user typed.</summary>
+    public EruptModel<T> Complete<TProp>(Expression<Func<T, TProp>> property, Func<Record, string, Task<IEnumerable<string>>> complete) =>
+        Invoke(property, "autocomplete", ["AUTO_COMPLETE"], async (form, typed) => Values.ToJson(await complete(form, typed)));
+
+    public EruptModel<T> Complete<TProp>(Expression<Func<T, TProp>> property, Func<Record, string, IEnumerable<string>> complete) =>
+        Complete(property, (form, typed) => Task.FromResult(complete(form, typed)));
+
+    /// <summary>Run when a BUTTON field is clicked.</summary>
+    public EruptModel<T> Click<TProp>(Expression<Func<T, TProp>> property, Func<Record, Task<FieldUpdate>> click) =>
+        Invoke(property, "button", ["BUTTON"], async (form, _) => (await click(form)).ToJson(button: true));
+
+    public EruptModel<T> Click<TProp>(Expression<Func<T, TProp>> property, Func<Record, FieldUpdate> click) =>
+        Click(property, form => Task.FromResult(click(form)));
+
+    private EruptModel<T> Invoke<TProp>(Expression<Func<T, TProp>> property, string kind, string[]? types, Func<Record, string, Task<JsonNode?>> code)
+    {
+        var f = Field(this, PropertyName(property));
+        if (f.IsPk || (types is not null && !types.Contains(f.Type)))
+            throw new ArgumentException($"{Name}.{f.Name}: {kind} code belongs to {(types is null ? "a field" : string.Join(" / ", types))}, not {f.Type ?? "the primary key"}");
+        f.Invoked[kind] = code;
+        return this;
+    }
 
     private string PropertyName<TProp>(Expression<Func<T, TProp>> property) =>
         (property.Body is UnaryExpression unary ? unary.Operand : property.Body) is MemberExpression member

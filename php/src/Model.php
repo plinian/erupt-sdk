@@ -38,6 +38,8 @@ final class Model
     public readonly array $proxies;
     /** @var array<string, array{0: list<array{0: string, 1: list<mixed>}>, 1: list<array{0: string, 1: bool}>}> view code -> [filters, sort] */
     public readonly array $vis;
+    /** @var array{0: string, 1: bool}|null [field, dependNode] of a @LinkTree: the reference the tree beside the table filters */
+    public readonly ?array $linkTree;
     private readonly array $raw;
 
     /** The compiled model of an #[Erupt] class; cached, so declarations are checked once. */
@@ -105,6 +107,11 @@ final class Model
         }
         $this->pk = $pks[0] ?? null;
         $this->orderBy = $this->parseOrder($decl->orderBy);
+        $link = $raw['linkTree'] ?? [];
+        $this->linkTree = isset($link['field']) ? [$link['field'], (bool) ($link['dependNode'] ?? false)] : null;
+        if ($this->linkTree && !($fields[$this->linkTree[0]] ?? null)?->isReference()) {
+            throw new \InvalidArgumentException("$this->name: linkTree.field '{$this->linkTree[0]}' must be a reference field");
+        }
         // view code -> [filters, sort] the node applies to that view's table queries
         $this->vis = array_map(fn($v) => [array_map(fn($f) => [$f, []], $v[0]), $this->parseOrder($v[1])], $vis);
 
@@ -151,10 +158,12 @@ final class Model
         if ($decl->ref === null && $hint !== null && class_exists($hint) && (new \ReflectionClass($hint))->getAttributes(Erupt::class)) {
             $decl->ref = $hint;
         }
+        $collection = in_array($decl->type, FieldSpec::COLLECTIONS, true);
         $type = match (true) {
+            $collection => $decl->type,
             $decl->ref !== null => $decl->tree !== null ? 'REFERENCE_TREE' : 'REFERENCE_TABLE',
             $decl->type !== null => $decl->type,
-            $decl->choices !== null && $hint !== 'array' => 'CHOICE',
+            $decl->choices !== null || $decl->fetch !== null => $hint === 'array' ? 'MULTI_CHOICE' : 'CHOICE',
             $hint === 'bool' => 'BOOLEAN',
             $hint === 'int', $hint === 'float' => 'NUMBER',
             $hint !== null && is_a($hint, \DateTimeInterface::class, true) => 'DATE_TIME',
@@ -163,13 +172,31 @@ final class Model
         if (!isset(Schema::defaults()['fields'][$type])) {
             throw new \InvalidArgumentException("$path: edit type $type is not supported yet");
         }
-        $json = $decl->ref === null ? match ($hint) {
+        if ($collection && $decl->ref === null) {
+            throw new \InvalidArgumentException("$path: $type needs ref");
+        }
+        $decl->virtual = $decl->virtual || $type === 'BUTTON';
+        $json = $collection ? FieldSpec::JSON_ARRAY : ($decl->ref === null ? match ($hint) {
             'array' => FieldSpec::JSON_ARRAY,
             'object', \stdClass::class => FieldSpec::JSON_OBJECT,
             default => null,
-        } : null;
-        $spec = new FieldSpec($name, $decl, $type, $json);
-        if ($spec->isReference()) {
+        } : null);
+        $code = [];
+        foreach (FieldSpec::INVOKED as $kind => $attr) {
+            if ($decl->$attr !== null) {
+                $class = $property->getDeclaringClass();
+                if (!$class->hasMethod($decl->$attr) || !$class->getMethod($decl->$attr)->isStatic()) {
+                    throw new \InvalidArgumentException("$path: $attr must name a static method of $this->name");
+                }
+                $code[$kind] = $class->getMethod($decl->$attr)->getClosure();
+            }
+        }
+        if ((isset($code['options']) && !isset(FieldSpec::FETCHED[$type])) || (isset($code['autocomplete']) && $type !== 'AUTO_COMPLETE')
+            || (isset($code['button']) && $type !== 'BUTTON')) {
+            throw new \InvalidArgumentException("$path: fetch, complete and click belong to CHOICE / MULTI_CHOICE / TAGS, AUTO_COMPLETE and BUTTON");
+        }
+        $spec = new FieldSpec($name, $decl, $type, $json, $code);
+        if ($spec->isReference() || $collection) {
             $target = Model::of($decl->ref);
             if ($target->pk === null) {
                 throw new \InvalidArgumentException("$path: $target->name has no primary key");

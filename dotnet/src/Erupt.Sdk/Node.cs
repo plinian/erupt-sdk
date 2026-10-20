@@ -78,14 +78,12 @@ public sealed partial class EruptNode
         [
             ("GET", Route("^/erupt-api/build/([^/]+)$"), Build),
             ("POST", Route("^/erupt-api/data/table/([^/]+)$"), Table),
-            ("POST", Route("^/erupt-api/data/([^/]+)/reference-table/([^/]+)$"), ReferenceTable),
-            ("POST", Route("^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$"), OperationFormValue),
-            ("POST", Route("^/erupt-api/data/([^/]+)/operator/([^/]+)$"), Operation),
             ("GET", Route("^/erupt-api/data/init-value/([^/]+)$"), InitValue),
             ("GET", Route("^/erupt-api/data/([^/]+)/([^/]+)$"), Get),
             ("POST", Route("^/erupt-api/data/modify/([^/]+)$"), Add),
             ("POST", Route("^/erupt-api/data/modify/([^/]+)/update$"), Update),
             ("POST", Route("^/erupt-api/data/modify/([^/]+)/delete$"), Delete),
+            ("POST", Route("^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$"), Invoke),
         ];
     }
 
@@ -260,20 +258,6 @@ public sealed partial class EruptNode
         return await Page(r.Model, r.Repo, BodyObject(r), r.Http.RequestAborted);
     }
 
-    private async Task<JsonNode?> ReferenceTable(Request r, string[] args)
-    {
-        var target = Target(ReferenceField(r.Model, args[0], "REFERENCE_TABLE"));
-        return await Page(target.Model, target.Repo, BodyObject(r), r.Http.RequestAborted);
-    }
-
-    private static FieldDef ReferenceField(EruptModel model, string field, string? editType = null) =>
-        model.FieldMap.TryGetValue(field, out var f) && f.IsReference && (editType is null || f.Type == editType) ? f : throw new Reply(404);
-
-    private (EruptModel Model, IRepository Repo) Target(FieldDef f) =>
-        _models.TryGetValue(f.Target.Name, out var entry)
-            ? entry
-            : throw new InvalidOperationException($"referenced erupt '{f.Target.Name}' is not registered on this node");
-
     private async Task<JsonNode> Page(EruptModel model, IRepository repo, JsonObject body, CancellationToken ct)
     {
         var pageIndex = Math.Max(Int(body["pageIndex"], 1), 1);
@@ -287,12 +271,15 @@ public sealed partial class EruptNode
                 throw new EruptFailure($"illegal sort field '{name}'");
             query.Sort.Add((f.Name, Values.Str(Values.Plain(s?["direction"]) ?? "ASC").ToUpperInvariant() == "DESC"));
         }
+        // a @LinkTree table shows the rows under the picked tree keys; with DependNode, none until one is picked
+        var picked = Values.Plain(body["linkTreeVal"]);
+        if (model.LinkTree is (var link, _) && picked is not null) query.Conditions.Add(Condition(model.FieldMap[link], "IN", picked));
         // a @Vis view's own filter and order, then the DataProxy's
         var (filters, sort) = model.Views.GetValueOrDefault(Values.Plain(body["vis"]) as string ?? "", ([], []));
         if (query.Sort.Count == 0) query.Sort = [.. sort.Count > 0 ? sort : model.OrderBy];
         query.Filters.AddRange(filters);
         query.Filters.AddRange(model.Filters(query.Conditions));
-        var (total, records) = await repo.PageAsync(query, ct);
+        var (total, records) = model.LinkTree is { DependNode: true } && picked is null ? (0, []) : await repo.PageAsync(query, ct);
         var rows = await Rows(model, records, ct);
         model.Hook(p => p.AfterFetch(rows.Cast<JsonObject>().ToList()));
         return new JsonObject
@@ -312,9 +299,12 @@ public sealed partial class EruptNode
         if (key is null || !model.FieldMap.TryGetValue(key, out var f) || f.IsPk || !f.Search)
             throw new EruptFailure($"illegal search field '{key}'");
         var op = Values.Plain(c["expression"]) as string;
-        if (string.IsNullOrEmpty(op)) op = "EQ";
+        return Condition(f, string.IsNullOrEmpty(op) ? "EQ" : op, Values.Plain(c["value"]));
+    }
+
+    private static Cond Condition(FieldDef f, string op, object? value)
+    {
         if (!Ops.Contains(op)) throw new EruptFailure($"illegal operator '{op}'");
-        var value = Values.Plain(c["value"]);
         if (op is "NULL" or "NOT_NULL") return new Cond(f.Name, op);
         if (f.IsReference && op is not ("EQ" or "NEQ" or "IN" or "NOT_IN")) throw new EruptFailure($"illegal operator '{op}' for a reference");
         if (op is "LIKE" or "NOT_LIKE") return new Cond(f.Name, op, Values.Str(value));
@@ -393,6 +383,20 @@ public sealed partial class EruptNode
     }
 
     /// <summary>
+    /// The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the operation
+    /// code, or a field's fetched options, onchange, auto-complete or button with the form's values.
+    /// </summary>
+    private static async Task<JsonNode?> Invoke(Request r, string[] args)
+    {
+        if (args[0] == "operation") return await Operation(r, args[1]);
+        if (args[0] == "operation-form") return R(data: OperationFormValue(r.Model, args[1]));
+        if (!r.Model.FieldMap.TryGetValue(args[1], out var f) || !f.Invoked.TryGetValue(args[0], out var code)) throw new Reply(404);
+        var body = BodyObject(r);
+        var form = new Record(Values.Plain(body["form"]) as Dictionary<string, object?> ?? []);
+        return R(data: await code(form, Values.Plain(body["value"]) as string ?? ""));
+    }
+
+    /// <summary>
     /// Records to browser rows. A reference stays its key: the server resolves its label, the flattened
     /// &lt;field&gt;_&lt;label&gt; column and the tree (erupt-cloud/PROTOCOL.md §7.3).
     /// </summary>
@@ -415,17 +419,13 @@ public sealed partial class EruptNode
         return op.Visible(CurrentUser) ? op : throw new Reply(403);
     }
 
-    private Task<JsonNode?> OperationFormValue(Request r, string[] args)
-    {
-        var op = OperationOf(r.Model, args[0]);
-        // the browser ignores a 404 here and opens an empty form
-        if (op.Form is null) throw new Reply(404);
-        return Task.FromResult<JsonNode?>(new JsonObject(op.Form.Fields.Select(f => KeyValuePair.Create(f.Name, (JsonNode?)null))));
-    }
+    private static JsonObject? OperationFormValue(EruptModel model, string code) =>
+        // none without a form: the server answers the browser a 404, and it opens an empty one
+        OperationOf(model, code).Form is { } form ? new JsonObject(form.Fields.Select(f => KeyValuePair.Create(f.Name, (JsonNode?)null))) : null;
 
-    private async Task<JsonNode?> Operation(Request r, string[] args)
+    private static async Task<JsonNode?> Operation(Request r, string code)
     {
-        var op = OperationOf(r.Model, args[0]);
+        var op = OperationOf(r.Model, code);
         var body = BodyObject(r);
         Record? param = null;
         if (op.Form is not null) param = ToRecord(op.Form, body["param"] as JsonObject ?? []);
@@ -567,7 +567,7 @@ public sealed partial class EruptNode
         ["instanceId"] = InstanceId, ["nodeName"] = Options.Name, ["accessToken"] = Options.AccessToken,
         ["version"] = "dotnet-" + Version, ["nodeAddress"] = new JsonArray(Options.Address),
         ["eruptModules"] = new JsonArray(), ["erupts"] = new JsonArray(_models.Keys.Select(k => (JsonNode)k).ToArray()),
-        ["resources"] = new JsonObject(),
+        ["resources"] = new JsonObject(), ["capabilities"] = new JsonArray("invoke"),
     };
 
     /// <summary>Register every <see cref="NodeOptions.Heartbeat"/> until cancelled (half the interval after a failure).</summary>

@@ -192,6 +192,25 @@ func TestNodeOverSQLite(t *testing.T) {
 	if _, ok := row["category_name"]; ok {
 		t.Errorf("category_name is the server's to add: %v", row)
 	}
+	// operations and their form values run through invoke, under the operation code
+	ids := `{"ids":[` + str(row["id"]) + `],"param":{"note":"go"}}`
+	if code, r := call("POST", "/erupt-api/invoke/Article/operation/feature", "Article", ids); code != 200 || r.(map[string]any)["success"] != true {
+		t.Errorf("operation: %d %v", code, r)
+	}
+	if code, _ := call("POST", "/erupt-api/invoke/Article/operation/missing", "Article", `{}`); code != 404 {
+		t.Errorf("unknown operation: %d", code)
+	}
+	for op, want := range map[string]any{"publish": map[string]any{"note": nil}, "feature": nil} {
+		if _, r := call("POST", "/erupt-api/invoke/Article/operation-form/"+op, "Article", `{}`); !reflect.DeepEqual(r.(map[string]any)["data"], want) {
+			t.Errorf("form value of %s: %v", op, r)
+		}
+	}
+	// the picker and the old operator routes are the server's
+	for _, path := range []string{"reference-table/category", "operator/feature", "operator/publish/form-value"} {
+		if code, _ := call("POST", "/erupt-api/data/Article/"+path, "Article", ids); code != 404 {
+			t.Errorf("%s: %d", path, code)
+		}
+	}
 }
 
 type memo struct {
@@ -419,6 +438,50 @@ func TestBeforeFetch(t *testing.T) {
 	}
 }
 
+type doc struct {
+	ID    int64  `json:"id" erupt:"pk"`
+	Title string `json:"title" erupt:"title=Title"`
+	Topic int64  `json:"topic" erupt:"title=Topic;ref=Category;tree=parent"`
+}
+
+func TestLinkTree(t *testing.T) {
+	if _, err := NewModel(doc{}, "Doc", WithRaw(M{"linkTree": M{"field": "title"}})); err == nil {
+		t.Error("a linkTree on a non-reference field was accepted")
+	}
+	category, _ := testModels(t)
+	m, err := NewModel(doc{}, "Doc", WithName("Doc"), WithRaw(M{"linkTree": LinkTree{Field: Ptr("topic"), DependNode: Ptr(true)}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, _ := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
+	if err := node.Register(category, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Register(m, NewMemoryRepository(Record{"title": "a", "topic": 1}, Record{"title": "b", "topic": 2}, Record{"title": "c", "topic": 3})); err != nil {
+		t.Fatal(err)
+	}
+	titles := func(body string) []string {
+		req := httptest.NewRequest("POST", "/erupt-api/data/table/Doc", strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", "Doc")
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var page struct{ List []map[string]any }
+		_ = json.Unmarshal(w.Body.Bytes(), &page)
+		out := []string{}
+		for _, row := range page.List {
+			out = append(out, str(row["title"]))
+		}
+		return out
+	}
+	// dependNode: nothing until a tree node is picked
+	for body, want := range map[string][]string{`{}`: {}, `{"linkTreeVal":[2]}`: {"b"}, `{"linkTreeVal":["1","2"]}`: {"a", "b"}} {
+		if got := titles(body); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %v, want %v", body, got, want)
+		}
+	}
+}
+
 // A virtual field is in the build only; a slice or map field round-trips as a JSON value.
 func TestVirtualAndJSONFields(t *testing.T) {
 	type Widget struct {
@@ -475,5 +538,140 @@ func TestVirtualAndJSONFields(t *testing.T) {
 	}
 	if _, err := NewModel(Bad{}, "Bad"); err == nil {
 		t.Fatal("a searchable JSON field accepted")
+	}
+}
+
+type order struct {
+	ID       int64   `json:"id" erupt:"pk"`
+	Status   string  `json:"status" erupt:"title=Status"`
+	Tags     string  `json:"tags" erupt:"title=Tags;type=TAGS"`
+	Qty      int64   `json:"qty" erupt:"title=Qty"`
+	Note     string  `json:"note" erupt:"title=Note"`
+	City     string  `json:"city" erupt:"title=City;type=AUTO_COMPLETE"`
+	Body     string  `json:"body" erupt:"title=Body;type=MARKDOWN"`
+	Files    string  `json:"files" erupt:"title=Files;type=ATTACHMENT"`
+	Cats     []int64 `json:"cats" erupt:"title=Categories;type=CHECKBOX;ref=Category"`
+	Sections []int64 `json:"sections" erupt:"title=Sections;type=TAB_TREE;ref=Category"`
+	Calc     any     `json:"calc" erupt:"title=Calc;type=BUTTON"`
+	Stop     any     `json:"stop" erupt:"title=Stop;type=BUTTON"`
+}
+
+func TestFieldTypesAndInvoke(t *testing.T) {
+	type picks struct {
+		ID    int64    `json:"id" erupt:"pk"`
+		Roles []string `json:"roles" erupt:"title=Roles;choices=a:A,b:B"`
+	}
+	if m, err := NewModel(picks{}, "Picks"); err != nil || m.FieldType("roles") != "MULTI_CHOICE" {
+		t.Errorf("a slice field with choices: %v %v", m, err)
+	}
+	complete := FieldCode{Complete: func(context.Context, M, string) ([]string, error) { return nil, nil }}
+	if _, err := NewModel(order{}, "Order", WithFieldCode("note", complete)); err == nil {
+		t.Error("Complete on an INPUT was accepted")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
+	}))
+	defer server.Close()
+	category, _ := testModels(t)
+	m, err := NewModel(order{}, "Order", WithName("Order"),
+		WithFieldCode("status", FieldCode{Fetch: func(_ context.Context, form M) ([]Option, error) {
+			note, _ := form["note"].(string)
+			return []Option{{"new", "New"}, {note, "From form"}}, nil
+		}}),
+		WithFieldCode("tags", FieldCode{Tags: func(context.Context, M) ([]string, error) { return []string{"red", "blue"}, nil }}),
+		WithFieldCode("qty", FieldCode{Onchange: func(_ context.Context, form M) (Change, error) {
+			return Change{FormData: M{"note": str(form["qty"]) + " items"}}, nil
+		}}),
+		WithFieldCode("city", FieldCode{Complete: func(_ context.Context, _ M, typed string) ([]string, error) {
+			var out []string
+			for _, c := range []string{"Paris", "Tokyo"} {
+				if strings.Contains(strings.ToLower(c), strings.ToLower(typed)) {
+					out = append(out, c)
+				}
+			}
+			return out, nil
+		}}),
+		WithFieldCode("calc", FieldCode{Click: func(context.Context, M) (Click, error) {
+			return Click{Eval: "alert(1)", FormData: M{"qty": 2}}, nil
+		}}),
+		WithFieldCode("stop", FieldCode{Click: func(context.Context, M) (Click, error) { return Click{}, Fail("not now") }}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, _ := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	if err := node.Register(category, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Register(m, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
+	}
+	call := func(method, path, body string) (int, map[string]any) {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", "Order")
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var v map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		return w.Code, v
+	}
+	_, build := call("GET", "/erupt-api/build/Order", "")
+	fields, edit := map[string]map[string]any{}, map[string]map[string]any{}
+	for _, f := range build["eruptModel"].(map[string]any)["eruptFieldModels"].([]any) {
+		f := f.(map[string]any)
+		fields[str(f["fieldName"])] = f
+		edit[str(f["fieldName"])] = f["eruptFieldJson"].(map[string]any)["edit"].(map[string]any)
+	}
+	for name, attr := range map[string]string{"status": "choiceType", "tags": "tagsType"} {
+		if got := edit[name][attr].(map[string]any)["fetchHandler"]; !reflect.DeepEqual(got, []any{"invoke"}) {
+			t.Errorf("%s fetchHandler %v", name, got)
+		}
+	}
+	if edit["qty"]["onchange"] != "invoke" || edit["body"]["type"] != "MARKDOWN" || edit["files"]["type"] != "ATTACHMENT" || edit["calc"]["type"] != "BUTTON" {
+		t.Errorf("edits %v %v %v %v", edit["qty"]["onchange"], edit["body"]["type"], edit["files"]["type"], edit["calc"]["type"])
+	}
+	if fields["cats"]["fieldReturnName"] != "Category" || fields["sections"]["fieldReturnName"] != "Category" {
+		t.Errorf("fieldReturnName %v %v", fields["cats"]["fieldReturnName"], fields["sections"]["fieldReturnName"])
+	}
+	invoke := func(kind, field, body string) (int, map[string]any) {
+		return call("POST", "/erupt-api/invoke/Order/"+kind+"/"+field, body)
+	}
+	data := func(kind, field, body string) any {
+		_, r := invoke(kind, field, body)
+		return r["data"]
+	}
+	for _, c := range []struct {
+		kind, field, body string
+		want              any
+	}{
+		{"options", "status", `{"form":{"note":"n"}}`, []any{M{"value": "new", "label": "New"}, M{"value": "n", "label": "From form"}}},
+		{"options", "tags", `{}`, []any{"red", "blue"}},
+		{"onchange", "qty", `{"form":{"qty":3}}`, M{"formData": M{"note": "3 items"}}},
+		{"autocomplete", "city", `{"form":{},"value":"pa"}`, []any{"Paris"}},
+		{"button", "calc", `{"form":{}}`, M{"eval": "alert(1)", "formData": M{"qty": float64(2)}}},
+	} {
+		if got := data(c.kind, c.field, c.body); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s %s: %#v", c.kind, c.field, got)
+		}
+	}
+	if _, r := invoke("button", "stop", `{}`); r["success"] != false || r["message"] != "not now" {
+		t.Errorf("a refused click %v", r)
+	}
+	for _, field := range []string{"button/qty", "options/missing"} {
+		if status, _ := call("POST", "/erupt-api/invoke/Order/"+field, `{}`); status != 404 {
+			t.Errorf("%s: %d", field, status)
+		}
+	}
+	// picked records arrive as [{id: key}] and are stored as their keys
+	if _, r := call("POST", "/erupt-api/data/modify/Order", `{"cats":[{"id":1},{"id":"2"}],"sections":[{"id":3}],"tags":"[\"red\"]"}`); r["success"] != true {
+		t.Fatalf("add %v", r)
+	}
+	_, page := call("POST", "/erupt-api/data/table/Order", `{}`)
+	row := page["list"].([]any)[0].(map[string]any)
+	if !reflect.DeepEqual(row["cats"], []any{float64(1), float64(2)}) || !reflect.DeepEqual(row["sections"], []any{float64(3)}) {
+		t.Errorf("keys %v %v", row["cats"], row["sections"])
+	}
+	if _, ok := row["calc"]; ok {
+		t.Error("a BUTTON reached the row")
 	}
 }

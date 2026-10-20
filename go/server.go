@@ -124,7 +124,7 @@ func (n *Node) register(instanceID string) error {
 	n.mu.RUnlock()
 	info, err := json.Marshal(M{"instanceId": instanceID, "nodeName": n.cfg.Name, "accessToken": n.cfg.AccessToken,
 		"version": "go-" + Version, "nodeAddress": []string{n.cfg.Address}, "eruptModules": []string{},
-		"erupts": erupts, "resources": M{}})
+		"erupts": erupts, "resources": M{}, "capabilities": []string{"invoke"}})
 	if err != nil {
 		return err
 	}

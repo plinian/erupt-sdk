@@ -24,14 +24,12 @@ final class Node
     private const ROUTES = [
         ['GET', '#^/erupt-api/build/([^/]+)$#', 'build'],
         ['POST', '#^/erupt-api/data/table/([^/]+)$#', 'table'],
-        ['POST', '#^/erupt-api/data/([^/]+)/reference-table/([^/]+)$#', 'referenceTable'],
-        ['POST', '#^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$#', 'operationFormValue'],
-        ['POST', '#^/erupt-api/data/([^/]+)/operator/([^/]+)$#', 'operation'],
         ['GET', '#^/erupt-api/data/init-value/([^/]+)$#', 'initValue'],
         ['GET', '#^/erupt-api/data/([^/]+)/([^/]+)$#', 'get'],
         ['POST', '#^/erupt-api/data/modify/([^/]+)$#', 'add'],
         ['POST', '#^/erupt-api/data/modify/([^/]+)/update$#', 'update'],
         ['POST', '#^/erupt-api/data/modify/([^/]+)/delete$#', 'delete'],
+        ['POST', '#^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$#', 'invoke'],
     ];
 
     private static ?array $user = null;
@@ -83,15 +81,6 @@ final class Node
         $repository->bind($model);
         $this->models[$model->name] = [$model, $repository];
         return $this;
-    }
-
-    private function repoOf(Model $target): Repository
-    {
-        [$model, $repo] = $this->models[$target->name] ?? [null, null];
-        if ($model !== $target) {
-            throw new \LogicException("referenced erupt '$target->name' is not registered on this node");
-        }
-        return $repo;
     }
 
     // ---------------------------------------------------------------- serving
@@ -213,21 +202,6 @@ final class Node
         return $this->page($model, $repo, $request->object());
     }
 
-    private function referenceTable(Model $model, Repository $repo, Request $request, string $field): array
-    {
-        $target = $this->referenceField($model, $field, 'REFERENCE_TABLE')->target();
-        return $this->page($target, $this->repoOf($target), $request->object());
-    }
-
-    private function referenceField(Model $model, string $field, ?string $editType = null): FieldSpec
-    {
-        $f = $model->fields[$field] ?? null;
-        if ($f === null || !$f->isReference() || ($editType !== null && $f->type !== $editType)) {
-            throw new Reply(404);
-        }
-        return $f;
-    }
-
     private function page(Model $model, Repository $repo, array $body): array
     {
         $pageIndex = max((int) (($body['pageIndex'] ?? null) ?: 1), 1);
@@ -243,13 +217,18 @@ final class Node
             }
             $query->sort[] = [$f->name, strtoupper((string) ($s['direction'] ?? 'ASC')) === 'DESC'];
         }
+        // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+        $picked = $body['linkTreeVal'] ?? null;
+        if ($model->linkTree && $picked !== null) {
+            $query->conditions[] = $this->condition($model->fields[$model->linkTree[0]], 'IN', $picked);
+        }
         // a @Vis view's own filter and order, then the DataProxy's
         [$filters, $sort] = is_string($body['vis'] ?? null) ? ($model->vis[$body['vis']] ?? [[], []]) : [[], []];
         if (!$query->sort) {
             $query->sort = $sort ?: $model->orderBy;
         }
         $query->filters = [...$filters, ...$model->filters($query->conditions)];
-        [$total, $records] = $repo->page($query);
+        [$total, $records] = $model->linkTree && $model->linkTree[1] && $picked === null ? [0, []] : $repo->page($query);
         $rows = $this->rows($model, $records);
         $model->hook('afterFetch', $rows);
         return ['pageIndex' => $pageIndex, 'pageSize' => $pageSize, 'total' => $total,
@@ -377,6 +356,34 @@ final class Node
     }
 
     /**
+     * The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the
+     * operation code, or a field's fetched options, onchange, auto-complete or button with the form's values.
+     */
+    private function invoke(Model $model, Repository $repo, Request $request, string $kind, string $field): array
+    {
+        if ($kind === 'operation') {
+            return $this->operation($model, $repo, $request, $field);
+        }
+        if ($kind === 'operation-form') {
+            return self::r(data: $this->operationFormValue($model, $field));
+        }
+        $f = current(array_filter($model->declared, fn(FieldSpec $f) => $f->name === $field)) ?: null;
+        $fn = $f?->code[$kind] ?? throw new Reply(404);
+        $body = $request->object();
+        $form = is_array($body['form'] ?? null) ? $body['form'] : [];
+        if ($kind === 'autocomplete') {
+            return self::r(data: array_values($fn($form, is_scalar($body['value'] ?? null) ? (string) $body['value'] : '')));
+        }
+        $answer = $fn($form);
+        if ($kind === 'options') {
+            // value => label, as the choices of a field; a TAGS answers its list of tags
+            $answer = $f->type === 'TAGS' ? array_values($answer)
+                : array_map(fn($v, $label) => ['value' => (string) $v, 'label' => $label], array_keys($answer), $answer);
+        }
+        return self::r(data: $answer);
+    }
+
+    /**
      * Records to browser rows. A reference stays its key: the server resolves its label, the flattened
      * <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
      */
@@ -403,10 +410,11 @@ final class Node
         return $op;
     }
 
-    private function operationFormValue(Model $model, Repository $repo, Request $request, string $code): array
+    private function operationFormValue(Model $model, string $code): ?array
     {
-        $form = $this->operationOf($model, $code)->formModel() ?? throw new Reply(404); // the browser ignores a 404 here
-        return array_fill_keys(array_keys($form->fields), null);
+        // none without a form: the server answers the browser a 404, and it opens an empty one
+        $form = $this->operationOf($model, $code)->formModel();
+        return $form ? array_fill_keys(array_keys($form->fields), null) : null;
     }
 
     private function operation(Model $model, Repository $repo, Request $request, string $code): array
@@ -564,7 +572,7 @@ final class Node
         $server = $this->server();
         $info = ['instanceId' => $this->instanceId, 'nodeName' => $this->name, 'accessToken' => $this->accessToken,
             'version' => 'php-' . self::VERSION, 'nodeAddress' => [$this->address($port)], 'eruptModules' => [],
-            'erupts' => array_keys($this->models), 'resources' => new \stdClass()];
+            'erupts' => array_keys($this->models), 'resources' => new \stdClass(), 'capabilities' => ['invoke']];
         try {
             [$status] = Http::request('POST', "$server/erupt-cloud-api/register-node", ['Content-Type' => 'application/json'], Json::encode($info), 10);
             if ($status >= 200 && $status < 300) {

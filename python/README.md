@@ -122,6 +122,38 @@ class Task: ...
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`tree={"id": "id", "label": "name", "pid": "parent"}` shows the model as a tree, and
+`linkTree={"field": "category"}` puts the tree of a reference field beside the table: the erupt server builds
+both trees from the node's table, and the node keeps the rows under the picked tree node (`dependNode: True`
+shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the inferred types, `type=` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores the
+upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR` (all text), `BUTTON` (form only),
+and `CHECKBOX` / `TAB_TREE` with `ref=`: the picked records, stored as the JSON list of their keys. A
+`list`-annotated field with `choices` is a `MULTI_CHOICE`.
+
+A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
+values:
+
+```python
+@erupt("Order")
+class Order:
+    id: int = Field(pk=True)
+    status: str = Field("Status", fetch=lambda form: {"new": "New", "paid": "Paid"})   # options, also TAGS: [...]
+    qty: int = Field("Qty", onchange=lambda form: {"formData": {"total": form["qty"] * 9}, "editExpr": {}})
+    city: str = Field("City", type="AUTO_COMPLETE", complete=lambda form, typed: lookup(typed))
+    total: float = Field("Total")
+    recalc = Field("Recalc", type="BUTTON", click=lambda form: {"eval": "alert('done')", "formData": {}})
+    tags: list = Field("Tags", type="CHECKBOX", ref=Tag)
+```
+
+`fetch` belongs to `CHOICE` / `MULTI_CHOICE` (`{value: label}` or pairs) and `TAGS` (a list), `complete` to
+`AUTO_COMPLETE`, `click` to `BUTTON`; `onchange` to any field. Raise `Fail` to refuse with a message.
+
 ## Storage
 
 Storage is any `Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:
@@ -147,7 +179,8 @@ repo = SqlRepository(lambda: pymysql.connect(**MYSQL), "article", dialect="mysql
 Without a sort, every repository returns rows by primary key ascending. `erupt.current_user()` returns the
 acting user inside a repository call.
 
-Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload, Excel, i18n of messages.
+Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of reference tables, i18n of messages. Trees, file
+upload and Excel are done by the erupt server.
 
 ## Without a registry
 

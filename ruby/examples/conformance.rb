@@ -60,6 +60,7 @@ class Note
   erupt "Note", power: { delete: false }, data_proxy: NoteProxy
   field :id, pk: true
   field :text, "Text"
+  field :ping, "Ping", type: Erupt::EditType::BUTTON, click: ->(form) { { eval: "pong:#{form["text"]}" } }
 end
 
 node = Erupt::Node.new("conformance", ENV.fetch("ERUPT_ACCESS_TOKEN"), ENV.fetch("ERUPT_SERVER"),

@@ -47,6 +47,7 @@ do {
     let note = try Model("Note", power: ["delete": false], dataProxy: [NoteProxy()]) {
         Field("id", pk: true)
         Field("text", "Text")
+        Field("ping", "Ping", type: .button, click: { form in FormChange(eval: "pong:" + (form["text"]?.text ?? "")) })
     }
 
     let node = try Node(

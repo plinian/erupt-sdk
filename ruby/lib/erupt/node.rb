@@ -27,15 +27,15 @@ module Erupt
     ROUTES = [
       ["GET", %r{\A/erupt-api/build/([^/]+)\z}, :build],
       ["POST", %r{\A/erupt-api/data/table/([^/]+)\z}, :table],
-      ["POST", %r{\A/erupt-api/data/([^/]+)/reference-table/([^/]+)\z}, :reference_table],
-      ["POST", %r{\A/erupt-api/data/([^/]+)/operator/([^/]+)/form-value\z}, :operation_form_value],
-      ["POST", %r{\A/erupt-api/data/([^/]+)/operator/([^/]+)\z}, :operation],
       ["GET", %r{\A/erupt-api/data/init-value/([^/]+)\z}, :init_value],
       ["GET", %r{\A/erupt-api/data/([^/]+)/([^/]+)\z}, :get],
       ["POST", %r{\A/erupt-api/data/modify/([^/]+)\z}, :add],
       ["POST", %r{\A/erupt-api/data/modify/([^/]+)/update\z}, :update],
-      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/delete\z}, :delete]
+      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/delete\z}, :delete],
+      ["POST", %r{\A/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)\z}, :invoke]
     ].freeze
+    # invoke kind -> the Field attribute holding its code
+    INVOKED = { "options" => :fetch, "onchange" => :onchange, "autocomplete" => :complete, "button" => :click }.freeze
 
     # Answered with a bare status
     class Reply < StandardError
@@ -186,21 +186,6 @@ module Erupt
       page(model, repo, read_object(env))
     end
 
-    def reference_table(model, _repo, env, field)
-      target = reference_field(model, field, EditType::REFERENCE_TABLE).target
-      entry = @models[target.name]
-      raise ArgumentError, "referenced erupt '#{target.name}' is not registered on this node" unless entry&.first.equal?(target)
-
-      page(target, entry.last, read_object(env))
-    end
-
-    def reference_field(model, field, edit_type)
-      f = model.fields[field]
-      raise Reply, 404 unless f&.type == edit_type
-
-      f
-    end
-
     def page(model, repo, body)
       page_index = [int(body["pageIndex"] || 1), 1].max
       page_size = int(body["pageSize"] || 10).clamp(1, MAX_PAGE_SIZE)
@@ -212,11 +197,15 @@ module Erupt
 
         query.sort << [f.name, s["direction"].to_s.upcase == "DESC"]
       end
+      # a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+      field, depend = model.link_tree
+      picked = body["linkTreeVal"]
+      query.conditions << condition(model.fields[field], "IN", picked) if field && !picked.nil?
       # a @Vis view's own filter and order, then the DataProxy's
       filters, sort = model.vis.fetch(body["vis"], [[], []])
       query.sort = (sort.empty? ? model.order : sort).dup if query.sort.empty?
       query.filters = filters + model.filters(query.conditions)
-      total, records = repo.page(query)
+      total, records = depend && picked.nil? ? [0, []] : repo.page(query)
       list = rows(model, records)
       model.hook(:after_fetch, list)
       { "pageIndex" => page_index, "pageSize" => page_size, "total" => total, "totalPage" => (total + page_size - 1) / page_size,
@@ -307,6 +296,26 @@ module Erupt
       r
     end
 
+    # The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the operation
+    # code, or a field's fetched options, onchange, auto-complete or button, with the form's values.
+    def invoke(model, repo, env, kind, name)
+      return operation(model, repo, env, name) if kind == "operation"
+      return r(data: operation_form_value(model, name)) if kind == "operation-form"
+
+      f = model.declared.find { |d| d.name == name }
+      fn = f && INVOKED.key?(kind) && f.public_send(INVOKED[kind])
+      raise Reply, 404 unless fn
+
+      body = read_object(env)
+      form = body["form"].is_a?(Hash) ? body["form"] : {}
+      return r(data: fn.call(form, body["value"] || "").to_a) if kind == "autocomplete"
+
+      answer = fn.call(form)
+      # {value => label} or [[value, label]], as the choices of a field
+      answer = answer.to_a.map { |v, label| { "value" => v.to_s, "label" => label } } if kind == "options" && f.type != EditType::TAGS
+      r(data: answer)
+    end
+
     # Records to browser rows. A reference stays its key: the server resolves its label, the flattened
     # <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
     def rows(model, records)
@@ -324,11 +333,10 @@ module Erupt
       op
     end
 
-    def operation_form_value(model, _repo, _env, code)
+    def operation_form_value(model, code)
       op = operation_of(model, code)
-      raise Reply, 404 unless op.form # the browser ignores a 404 here and opens an empty form
-
-      op.form_model.fields.keys.to_h { |name| [name, nil] }
+      # none without a form: the server answers the browser a 404, and it opens an empty one
+      op.form_model.fields.keys.to_h { |name| [name, nil] } if op.form
     end
 
     def operation(model, repo, env, code)
@@ -428,7 +436,8 @@ module Erupt
 
     def node_info
       { "instanceId" => @instance_id, "nodeName" => @name, "accessToken" => @access_token, "version" => "ruby-#{VERSION}",
-        "nodeAddress" => [@address], "eruptModules" => [], "erupts" => @models.keys, "resources" => {} }
+        "nodeAddress" => [@address], "eruptModules" => [], "erupts" => @models.keys, "resources" => {},
+        "capabilities" => ["invoke"] }
     end
 
     def heartbeat_loop

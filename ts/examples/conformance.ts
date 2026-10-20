@@ -37,6 +37,7 @@ const Article = model("Article", {
 const Note = model("Note", {
   id: field.pk(),
   text: field.input("Text"),
+  ping: field.button("Ping", (form) => ({ eval: `pong:${form.text}` })),
 }, {
   power: { delete: false },
   dataProxy: {

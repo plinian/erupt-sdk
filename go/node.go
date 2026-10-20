@@ -137,16 +137,6 @@ func (n *Node) Register(m *Model, repo Repository) error {
 	return nil
 }
 
-func (n *Node) repoOf(target *Model) (Repository, error) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	r := n.models[target.name]
-	if r == nil || r.model != target {
-		return nil, fmt.Errorf("referenced erupt '%s' is not registered on this node", target.name)
-	}
-	return r.repo, nil
-}
-
 // reply is a bare status answer (403 / 404).
 type reply struct{ status int }
 
@@ -171,14 +161,12 @@ type route struct {
 var routes = []route{
 	{"GET", regexp.MustCompile(`^/erupt-api/build/([^/]+)$`), (*Node).build},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/table/([^/]+)$`), (*Node).table},
-	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/reference-table/([^/]+)$`), (*Node).referenceTable},
-	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$`), (*Node).operationFormValue},
-	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/operator/([^/]+)$`), (*Node).operation},
 	{"GET", regexp.MustCompile(`^/erupt-api/data/init-value/([^/]+)$`), (*Node).initValue},
 	{"GET", regexp.MustCompile(`^/erupt-api/data/([^/]+)/([^/]+)$`), (*Node).get},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)$`), (*Node).add},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)/update$`), (*Node).update},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)/delete$`), (*Node).delete},
+	{"POST", regexp.MustCompile(`^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$`), (*Node).invoke},
 }
 
 func r(success bool, message, data any) M {
@@ -374,30 +362,6 @@ func (n *Node) table(q *request) (any, error) {
 	return n.page(q.ctx, q.model, q.repo, body)
 }
 
-func (n *Node) referenceTable(q *request) (any, error) {
-	f, err := referenceField(q.model, q.args[0])
-	if err != nil {
-		return nil, err
-	}
-	repo, err := n.repoOf(f.target)
-	if err != nil {
-		return nil, err
-	}
-	body, err := q.object()
-	if err != nil {
-		return nil, err
-	}
-	return n.page(q.ctx, f.target, repo, body)
-}
-
-func referenceField(m *Model, name string) (*field, error) {
-	f := m.byName[name]
-	if f == nil || f.typ != typeReferenceTable {
-		return nil, reply{404}
-	}
-	return f, nil
-}
-
 func number(v any, fallback int) int {
 	if f, ok := toFloat(v); ok && f != 0 {
 		return int(f)
@@ -434,6 +398,15 @@ func (n *Node) page(ctx context.Context, m *Model, repo Repository, body map[str
 		}
 		q.Sort = append(q.Sort, Order{Field: f.name, Desc: strings.EqualFold(str(obj["direction"]), "DESC")})
 	}
+	// a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+	picked := body["linkTreeVal"]
+	if m.linkTree != "" && picked != nil {
+		cond, err := fieldCondition(m.byName[m.linkTree], "IN", picked)
+		if err != nil {
+			return nil, err
+		}
+		q.Conditions = append(q.Conditions, cond)
+	}
 	// a @Vis view's own filter and order, then the DataProxy's
 	code, _ := body["vis"].(string)
 	v := m.vis[code]
@@ -453,9 +426,12 @@ func (n *Node) page(ctx context.Context, m *Model, repo Repository, body map[str
 			q.Filters = append(q.Filters, f)
 		}
 	}
-	total, records, err := repo.Page(ctx, q)
-	if err != nil {
-		return nil, err
+	total, records := int64(0), []Record{}
+	if !m.dependNode || picked != nil {
+		var err error
+		if total, records, err = repo.Page(ctx, q); err != nil {
+			return nil, err
+		}
 	}
 	rows, err := n.rows(ctx, m, records)
 	if err != nil {
@@ -482,7 +458,11 @@ func condition(m *Model, c map[string]any) (Cond, error) {
 	if !queryOps[op] {
 		return Cond{}, Fail("illegal operator '%s'", op)
 	}
-	value := c["value"]
+	return fieldCondition(f, op, c["value"])
+}
+
+// fieldCondition coerces a condition's value to the field's type.
+func fieldCondition(f *field, op string, value any) (Cond, error) {
 	switch {
 	case op == "NULL" || op == "NOT_NULL":
 		return Cond{Field: f.name, Op: op}, nil
@@ -683,6 +663,55 @@ func (n *Node) delete(q *request) (any, error) {
 	return r(true, nil, nil), nil
 }
 
+// invoke runs the node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the
+// operation code, or a field's fetched options, onchange, auto-complete or button with the form's values.
+func (n *Node) invoke(q *request) (any, error) {
+	switch q.args[0] {
+	case "operation":
+		return n.operation(q, q.args[1])
+	case "operation-form":
+		return n.operationFormValue(q, q.args[1])
+	}
+	f := q.model.byName[q.args[1]]
+	if f == nil {
+		return nil, reply{404}
+	}
+	body, err := q.object()
+	if err != nil {
+		return nil, err
+	}
+	form, _ := body["form"].(map[string]any)
+	if form == nil {
+		form = M{}
+	}
+	var data any
+	switch c := f.code; {
+	case q.args[0] == "options" && c.Fetch != nil:
+		var options []Option
+		options, err = c.Fetch(q.ctx, form)
+		data = append([]Option{}, options...)
+	case q.args[0] == "options" && c.Tags != nil:
+		var tags []string
+		tags, err = c.Tags(q.ctx, form)
+		data = append([]string{}, tags...)
+	case q.args[0] == "onchange" && c.Onchange != nil:
+		data, err = c.Onchange(q.ctx, form)
+	case q.args[0] == "autocomplete" && c.Complete != nil:
+		typed, _ := body["value"].(string)
+		var suggestions []string
+		suggestions, err = c.Complete(q.ctx, form, typed)
+		data = append([]string{}, suggestions...)
+	case q.args[0] == "button" && c.Click != nil:
+		data, err = c.Click(q.ctx, form)
+	default:
+		return nil, reply{404}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r(true, nil, data), nil
+}
+
 // rows turns records into browser rows. A reference stays its key: the server resolves its label, the
 // flattened <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
 func (n *Node) rows(_ context.Context, m *Model, records []Record) ([]M, error) {
@@ -697,9 +726,9 @@ func (n *Node) rows(_ context.Context, m *Model, records []Record) ([]M, error) 
 	return rows, nil
 }
 
-func (n *Node) operationOf(q *request) (*Operation, error) {
+func (n *Node) operationOf(q *request, code string) (*Operation, error) {
 	for _, op := range q.model.operations {
-		if op.Code == q.args[0] {
+		if op.Code == code {
 			// a hidden operation does not exist for this user, exactly like the Java proxy filters it out
 			if !op.visible(UserFrom(q.ctx)) {
 				return nil, reply{403}
@@ -710,19 +739,20 @@ func (n *Node) operationOf(q *request) (*Operation, error) {
 	return nil, reply{404}
 }
 
-func (n *Node) operationFormValue(q *request) (any, error) {
-	op, err := n.operationOf(q)
+func (n *Node) operationFormValue(q *request, code string) (any, error) {
+	op, err := n.operationOf(q, code)
 	if err != nil {
 		return nil, err
 	}
+	// none without a form: the server answers the browser a 404, and it opens an empty one
 	if op.Form == nil {
-		return nil, reply{404} // the browser ignores a 404 here and opens an empty form
+		return r(true, nil, nil), nil
 	}
-	return emptyRow(op.Form), nil
+	return r(true, nil, emptyRow(op.Form)), nil
 }
 
-func (n *Node) operation(q *request) (any, error) {
-	op, err := n.operationOf(q)
+func (n *Node) operation(q *request, code string) (any, error) {
+	op, err := n.operationOf(q, code)
 	if err != nil {
 		return nil, err
 	}

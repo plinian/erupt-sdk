@@ -14,6 +14,12 @@ use crate::values::{as_f64, number, parse_date_time, text};
 use crate::{Error, Record, Result};
 
 pub(crate) const REFERENCES: [&str; 2] = ["REFERENCE_TABLE", "REFERENCE_TREE"];
+/// many records of another model, stored as the JSON list of their keys
+const COLLECTIONS: [&str; 2] = ["CHECKBOX", "TAB_TREE"];
+
+/// A field's own code, run when the server invokes it (erupt-cloud/PROTOCOL.md §5.5): the form's values and
+/// the call's `value` to the answer's `data`.
+type FieldCode = Arc<dyn Fn(&Record, &Value) -> Result<Value> + Send + Sync>;
 
 fn identifier(name: &str) -> bool {
     let mut chars = name.chars();
@@ -63,6 +69,12 @@ pub struct Field {
     pub(crate) tree: Option<String>,
     view: Value,
     edit: Value,
+    fetch: Option<FieldCode>,
+    /// `fetch` answers TAGS' tags rather than CHOICE / MULTI_CHOICE options
+    fetch_tags: bool,
+    onchange: Option<FieldCode>,
+    complete: Option<FieldCode>,
+    click: Option<FieldCode>,
 }
 
 impl Field {
@@ -77,13 +89,19 @@ impl Field {
             table: true,
             form: true,
             choices: Vec::new(),
-            transient: false,
+            // a BUTTON is a form element only
+            transient: kind == "BUTTON",
             json: false,
             target: None,
             label: "name".to_string(),
             tree: None,
             view: json!({}),
             edit: json!({}),
+            fetch: None,
+            fetch_tags: false,
+            onchange: None,
+            complete: None,
+            click: None,
         }
     }
 
@@ -118,6 +136,13 @@ impl Field {
             .collect();
         f
     }
+    /// A multi-select over `(value, label)` pairs, kept as a JSON list of the values.
+    pub fn multi_choice(title: &str, choices: &[(&str, &str)]) -> Self {
+        let mut f = Field::choice(title, choices);
+        f.kind = "MULTI_CHOICE".to_string();
+        f.json = true;
+        f
+    }
     /// Any edit type the SDK has a template for, by its schema name.
     pub fn of(edit_type: EditType, title: &str) -> Self {
         Field::new(edit_type.as_str(), title)
@@ -126,6 +151,21 @@ impl Field {
     pub fn reference(target: &Arc<Model>, title: &str) -> Self {
         let mut f = Field::new("REFERENCE_TABLE", title);
         f.target = Some(target.clone());
+        f
+    }
+    /// Records of another model, ticked in a list; stored as the JSON list of their primary keys.
+    pub fn checkbox(target: &Arc<Model>, title: &str) -> Self {
+        Field::collection("CHECKBOX", target, title)
+    }
+    /// Records of another model, picked in its own tree (`.raw(json!({"tree": ...}))` on it); stored as the
+    /// JSON list of their primary keys.
+    pub fn tab_tree(target: &Arc<Model>, title: &str) -> Self {
+        Field::collection("TAB_TREE", target, title)
+    }
+    fn collection(kind: &str, target: &Arc<Model>, title: &str) -> Self {
+        let mut f = Field::new(kind, title);
+        f.target = Some(target.clone());
+        f.json = true;
         f
     }
 
@@ -157,7 +197,7 @@ impl Field {
         self.transient = true;
         self
     }
-    /// The value is a JSON array or object (MULTI_CHOICE, KEY_VALUE via a raw edit type), kept as JSON text
+    /// The value is a JSON array or object (KEY_VALUE via a raw edit type), kept as JSON text
     /// by SQL repositories and returned as JSON.
     pub fn json(mut self) -> Self {
         self.json = true;
@@ -172,6 +212,56 @@ impl Field {
     pub fn tree(mut self, pid: &str) -> Self {
         self.tree = Some(pid.to_string());
         self.kind = "REFERENCE_TREE".to_string();
+        self
+    }
+    /// CHOICE / MULTI_CHOICE: the `(value, label)` options, fetched with the form's values when it opens.
+    pub fn fetch(
+        mut self,
+        fetch: impl Fn(&Record) -> Result<Vec<(String, String)>> + Send + Sync + 'static,
+    ) -> Self {
+        self.fetch = Some(Arc::new(move |form, _| {
+            Ok(fetch(form)?
+                .into_iter()
+                .map(|(value, label)| json!({"value": value, "label": label}))
+                .collect())
+        }));
+        self.fetch_tags = false;
+        self
+    }
+    /// TAGS: the tags offered, fetched with the form's values when it opens.
+    pub fn fetch_tags(
+        mut self,
+        fetch: impl Fn(&Record) -> Result<Vec<String>> + Send + Sync + 'static,
+    ) -> Self {
+        self.fetch = Some(Arc::new(move |form, _| Ok(json!(fetch(form)?))));
+        self.fetch_tags = true;
+        self
+    }
+    /// Run when the field changes in the form: answer `{"formData": {...}, "editExpr": {...}}`.
+    pub fn onchange(
+        mut self,
+        onchange: impl Fn(&Record) -> Result<Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.onchange = Some(Arc::new(move |form, _| onchange(form)));
+        self
+    }
+    /// AUTO_COMPLETE: the suggestions for what was typed.
+    pub fn complete(
+        mut self,
+        complete: impl Fn(&Record, &str) -> Result<Vec<String>> + Send + Sync + 'static,
+    ) -> Self {
+        self.complete = Some(Arc::new(move |form, typed| {
+            Ok(json!(complete(form, typed.as_str().unwrap_or(""))?))
+        }));
+        self
+    }
+    /// BUTTON: run on a click; answer `{"eval": "js", "formData": {...}, "editExpr": {...}}`. `eval` runs as
+    /// JavaScript in the browser, so only put code you wrote there.
+    pub fn click(
+        mut self,
+        click: impl Fn(&Record) -> Result<Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.click = Some(Arc::new(move |form, _| click(form)));
         self
     }
     /// Raw `@View` attributes, validated against the schema when the model is built.
@@ -193,6 +283,22 @@ impl Field {
         REFERENCES.contains(&self.kind.as_str())
     }
 
+    fn is_collection(&self) -> bool {
+        COLLECTIONS.contains(&self.kind.as_str())
+    }
+
+    /// Run the field's code for an invoke `kind`; None when it has none.
+    pub(crate) fn invoke(&self, kind: &str, form: &Record, value: &Value) -> Option<Result<Value>> {
+        let code = match kind {
+            "options" => &self.fetch,
+            "onchange" => &self.onchange,
+            "autocomplete" => &self.complete,
+            "button" => &self.click,
+            _ => return None,
+        };
+        code.as_ref().map(|code| code(form, value))
+    }
+
     pub(crate) fn target(&self) -> &Model {
         self.target.as_deref().expect("reference target")
     }
@@ -212,9 +318,22 @@ impl Field {
             edit["notNull"] = json!(self.not_null);
             edit["show"] = json!(self.form);
             edit["search"]["value"] = json!(self.search);
-            let view = &mut efj["views"][0];
-            view["title"] = json!(self.title);
-            view["sortable"] = json!(self.sortable);
+            if self.fetch.is_some() {
+                let attr = match self.kind.as_str() {
+                    "CHOICE" => "choiceType",
+                    "MULTI_CHOICE" => "multiChoiceType",
+                    _ => "tagsType",
+                };
+                edit[attr]["fetchHandler"] = json!(["invoke"]);
+            }
+            if self.onchange.is_some() {
+                edit["onchange"] = json!("invoke");
+            }
+            // a BUTTON's template has no table column
+            if let Some(view) = efj["views"].get_mut(0) {
+                view["title"] = json!(self.title);
+                view["sortable"] = json!(self.sortable);
+            }
         }
         match self.kind.as_str() {
             "DATE" => tpl["eruptFieldJson"]["views"][0]["type"] = json!("DATE"),
@@ -234,15 +353,22 @@ impl Field {
                 }
                 efj["views"][0]["column"] = json!(self.label);
             }
+            // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+            "CHECKBOX" | "TAB_TREE" => {
+                tpl["fieldReturnName"] = json!(self.target().name);
+                tpl["eruptFieldJson"]["views"][0]["column"] = json!(self.label);
+            }
             _ => {}
         }
         let efj = &mut tpl["eruptFieldJson"];
         merge(&mut efj["edit"], &self.edit);
-        merge(&mut efj["views"][0], &self.view);
+        if let Some(view) = efj["views"].get_mut(0) {
+            merge(view, &self.view);
+        }
         if !self.table {
             efj["views"] = json!([]);
         }
-        // a CHOICE, or a MULTI_CHOICE by raw edit type: the options travel as componentValue
+        // a CHOICE or MULTI_CHOICE: the options travel as componentValue
         if !self.choices.is_empty() {
             tpl["componentValue"] = Value::Array(
                 self.choices
@@ -265,6 +391,28 @@ impl Field {
                 other => other.clone(),
             };
             return target.field(pk).expect("target pk").coerce(&id);
+        }
+        if self.is_collection() {
+            // picked records arrive as [{"id": key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), stored as keys
+            let target = self.target();
+            let pk = target.pk.as_deref().unwrap_or("id");
+            let items = match value {
+                Value::Null => json!([]),
+                Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+                other => other.clone(),
+            };
+            let Value::Array(items) = items else {
+                return Err(format!("illegal value '{}'", text(value)));
+            };
+            let key = target.field(pk).expect("target pk");
+            return items
+                .iter()
+                .map(|item| match item {
+                    Value::Object(o) => key.coerce(o.get(pk).or(o.values().next()).unwrap_or(item)),
+                    other => key.coerce(other),
+                })
+                .collect::<std::result::Result<_, _>>()
+                .map(Value::Array);
         }
         if value.is_null() || value.as_str() == Some("") {
             return Ok(Value::Null);
@@ -522,6 +670,8 @@ pub struct Model {
     pub(crate) order_by: Vec<(String, bool)>,
     /// view code -> the filters and order the node applies to that view's table pages
     pub(crate) vis: HashMap<String, (Vec<Filter>, Order)>,
+    /// (field, dependNode) of a @LinkTree: the reference the tree beside the table filters
+    pub(crate) link_tree: Option<(String, bool)>,
     raw: Value,
     pub(crate) operations: Vec<Operation>,
     pub(crate) proxies: Vec<Arc<dyn DataProxy>>,
@@ -702,6 +852,20 @@ impl ModelBuilder {
             if f.json && (f.search || f.sortable) {
                 return fail(format!("{path}: a JSON field cannot be searched or sorted"));
             }
+            let fetched = match f.kind.as_str() {
+                "CHOICE" | "MULTI_CHOICE" => !f.fetch_tags,
+                "TAGS" => f.fetch_tags,
+                _ => false,
+            };
+            if (f.fetch.is_some() && !fetched)
+                || (f.complete.is_some() && f.kind != "AUTO_COMPLETE")
+                || (f.click.is_some() && f.kind != "BUTTON")
+            {
+                return fail(format!(
+                    "{path}: fetch, fetch_tags, complete and click belong to CHOICE / MULTI_CHOICE, TAGS, \
+                     AUTO_COMPLETE and BUTTON"
+                ));
+            }
             check("View", &f.view, &format!("{path}.view"), true).map_err(Error::Declaration)?;
             check("Edit", &f.edit, &format!("{path}.edit"), true).map_err(Error::Declaration)?;
             if let Some(target) = &f.target {
@@ -729,6 +893,20 @@ impl ModelBuilder {
             .into_iter()
             .map(|(code, filters, sort)| Ok((code, (filters, parse_order(name, &fields, &sort)?))))
             .collect::<Result<_>>()?;
+        let link_tree = raw.get("linkTree").and_then(|t| {
+            let field = t.get("field")?.as_str().filter(|f| !f.is_empty())?;
+            Some((
+                field.to_string(),
+                t.get("dependNode") == Some(&Value::Bool(true)),
+            ))
+        });
+        if let Some((field, _)) = &link_tree {
+            if !fields.iter().any(|f| &f.name == field && f.is_reference()) {
+                return fail(format!(
+                    "{name}: linkTree.field '{field}' must be a reference field"
+                ));
+            }
+        }
         let mut codes = HashSet::new();
         for op in &self.operations {
             let path = format!("{name}.{}", op.code);
@@ -751,6 +929,7 @@ impl ModelBuilder {
             power,
             order_by,
             vis,
+            link_tree,
             raw,
             operations: self.operations,
             proxies: self.proxies,

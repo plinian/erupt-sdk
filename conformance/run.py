@@ -345,13 +345,33 @@ def data_proxy(n):
     ok_r(n.call("POST", "/erupt-api/data/modify/Note", {"text": "fine"}, erupt="Note"), "validate lets a record through")
 
 
+def invoked():
+    """Whether the node serves invoke (PROTOCOL.md §5.5); a Java node keeps the Java endpoints."""
+    return "invoke" in (FakeServer.registrations[0].get("capabilities") or [])
+
+
+@check
+def invoke(n):
+    if not invoked():
+        return
+    status, r = n.call("POST", "/erupt-api/invoke/Note/button/ping", {"form": {"text": "hi"}}, erupt="Note")
+    eq((200, True, "pong:hi"), (status, r.get("success"), (r.get("data") or {}).get("eval")), "button")
+    eq(404, n.call("POST", "/erupt-api/invoke/Note/button/text", {"form": {}}, erupt="Note")[0], "a field without that code")
+
+
 @check
 def references(n):
     clear_articles(n)
-    status, page = n.call("POST", "/erupt-api/data/Article/reference-table/category?tabRef=false",
-                          {"pageIndex": 1, "pageSize": 10, "condition": [{"key": "name", "expression": "LIKE", "value": "py"}]})
-    eq((200, [{"id": 2, "name": "Python", "parent": 1}]), (status, page["list"]), "picker")
-    eq(404, n.call("POST", "/erupt-api/data/Article/reference-table/topic", {})[0], "table picker on a tree field")
+    query = {"pageIndex": 1, "pageSize": 10, "condition": [{"key": "name", "expression": "LIKE", "value": "py"}]}
+    if invoked():
+        # the server reads the picker off the referenced model's own table
+        status, page = n.call("POST", "/erupt-api/data/table/Category", query, erupt="Category")
+        eq((200, [{"id": 2, "name": "Python", "parent": 1}]), (status, page["list"]), "picker")
+        eq(404, n.call("POST", "/erupt-api/data/Article/reference-table/category", query)[0], "reference-table is the server's")
+    else:
+        status, page = n.call("POST", "/erupt-api/data/Article/reference-table/category?tabRef=false", query)
+        eq((200, [{"id": 2, "name": "Python", "parent": 1}]), (status, page["list"]), "picker")
+        eq(404, n.call("POST", "/erupt-api/data/Article/reference-table/topic", {})[0], "table picker on a tree field")
     add(n, title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
     row = table(n)["list"][0]
     # a reference travels as its key: the server resolves the label and the flattened column
@@ -377,7 +397,8 @@ def operations(n):
     add(n, title="A")
     add(n, title="B")
     ids = [r["id"] for r in table(n)["list"]]
-    path = "/erupt-api/data/Article/operator/"
+    # a node serving invoke runs operations through it, under the operation code
+    path = "/erupt-api/invoke/Article/operation/" if invoked() else "/erupt-api/data/Article/operator/"
     fail_r(n.call("POST", path + "publish", {"ids": ids, "param": {}}), "form validation")
     r = ok_r(n.call("POST", path + "publish", {"ids": ids, "param": {"note": "go"}}), "publish")
     eq("Executed successfully", r["message"], "publish message")
@@ -388,8 +409,13 @@ def operations(n):
     eq(403, n.call("POST", path + "rebuild", {"ids": None, "param": None})[0], "hidden operation")
     ok_r(n.call("POST", path + "rebuild", {"ids": None, "param": None}, account="root"), "BUTTON operation")
     eq(404, n.call("POST", path + "missing", {})[0], "unknown operation")
-    eq((200, {"note": None}), n.call("POST", path + "publish/form-value?ids=" + str(ids[0])), "form-value")
-    eq(404, n.call("POST", path + "feature/form-value")[0], "form-value without a form")
+    if invoked():
+        eq({"note": None}, ok_r(n.call("POST", "/erupt-api/invoke/Article/operation-form/publish", {}), "form-value")["data"], "form-value")
+        eq(None, ok_r(n.call("POST", "/erupt-api/invoke/Article/operation-form/feature", {}))["data"], "form-value without a form")
+        eq(404, n.call("POST", "/erupt-api/data/Article/operator/publish", {"ids": ids})[0], "operator is invoke's")
+    else:
+        eq((200, {"note": None}), n.call("POST", path + "publish/form-value?ids=" + str(ids[0])), "form-value")
+        eq(404, n.call("POST", path + "feature/form-value")[0], "form-value without a form")
 
 
 @check
