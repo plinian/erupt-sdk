@@ -30,11 +30,38 @@ impl Cond {
     }
 }
 
+/// SQL ANDed to a table page's WHERE, as written, from a `vis` view's `filter` or a
+/// [`DataProxy::before_fetch`](crate::DataProxy::before_fetch). With `params`, each `?` in it is one of them,
+/// bound like every other value; `"done = 0".into()` for SQL alone, taken as is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Filter {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
+impl Filter {
+    pub fn new(sql: &str, params: Vec<Value>) -> Self {
+        Filter {
+            sql: sql.to_string(),
+            params,
+        }
+    }
+}
+
+impl From<&str> for Filter {
+    fn from(sql: &str) -> Self {
+        Filter::new(sql, Vec::new())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Query {
     pub conditions: Vec<Cond>,
     /// `(field, descending)`
     pub sort: Vec<(String, bool)>,
+    /// From a `vis` view and the model's `DataProxy::before_fetch`: a repository must apply every one or refuse
+    /// the query.
+    pub filters: Vec<Filter>,
     pub offset: u64,
     pub limit: u64,
 }
@@ -44,6 +71,7 @@ impl Default for Query {
         Query {
             conditions: Vec::new(),
             sort: Vec::new(),
+            filters: Vec::new(),
             offset: 0,
             limit: 10,
         }
@@ -51,7 +79,7 @@ impl Default for Query {
 }
 
 /// Implement these to put a model on any storage. Calls block; mount the node with spawn_blocking under an
-/// async runtime.
+/// async runtime. `page` must apply [`Query::filters`] or refuse a query that has them, never ignore them.
 pub trait Repository: Send + Sync {
     /// Called once by `Node::register` with the model this repository stores.
     fn bind(&mut self, model: Arc<Model>) -> Result<()>;
@@ -151,6 +179,11 @@ impl Repository for MemoryRepository {
     }
 
     fn page(&self, query: &Query) -> Result<(u64, Vec<Record>)> {
+        if !query.filters.is_empty() {
+            return Err(Error::Other(
+                "MemoryRepository cannot apply SQL filters (a view filter, before_fetch)".into(),
+            ));
+        }
         let state = self.state.lock().expect("memory repository lock");
         let mut rows: Vec<&Record> = state
             .1

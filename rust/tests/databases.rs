@@ -59,6 +59,7 @@ fn scenario(executor: impl SqlExecutor + 'static, dialect: Dialect, ddl: &[&str]
                 .page(&Query {
                     conditions,
                     sort,
+                    filters: vec![],
                     offset: 0,
                     limit: 10,
                 })
@@ -129,6 +130,7 @@ fn scenario(executor: impl SqlExecutor + 'static, dialect: Dialect, ddl: &[&str]
         .page(&Query {
             conditions: vec![],
             sort: vec![("views".into(), true)],
+            filters: vec![],
             offset: 1,
             limit: 1,
         })

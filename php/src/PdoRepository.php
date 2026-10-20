@@ -47,11 +47,19 @@ final class PdoRepository implements Repository
     }
 
     /** @return array{0: string, 1: list<mixed>} */
-    private function where(array $conditions): array
+    private function where(Query $query): array
     {
         $clauses = [];
         $params = [];
-        foreach ($conditions as $c) {
+        foreach ($query->filters as [$sql, $values]) {
+            // the developer's own SQL, as written; with values, each '?' is one of them, bound like every other value
+            if ($values && substr_count($sql, '?') !== count($values)) {
+                throw new \InvalidArgumentException('filter: ' . substr_count($sql, '?') . " '?' for " . count($values) . " params in '$sql'");
+            }
+            $clauses[] = "($sql)";
+            array_push($params, ...$values);
+        }
+        foreach ($query->conditions as $c) {
             $col = $this->q($c->field);
             switch ($c->op) {
                 case 'LIKE':
@@ -86,7 +94,7 @@ final class PdoRepository implements Repository
 
     public function page(Query $query): array
     {
-        [$where, $params] = $this->where($query->conditions);
+        [$where, $params] = $this->where($query);
         $table = $this->q($this->table);
         $total = (int) $this->run("SELECT COUNT(*) FROM $table$where", $params)->fetchColumn();
         // nulls last ascending and first descending on every database, like MemoryRepository

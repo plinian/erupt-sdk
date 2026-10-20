@@ -26,7 +26,6 @@ module Erupt
 
     ROUTES = [
       ["GET", %r{\A/erupt-api/build/([^/]+)\z}, :build],
-      ["GET", %r{\A/erupt-api/build/([^/]+)/([^/]+)\z}, :build_by_field],
       ["POST", %r{\A/erupt-api/data/table/([^/]+)\z}, :table],
       ["POST", %r{\A/erupt-api/data/([^/]+)/reference-table/([^/]+)\z}, :reference_table],
       ["POST", %r{\A/erupt-api/data/([^/]+)/operator/([^/]+)/form-value\z}, :operation_form_value],
@@ -47,9 +46,6 @@ module Erupt
         @status = status
       end
     end
-
-    # A business error shown to the user as an R message
-    class Fail < StandardError; end
 
     # Logs to $stderr unless a logger (Rails.logger, Logger.new(...)) is given.
     class StderrLog
@@ -185,12 +181,6 @@ module Erupt
 
     def build(model, _repo, env) = model.build_model(power(model, env), Erupt.current_user)
 
-    # the reference picker: build of the referenced model, requested under the host model's name
-    def build_by_field(model, _repo, env, field)
-      target = reference_field(model, field).target
-      target.build_model(power(target, env), Erupt.current_user)
-    end
-
     def table(model, repo, env)
       require_power(model, env, "query")
       page(model, repo, read_object(env))
@@ -204,9 +194,9 @@ module Erupt
       page(target, entry.last, read_object(env))
     end
 
-    def reference_field(model, field, edit_type = nil)
+    def reference_field(model, field, edit_type)
       f = model.fields[field]
-      raise Reply, 404 unless f&.reference? && (edit_type.nil? || f.type == edit_type)
+      raise Reply, 404 unless f&.type == edit_type
 
       f
     end
@@ -222,10 +212,15 @@ module Erupt
 
         query.sort << [f.name, s["direction"].to_s.upcase == "DESC"]
       end
-      query.sort = model.order.dup if query.sort.empty?
+      # a @Vis view's own filter and order, then the DataProxy's
+      filters, sort = model.vis.fetch(body["vis"], [[], []])
+      query.sort = (sort.empty? ? model.order : sort).dup if query.sort.empty?
+      query.filters = filters + model.filters(query.conditions)
       total, records = repo.page(query)
+      list = rows(model, records)
+      model.hook(:after_fetch, list)
       { "pageIndex" => page_index, "pageSize" => page_size, "total" => total, "totalPage" => (total + page_size - 1) / page_size,
-        "list" => rows(model, records), "sort" => nil, "alert" => nil, "extraContent" => nil }
+        "list" => list, "sort" => nil, "alert" => nil, "extraContent" => nil }
     end
 
     def conditions(model, c)
@@ -260,7 +255,9 @@ module Erupt
 
     def init_value(model, _repo, env)
       require_power(model, env, "add")
-      model.fields.keys.to_h { |name| [name, nil] }
+      record = model.fields.keys.to_h { |name| [name, nil] }
+      model.hook(:add_behavior, record)
+      rows(model, [record]).first
     end
 
     def get(model, repo, env, pk)
@@ -268,12 +265,17 @@ module Erupt
       raise Reply, 403 unless granted["edit"] || granted["viewDetails"]
 
       record = repo.get(pk_of(model, pk)) or raise Fail, "record not found"
+      model.hook(:edit_behavior, record)
       rows(model, [record]).first
     end
 
     def add(model, repo, env)
       require_power(model, env, "add")
-      repo.add(record(model, read_object(env)))
+      rec = record(model, read_object(env))
+      model.hook(:validate, rec)
+      model.hook(:before_add, rec)
+      repo.add(rec)
+      model.hook(:after_add, rec)
       r
     end
 
@@ -283,7 +285,11 @@ module Erupt
       pk = pk_of(model, body[model.pk])
       raise Fail, "record not found" if repo.get(pk).nil?
 
-      repo.update(pk, record(model, body))
+      rec = record(model, body)
+      model.hook(:validate, rec)
+      model.hook(:before_update, rec)
+      repo.update(pk, rec)
+      model.hook(:after_update, rec)
       r
     end
 
@@ -292,7 +298,12 @@ module Erupt
       ids = read_json(env)
       raise Fail, "a list of ids is required" unless ids.is_a?(Array)
 
-      repo.delete(ids.map { |pk| pk_of(model, pk) })
+      pks = ids.map { |pk| pk_of(model, pk) }
+      # the hooks see each record as it was; reading them costs nothing without a proxy
+      records = model.proxies.empty? ? [] : pks.filter_map { |pk| repo.get(pk) }
+      records.each { |rec| model.hook(:before_delete, rec) }
+      repo.delete(pks)
+      records.each { |rec| model.hook(:after_delete, rec) }
       r
     end
 

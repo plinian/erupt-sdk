@@ -5,6 +5,14 @@ import Foundation
 let env = ProcessInfo.processInfo.environment
 let port = Int(env["PORT"] ?? "") ?? 9090
 
+struct NoteProxy: DataProxy {
+    func addBehavior(_ record: inout Record) { record["text"] = "new" }
+
+    func validate(_ record: Record) throws {
+        if record["text"] == "forbidden" { throw EruptFailure("forbidden text") }
+    }
+}
+
 do {
     let category = try Model("Category") {
         Field("id", pk: true)
@@ -36,7 +44,7 @@ do {
         RowAction("rebuild", "Rebuild", mode: .button, show: { $0?.account == "root" }) { _ in nil }
     }
 
-    let note = try Model("Note", power: ["delete": false]) {
+    let note = try Model("Note", power: ["delete": false], dataProxy: [NoteProxy()]) {
         Field("id", pk: true)
         Field("text", "Text")
     }

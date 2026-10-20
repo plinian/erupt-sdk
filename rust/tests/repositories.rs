@@ -41,6 +41,7 @@ fn scenario(kind: &str, mut repo: Box<dyn Repository>) {
                 .page(&Query {
                     conditions,
                     sort,
+                    filters: vec![],
                     offset: 0,
                     limit: 10,
                 })
@@ -111,6 +112,7 @@ fn scenario(kind: &str, mut repo: Box<dyn Repository>) {
         .page(&Query {
             conditions: vec![],
             sort: vec![("views".into(), true)],
+            filters: vec![],
             offset: 1,
             limit: 1,
         })

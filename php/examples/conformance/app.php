@@ -10,6 +10,8 @@ namespace Erupt\Examples\Conformance;
 use Erupt\Attribute\Erupt;
 use Erupt\Attribute\Field;
 use Erupt\Attribute\Operation;
+use Erupt\DataProxy;
+use Erupt\Fail;
 use Erupt\Node;
 use Erupt\OperationContext;
 use Erupt\PdoRepository;
@@ -69,7 +71,22 @@ final class Article
     }
 }
 
-#[Erupt('Note', power: ['delete' => false])]
+final class NoteProxy extends DataProxy
+{
+    public function addBehavior(array &$record): void
+    {
+        $record['text'] = 'new';
+    }
+
+    public function validate(array &$record): void
+    {
+        if (($record['text'] ?? null) === 'forbidden') {
+            throw new Fail('forbidden text');
+        }
+    }
+}
+
+#[Erupt('Note', power: ['delete' => false], dataProxy: NoteProxy::class)]
 final class Note
 {
     #[Field(pk: true)] public int $id;

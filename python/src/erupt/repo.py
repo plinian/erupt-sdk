@@ -22,6 +22,7 @@ class Cond:
 class Query:
     conditions: list = field(default_factory=list)
     sort: list = field(default_factory=list)  # [(field, descending)]
+    filters: list = field(default_factory=list)  # [(sql, params)] of a @Vis view and DataProxy.before_fetch, ANDed as written
     offset: int = 0
     limit: int = 10
 
@@ -89,6 +90,8 @@ class MemoryRepository(Repository):
             self.add(record)
 
     def page(self, query):
+        if query.filters:
+            raise ValueError("MemoryRepository cannot apply SQL filters (a view filter, before_fetch)")
         with self._lock:
             rows = [r for r in self._rows.values() if all(_match(r.get(c.field), c) for c in query.conditions)]
         for name, desc in reversed(query.sort):
@@ -234,8 +237,15 @@ class SqlRepository(Repository):
                 cols.append(f"{self._q(f.name)} {_SQLITE_TYPES.get(f.type, 'TEXT')}")
         self._run((f"CREATE TABLE IF NOT EXISTS {self._q(self.table)} ({', '.join(cols)})", _Sql()), write=True)
 
-    def _where(self, conditions, b):
+    def _where(self, query, b):
         clauses = []
+        for sql, params in query.filters:
+            # the developer's own SQL, as written; with params, each '?' is one of them, bound like every other value
+            pieces = sql.split("?") if params else [sql]
+            if len(pieces) - 1 != len(params):
+                raise ValueError(f"filter: {len(pieces) - 1} '?' for {len(params)} params in {sql!r}")
+            clauses.append("(" + pieces[0] + "".join(b.p(v) + piece for v, piece in zip(params, pieces[1:])) + ")")
+        conditions = query.conditions
         for c in conditions:
             col = self._q(c.field)
             if c.op in _SQL_OPS:
@@ -258,10 +268,10 @@ class SqlRepository(Repository):
     def page(self, query):
         table = self._q(self.table)
         b = _Sql()
-        where = self._where(query.conditions, b)
+        where = self._where(query, b)
         total = next(iter(self._run((f"SELECT COUNT(*) AS n FROM {table}{where}", b))[0].values()))
         b = _Sql()
-        where = self._where(query.conditions, b)
+        where = self._where(query, b)
         order = ", ".join(f"{self._q(n)} {'DESC' if d else 'ASC'}" for n, d in query.sort) or self._q(self.model.pk) + " ASC"
         if _DIALECTS[self.dialect][2] == "limit":
             paging = f"LIMIT {b.p(query.limit)} OFFSET {b.p(query.offset)}"

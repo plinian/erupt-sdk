@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Data.Sqlite;
 
 namespace Erupt.Tests;
 
@@ -29,14 +30,14 @@ public class NodeTests
     }
 
     private static async Task<(int Status, JsonNode? Body)> Call(EruptNode node, string method, string path, object? body = null,
-        string? erupt = "Article", Action<HttpRequest>? tweak = null)
+        string? erupt = "Article", Action<HttpRequest>? tweak = null, string account = "admin")
     {
         var context = new DefaultHttpContext();
         context.Request.Method = method;
         context.Request.Path = path;
         context.Request.Headers["Access-Token"] = Token;
         context.Request.Headers["token"] = "t1";
-        context.Request.Headers["user"] = Convert.ToBase64String(Encoding.UTF8.GetBytes("""{"uid":1,"account":"admin"}"""));
+        context.Request.Headers["user"] = Convert.ToBase64String(Encoding.UTF8.GetBytes($$"""{"uid":1,"account":"{{account}}"}"""));
         if (erupt is not null) context.Request.Headers["erupt"] = erupt;
         context.Request.Body = new MemoryStream(body is null ? [] : Encoding.UTF8.GetBytes(body as string ?? System.Text.Json.JsonSerializer.Serialize(body)));
         tweak?.Invoke(context.Request);
@@ -77,6 +78,65 @@ public class NodeTests
         Assert.Equal("Title cannot be empty", fail!["message"]!.GetValue<string>());
         var (treeStatus, _) = await Call(node, "GET", "/erupt-api/data/Article/reference-tree/topic");
         Assert.Equal(404, treeStatus); // the server builds reference trees
+    }
+
+    [Fact]
+    public async Task DataProxy()
+    {
+        var node = Node();
+        node.Register<Memo>(new MemoryRepository());
+        MemoProxy.Calls.Clear();
+        var (_, build) = await Call(node, "GET", "/erupt-api/build/Memo", erupt: "Memo");
+        Assert.Equal("""{"text":"hi"}""", build!["eruptModel"]!["searchCondition"]!.ToJsonString());
+        Assert.Equal("new", (await Call(node, "GET", "/erupt-api/data/init-value/Memo", erupt: "Memo")).Body!["text"]!.GetValue<string>());
+        var (_, fail) = await Call(node, "POST", "/erupt-api/data/modify/Memo", new { text = "forbidden" }, "Memo");
+        Assert.Equal((false, "forbidden text"), (fail!["success"]!.GetValue<bool>(), fail["message"]!.GetValue<string>()));
+        Assert.True((await Call(node, "POST", "/erupt-api/data/modify/Memo", new { text = "a" }, "Memo")).Body!["success"]!.GetValue<bool>());
+        var (_, page) = await Call(node, "POST", "/erupt-api/data/table/Memo", new { }, "Memo");
+        Assert.Equal("A", page!["list"]![0]!["text"]!.GetValue<string>());
+        var pk = page["list"]![0]!["id"]!.GetValue<long>();
+        Assert.Equal("a?", (await Call(node, "GET", $"/erupt-api/data/Memo/{pk}", erupt: "Memo")).Body!["text"]!.GetValue<string>());
+        Assert.True((await Call(node, "POST", "/erupt-api/data/modify/Memo/update", new { id = pk, text = "b" }, "Memo")).Body!["success"]!.GetValue<bool>());
+        Assert.True((await Call(node, "POST", "/erupt-api/data/modify/Memo/delete", new[] { pk }, "Memo")).Body!["success"]!.GetValue<bool>());
+        Assert.Equal([("BeforeAdd", (object?)"a"), ("AfterAdd", "a"), ("BeforeUpdate", "b"), ("AfterUpdate", "b"), ("BeforeDelete", "b"), ("AfterDelete", "b")],
+            MemoProxy.Calls);
+    }
+
+    [Fact]
+    public async Task BeforeFetch()
+    {
+        using var keep = new SqliteConnection("Data Source=task;Mode=Memory;Cache=Shared");
+        keep.Open(); // the shared in-memory database lives while one connection is open
+        var node = Node();
+        var task = EruptModel.Of<TaskItem>()
+            .Vis(new Vis { Code = "q", Title = "Question", Type = VisType.TABLE }, filter: "title = 'a?'")
+            .Vis(new Vis { Title = "Reversed", Type = VisType.TABLE }, "title desc", "1 = 1", "2 = 2");
+        node.Register(task, new DbRepository(() => new SqliteConnection("Data Source=task;Mode=Memory;Cache=Shared"), "task") { AutoCreateSqlite = true });
+        foreach (var (title, owner, done) in new[] { ("a", "admin", false), ("b", "admin", true), ("c", "root", false), ("a?", "admin", false) })
+            await Call(node, "POST", "/erupt-api/data/modify/Task", new { title, owner, done }, "Task");
+        var (_, page) = await Call(node, "POST", "/erupt-api/data/table/Task", new { }, "Task");
+        Assert.Equal(["a", "a?"], page!["list"]!.AsArray().Select(r => r!["title"]!.GetValue<string>()));
+        Assert.Equal(2, page["total"]!.GetValue<long>());
+        (_, page) = await Call(node, "POST", "/erupt-api/data/table/Task",
+            new { condition = new[] { new { key = "title", expression = "EQ", value = "a" } } }, "Task", account: "root");
+        Assert.Empty(page!["list"]!.AsArray());
+        // a view's own filter and order run on the node, and stay out of the build
+        (_, page) = await Call(node, "POST", "/erupt-api/data/table/Task", new { vis = "q" }, "Task");
+        Assert.Equal(["a?"], page!["list"]!.AsArray().Select(r => r!["title"]!.GetValue<string>()));
+        (_, page) = await Call(node, "POST", "/erupt-api/data/table/Task", new { vis = "Reversed" }, "Task");
+        Assert.Equal(["a?", "a"], page!["list"]!.AsArray().Select(r => r!["title"]!.GetValue<string>()));
+        var (_, build) = await Call(node, "GET", "/erupt-api/build/Task", null, "Task");
+        var vis = build!["eruptModel"]!["eruptJson"]!["vis"]!.AsArray().Select(v => v!.AsObject()).ToList();
+        Assert.Equal(["q", "Reversed"], vis.Select(v => v["code"]!.GetValue<string>()));
+        Assert.DoesNotContain(vis, v => v.ContainsKey("filter") || v.ContainsKey("orderBy"));
+    }
+
+    [Fact]
+    public async Task BeforeFetchNeedsSql()
+    {
+        var node = Node();
+        node.Register<TaskItem>(new MemoryRepository());
+        Assert.Equal(500, (await Call(node, "POST", "/erupt-api/data/table/Task", new { }, "Task")).Status);
     }
 
     [Fact]

@@ -4,14 +4,17 @@ module Erupt
   # One search condition. +op+: EQ NEQ GT GTE LT LTE LIKE NOT_LIKE RANGE IN NOT_IN NULL NOT_NULL.
   Cond = Struct.new(:field, :op, :value)
 
-  # What a repository is asked for; +sort+ is <tt>[[field, descending], ...]</tt>.
-  Query = Struct.new(:conditions, :sort, :offset, :limit, keyword_init: true) do
-    def initialize(conditions: [], sort: [], offset: 0, limit: 10) = super
+  # What a repository is asked for; +sort+ is <tt>[[field, descending], ...]</tt>; +filters+ is
+  # <tt>[[sql, params], ...]</tt> of a @Vis view and DataProxy#before_fetch, to be ANDed as written: a repository that cannot
+  # apply them must refuse the query (raise), never ignore them.
+  Query = Struct.new(:conditions, :sort, :filters, :offset, :limit, keyword_init: true) do
+    def initialize(conditions: [], sort: [], filters: [], offset: 0, limit: 10) = super
   end
 
   # Storage adapter: implement these five methods to put a model on any storage. A record is a Hash keyed by
   # field name. A repository only sees field names the node has already checked against the model, so it may
-  # use them as identifiers; values always travel as parameters.
+  # use them as identifiers; values always travel as parameters. +page+ must apply the query's +filters+ or
+  # raise.
   class Repository
     attr_reader :model
 
@@ -47,6 +50,8 @@ module Erupt
     end
 
     def page(query)
+      raise ArgumentError, "MemoryRepository cannot apply SQL filters (a view filter, before_fetch)" unless query.filters.empty?
+
       rows = @lock.synchronize { @rows.values.select { |r| query.conditions.all? { |c| match?(r[c.field], c) } } }
       rows = rows.each_with_index.sort do |(a, i), (b, j)|
         query.sort.lazy.map { |name, desc| compare(a[name], b[name]) * (desc ? -1 : 1) }.find(&:nonzero?) || i <=> j

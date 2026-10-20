@@ -2,6 +2,7 @@ package erupt
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -24,16 +25,26 @@ type Order struct {
 	Desc  bool
 }
 
-// Query is what a table page asks a repository for.
+// Filter is SQL a @Vis view or a DataProxy's BeforeFetch adds to a table page, ANDed as written; with
+// Params, each '?' in SQL is bound to one of them.
+type Filter struct {
+	SQL    string
+	Params []any
+}
+
+// Query is what a table page asks a repository for. Filters come from a @Vis view and DataProxy.BeforeFetch
+// and must be ANDed to the conditions; a repository that cannot apply them must refuse the query with an error.
 type Query struct {
 	Conditions []Cond
 	Sort       []Order
+	Filters    []Filter
 	Offset     int
 	Limit      int
 }
 
 // Repository puts an erupt model on any storage. Get returns nil, nil for a missing record. Return
-// Fail(...) for an error the user should read; any other error answers 500.
+// Fail(...) for an error the user should read; any other error answers 500. Page must apply Query.Filters
+// or refuse a query that has some, never ignore them.
 type Repository interface {
 	Page(ctx context.Context, q Query) (total int64, records []Record, err error)
 	Get(ctx context.Context, pk any) (Record, error)
@@ -74,6 +85,9 @@ func (r *MemoryRepository) Bind(m *Model) error {
 }
 
 func (r *MemoryRepository) Page(_ context.Context, q Query) (int64, []Record, error) {
+	if len(q.Filters) > 0 {
+		return 0, nil, errors.New("MemoryRepository cannot apply SQL filters (a view filter, BeforeFetch)")
+	}
 	r.mu.RLock()
 	var rows []Record
 	for _, key := range r.order {

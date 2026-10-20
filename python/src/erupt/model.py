@@ -215,12 +215,61 @@ def operation(title, *, code=None, mode: RowOperationMode = "MULTI", icon=None, 
     return wrap
 
 
+class DataProxy:
+    """Hooks around a model's data, as erupt's Java ``DataProxy``: subclass it, override what you need and pass
+    it as ``@erupt(..., data_proxy=...)``. A record is the dict the repository stores, a row the dict the
+    browser reads; change them in place. Raise ``Fail`` to refuse with a message."""
+
+    def search_condition(self, condition):
+        """Default values of the search bar, ``condition[field] = value``."""
+
+    def before_fetch(self, conditions):
+        """SQL ANDed to a table page's WHERE, as written: ``"status <> 'deleted'"``, or with its values bound,
+        ``("owner = ?", [uid])``. ``conditions`` are the search bar's. Only SQL repositories apply it."""
+
+    def after_fetch(self, rows):
+        """The rows of a table page, before they are sent."""
+
+    def add_behavior(self, record):
+        """The values a new record's form opens with."""
+
+    def edit_behavior(self, record):
+        """A record read by its key, for the edit form or the detail view."""
+
+    def validate(self, record):
+        """A record about to be added or updated."""
+
+    def before_add(self, record):
+        pass
+
+    def after_add(self, record):
+        pass
+
+    def before_update(self, record):
+        pass
+
+    def after_update(self, record):
+        pass
+
+    def before_delete(self, record):
+        pass
+
+    def after_delete(self, record):
+        pass
+
+
 class Model:
-    def __init__(self, cls, name, title, power, order_by, raw):
+    def __init__(self, cls, name, title, power, order_by, raw, data_proxy=()):
         if not _IDENTIFIER.match(name):
             raise ValueError(f"erupt name '{name}' must be an identifier")
         self.cls, self.name, self.title = cls, name, title
+        proxies = data_proxy if isinstance(data_proxy, (list, tuple)) else [data_proxy]
+        self.proxies = [p() if isinstance(p, type) else p for p in proxies]
+        for p in self.proxies:
+            if not isinstance(p, DataProxy):
+                raise ValueError(f"{name}: data_proxy must be a DataProxy")
         self.power = {**_DEFAULTS["power"], **(power or {})}
+        raw, vis = self._pull_vis(raw)
         _schema.check("Erupt", raw, f"@erupt {name}")
         self.raw = raw
         hints = getattr(cls, "__annotations__", {})
@@ -258,6 +307,34 @@ class Model:
         # a model without a primary key can only serve as an operation form
         self.pk = pks[0].name if pks else None
         self.order_by = self._parse_order(order_by)
+        # view code -> (filters, sort) the node applies to that view's table queries
+        self.vis = {code: ([(f, []) for f in filters], self._parse_order(sort)) for code, (filters, sort) in vis.items()}
+
+    @staticmethod
+    def _pull_vis(raw):
+        """``filter`` and ``orderBy`` of a ``vis`` entry run on the node, as Java keeps them off the build
+        (``@Transient``): taken out before the schema check. A view without a ``code`` is addressed by its title."""
+        vis, entries = {}, []
+        for entry in raw.get("vis") or []:
+            entry = {"code": entry.get("title", ""), **entry}
+            filters = entry.pop("filter", None) or []
+            vis[entry["code"]] = ([filters] if isinstance(filters, str) else list(filters), entry.pop("orderBy", None))
+            entries.append(entry)
+        return ({**raw, "vis": entries} if "vis" in raw else raw), vis
+
+    def hook(self, name, *args):
+        """Run one DataProxy hook on every proxy, in declaration order."""
+        for p in self.proxies:
+            getattr(p, name)(*args)
+
+    def filters(self, conditions):
+        """The SQL every proxy's ``before_fetch`` adds, as ``[(sql, params)]``."""
+        filters = []
+        for p in self.proxies:
+            sql = p.before_fetch(conditions)
+            if sql:
+                filters.append((sql, []) if isinstance(sql, str) else (sql[0], list(sql[1])))
+        return filters
 
     def _parse_order(self, order_by):
         """``"views desc, id"`` -> ``[("views", True), ("id", False)]``, fields checked against the model."""
@@ -287,10 +364,15 @@ class Model:
             "eruptName": self.name,
             "eruptJson": erupt_json,
             "eruptFieldModels": [f.build() for f in self.declared],
-            "searchCondition": {},
+            "searchCondition": self._search_condition(),
             "extraRow": False,
             "tags": {},
         }
+
+    def _search_condition(self):
+        condition = {}
+        self.hook("search_condition", condition)
+        return condition
 
     def build_model(self, power, user=None):
         operations = [op for op in self.operations.values() if op.visible(user)]
@@ -302,15 +384,16 @@ class Model:
         }
 
 
-def erupt(title, *, name=None, power=None, order_by=None, **raw):
+def erupt(title, *, name=None, power=None, order_by=None, data_proxy=(), **raw):
     """Declare a class as an erupt model. ``name`` defaults to the class name and is what the server
     addresses (``node.Name``); ``power`` switches features off (``{"delete": False}``); ``order_by`` is the
-    default table order, applied by the node (``"views desc, id"``); remaining keyword
+    default table order, applied by the node (``"views desc, id"``); ``data_proxy`` is one ``DataProxy`` or a
+    list of them (instances or classes), run around every read and write of the model; remaining keyword
     arguments are raw ``@Erupt`` attributes merged onto the defaults (``layout={"pageSize": 30}``, see
     ``erupt._types.Erupt``); an unknown attribute or value fails here, not in the browser."""
 
     def wrap(cls):
-        cls.__erupt__ = Model(cls, name or cls.__name__, title, power, order_by, raw)
+        cls.__erupt__ = Model(cls, name or cls.__name__, title, power, order_by, raw, data_proxy)
         return cls
 
     return wrap

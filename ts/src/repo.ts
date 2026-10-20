@@ -15,6 +15,12 @@ export interface Query {
   conditions: Cond[];
   /** [field, descending] */
   sort: [string, boolean][];
+  /**
+   * `[sql, params]` of a @Vis view and `DataProxy.beforeFetch`, ANDed to the WHERE as written; with params,
+   * each `?` is one of them, bound.
+   * A repository applies every one or refuses the query by throwing; it never ignores them.
+   */
+  filters?: [string, unknown[]][];
   offset: number;
   limit: number;
 }
@@ -25,7 +31,7 @@ export type Awaitable<T> = T | Promise<T>;
 export interface Repository {
   /** called once by `Node.register` with the model this repository stores */
   bind(model: Model): void;
-  /** `[total, records]`; a record is keyed by field name */
+  /** `[total, records]`; a record is keyed by field name. Apply `query.filters` or throw, never ignore them. */
   page(query: Query): Awaitable<[number, EruptRecord[]]>;
   get(pk: unknown): Awaitable<EruptRecord | null>;
   add(record: EruptRecord): Awaitable<void>;
@@ -90,6 +96,7 @@ export class MemoryRepository implements Repository {
   }
 
   page(query: Query): [number, EruptRecord[]] {
+    if (query.filters?.length) throw new Error("MemoryRepository cannot apply SQL filters (a view filter, beforeFetch)");
     const rows = [...this.rows.values()].filter((r) => query.conditions.every((c) => match(r[c.field], c)));
     // no sort: primary key ascending, the default of every repository
     const sort: [string, boolean][] = query.sort.length ? query.sort : [[this.model.pk!, false]];
@@ -274,9 +281,15 @@ export class SqlRepository implements Repository {
     this.ready = Promise.resolve(this.executor.execute(`CREATE TABLE IF NOT EXISTS ${this.q(this.table)} (${cols.join(", ")})`, []));
   }
 
-  private where(conditions: Cond[], p: Params): string {
+  private where(query: Query, p: Params): string {
     const clauses: string[] = [];
-    for (const c of conditions) {
+    for (const [sql, params] of query.filters ?? []) {
+      // the developer's own SQL, as written; with params, each '?' is one of them, bound like every other value
+      const pieces = params.length ? sql.split("?") : [sql];
+      if (pieces.length - 1 !== params.length) throw new Error(`filter: ${pieces.length - 1} '?' for ${params.length} params in '${sql}'`);
+      clauses.push("(" + pieces.reduce((out, piece, i) => out + p.add(params[i - 1]) + piece) + ")");
+    }
+    for (const c of query.conditions) {
       const col = this.q(c.field);
       const values = Array.isArray(c.value) ? c.value : [];
       if (SQL_OPS[c.op]) {
@@ -329,10 +342,10 @@ export class SqlRepository implements Repository {
     await this.ready;
     const table = this.q(this.table);
     const count = new Params(this.options.dialect);
-    const countWhere = this.where(query.conditions, count);
+    const countWhere = this.where(query, count);
     const [{ n }] = (await this.executor.query(`SELECT COUNT(*) AS n FROM ${table}${countWhere}`, count.values)) as [{ n: unknown }];
     const p = new Params(this.options.dialect);
-    const where = this.where(query.conditions, p);
+    const where = this.where(query, p);
     const sort: [string, boolean][] = query.sort.length ? query.sort : [[this.model.pk!, false]];
     const order = sort.map(([name, desc]) => `${this.q(name)} ${desc ? "DESC" : "ASC"}`).join(", ");
     const paging = this.options.dialect === "mssql"

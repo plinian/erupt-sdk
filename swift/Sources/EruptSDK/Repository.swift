@@ -14,16 +14,36 @@ public struct Cond: Sendable, Equatable {
     }
 }
 
-/// What a repository is asked for.
+/// SQL a `@Vis` view or a `DataProxy.beforeFetch` adds to a table page's WHERE, as written; with `params`, each
+/// `?` in it is one of them, bound like every other value. A string literal is SQL without params.
+public struct SQLFilter: Sendable, Equatable, ExpressibleByStringLiteral {
+    public let sql: String
+    public let params: [JSON]
+
+    public init(_ sql: String, _ params: [JSON] = []) {
+        self.sql = sql
+        self.params = params
+    }
+
+    public init(stringLiteral value: String) { self.init(value) }
+}
+
+/// What a repository is asked for. `filters` come from a `@Vis` view and `DataProxy.beforeFetch`: a repository ANDs every one to
+/// its conditions, or throws when it cannot apply them; it never ignores them.
 public struct Query: Sendable {
     public var conditions: [Cond]
     public var sort: [(field: String, descending: Bool)]
+    public var filters: [SQLFilter]
     public var offset: Int
     public var limit: Int
 
-    public init(conditions: [Cond] = [], sort: [(field: String, descending: Bool)] = [], offset: Int = 0, limit: Int = 10) {
+    public init(
+        conditions: [Cond] = [], sort: [(field: String, descending: Bool)] = [], filters: [SQLFilter] = [], offset: Int = 0,
+        limit: Int = 10
+    ) {
         self.conditions = conditions
         self.sort = sort
+        self.filters = filters
         self.offset = offset
         self.limit = limit
     }
@@ -31,7 +51,8 @@ public struct Query: Sendable {
 
 /// Storage adapter: implement these to put a model on any storage. A repository only sees field names the node
 /// has already checked against the model, so it may use them as identifiers; values always travel as parameters.
-/// Called from many threads at once.
+/// Called from many threads at once. `page` applies the query's `filters` or throws; a repository that cannot read
+/// SQL refuses them, as `MemoryRepository` does.
 public protocol Repository: AnyObject {
     /// Called once when the model is registered.
     func bind(_ model: Model) throws
@@ -43,7 +64,7 @@ public protocol Repository: AnyObject {
     func delete(_ pks: [JSON]) throws
 }
 
-/// Records in memory, for tests and demos.
+/// Records in memory, for tests and demos. It refuses a query with `filters`: it cannot read their SQL.
 public final class MemoryRepository: Repository {
     private let lock = NSLock()
     private var rows: [Int64: Record] = [:]
@@ -62,6 +83,7 @@ public final class MemoryRepository: Repository {
     }
 
     public func page(_ query: Query) throws -> (total: Int, records: [Record]) {
+        guard query.filters.isEmpty else { throw DeclarationError("MemoryRepository cannot apply SQL filters (a view filter, beforeFetch)") }
         let all: [Record] = locked { ids.compactMap { rows[$0] } }
         let matching = all.filter { r in query.conditions.allSatisfy { Self.matches(r[$0.field] ?? .null, $0) } }
         let sorted = matching.enumerated().sorted { a, b in

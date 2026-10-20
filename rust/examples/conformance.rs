@@ -1,10 +1,26 @@
 //! The conformance fixture (conformance/README.md) in Rust.
 use erupt::types::RowOperationMode;
-use erupt::{Field, MemoryRepository, Model, Node, Operation, Record};
+use erupt::{DataProxy, Error, Field, MemoryRepository, Model, Node, Operation, Record};
 use serde_json::{json, Value};
 
 fn record(value: Value) -> Record {
     value.as_object().cloned().unwrap_or_default()
+}
+
+struct NoteProxy;
+
+impl DataProxy for NoteProxy {
+    fn add_behavior(&self, record: &mut Record) -> erupt::Result<()> {
+        record.insert("text".into(), json!("new"));
+        Ok(())
+    }
+
+    fn validate(&self, record: &Record) -> erupt::Result<()> {
+        if record.get("text") == Some(&json!("forbidden")) {
+            return Err(Error::fail("forbidden text"));
+        }
+        Ok(())
+    }
 }
 
 fn main() -> erupt::Result<()> {
@@ -68,6 +84,7 @@ fn main() -> erupt::Result<()> {
         .build()?;
     let note = Model::new("Note", "Note")
         .power(json!({"delete": false}))
+        .data_proxy(NoteProxy)
         .field("id", Field::pk())
         .field("text", Field::input("Text"))
         .build()?;

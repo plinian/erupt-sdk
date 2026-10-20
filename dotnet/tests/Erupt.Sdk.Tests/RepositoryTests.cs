@@ -90,4 +90,16 @@ public sealed class RepositoryTests : IDisposable
             repo.Where([new Cond("title", "EQ", "a"), new Cond("views", "LIKE", "1!_")], parameters));
         Assert.Equal(["a", "%1!!!_%"], parameters);
     }
+
+    [Fact]
+    public void FiltersAreAndedAsWrittenWithBoundParams()
+    {
+        var repo = new DbRepository(() => throw new InvalidOperationException(), "t") { ParameterPrefix = ":" };
+        var parameters = new List<object?>();
+        Assert.Equal(" WHERE (owner = :p0 OR shared = :p1) AND (done = 0) AND \"title\" = :p2",
+            repo.Where([new Cond("title", "EQ", "a")], parameters, [new SqlFilter("owner = ? OR shared = ?", "admin", true), "done = 0"]));
+        Assert.Equal(["admin", true, "a"], parameters);
+        Assert.Equal(" WHERE (title = 'a?')", repo.Where([], [], ["title = 'a?'"])); // without params, '?' is plain text
+        Assert.Throws<ArgumentException>(() => repo.Where([], [], [new SqlFilter("owner = ?", "a", "b")]));
+    }
 }

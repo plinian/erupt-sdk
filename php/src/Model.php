@@ -34,6 +34,10 @@ final class Model
     public readonly array $declared;
     /** @var array<string, OperationSpec> */
     public readonly array $operations;
+    /** @var list<DataProxy> */
+    public readonly array $proxies;
+    /** @var array<string, array{0: list<array{0: string, 1: list<mixed>}>, 1: list<array{0: string, 1: bool}>}> view code -> [filters, sort] */
+    public readonly array $vis;
     private readonly array $raw;
 
     /** The compiled model of an #[Erupt] class; cached, so declarations are checked once. */
@@ -65,8 +69,18 @@ final class Model
             throw new \InvalidArgumentException("erupt name '$this->name' must be an identifier");
         }
         $this->title = $decl->title;
-        Schema::check('Erupt', $decl->raw, "#[Erupt] $this->name");
-        $this->raw = $decl->raw;
+        $proxies = [];
+        foreach (is_array($decl->dataProxy) ? $decl->dataProxy : [$decl->dataProxy] as $p) {
+            $p = is_string($p) && is_subclass_of($p, DataProxy::class) ? new $p() : $p;
+            if (!$p instanceof DataProxy) {
+                throw new \InvalidArgumentException("$this->name: dataProxy must be a DataProxy");
+            }
+            $proxies[] = $p;
+        }
+        $this->proxies = $proxies;
+        [$raw, $vis] = self::pullVis($decl->raw);
+        Schema::check('Erupt', $raw, "#[Erupt] $this->name");
+        $this->raw = $raw;
         $defaults = Schema::defaults()['power'];
         if ($unknown = array_diff_key($decl->power, $defaults)) {
             throw new \InvalidArgumentException("$this->name: unknown power " . implode(', ', array_keys($unknown)));
@@ -91,6 +105,8 @@ final class Model
         }
         $this->pk = $pks[0] ?? null;
         $this->orderBy = $this->parseOrder($decl->orderBy);
+        // view code -> [filters, sort] the node applies to that view's table queries
+        $this->vis = array_map(fn($v) => [array_map(fn($f) => [$f, []], $v[0]), $this->parseOrder($v[1])], $vis);
 
         $operations = [];
         foreach ($class->getMethods() as $method) {
@@ -167,6 +183,58 @@ final class Model
         return $spec;
     }
 
+    /**
+     * `filter` and `orderBy` of a `vis` entry run on the node, as Java keeps them off the build (`@Transient`):
+     * taken out before the schema check. A view without a `code` is addressed by its title.
+     */
+    private static function pullVis(array $raw): array
+    {
+        $vis = $entries = [];
+        foreach (is_array($raw['vis'] ?? null) ? $raw['vis'] : [] as $entry) {
+            if (!is_array($entry)) {
+                return [$raw, []]; // left to the schema check
+            }
+            $entry += ['code' => $entry['title'] ?? ''];
+            $filters = array_values((array) ($entry['filter'] ?? []));
+            if (array_filter($filters, fn($f) => !is_string($f)) || !is_string($entry['orderBy'] ?? '')) {
+                throw new \InvalidArgumentException("vis '{$entry['code']}': filter must be SQL strings, orderBy a string");
+            }
+            $vis[$entry['code']] = [$filters, $entry['orderBy'] ?? null];
+            unset($entry['filter'], $entry['orderBy']);
+            $entries[] = $entry;
+        }
+        if (is_array($raw['vis'] ?? null)) {
+            $raw['vis'] = $entries;
+        }
+        return [$raw, $vis];
+    }
+
+    /** Run one DataProxy hook on every proxy, in declaration order. */
+    public function hook(string $name, array &$arg): void
+    {
+        foreach ($this->proxies as $p) {
+            $p->$name($arg);
+        }
+    }
+
+    /**
+     * The SQL every proxy's beforeFetch adds, in declaration order.
+     *
+     * @param list<Cond> $conditions
+     * @return list<array{0: string, 1: list<mixed>}>
+     */
+    public function filters(array $conditions): array
+    {
+        $filters = [];
+        foreach ($this->proxies as $p) {
+            $sql = $p->beforeFetch($conditions);
+            if ($sql) {
+                $filters[] = is_string($sql) ? [$sql, []] : [$sql[0], array_values($sql[1])];
+            }
+        }
+        return $filters;
+    }
+
     /** `'views desc, id'` -> `[['views', true], ['id', false]]`, fields checked against the model. */
     private function parseOrder(?string $orderBy): array
     {
@@ -191,10 +259,17 @@ final class Model
             'eruptName' => $this->name,
             'eruptJson' => self::merge($erupt, $this->raw),
             'eruptFieldModels' => array_map(fn(FieldSpec $f) => $f->build(), $this->declared),
-            'searchCondition' => new \stdClass(),
+            'searchCondition' => $this->searchCondition() ?: new \stdClass(),
             'extraRow' => false,
             'tags' => new \stdClass(),
         ];
+    }
+
+    private function searchCondition(): array
+    {
+        $condition = [];
+        $this->hook('searchCondition', $condition);
+        return $condition;
     }
 
     public function buildModel(array $power, ?array $user): array

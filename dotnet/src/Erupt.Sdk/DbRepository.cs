@@ -17,7 +17,8 @@ public enum Paging
 /// A table over any ADO.NET provider. Identifiers come from the model (checked when it was declared) and are
 /// quoted; every value is a parameter (<c>@p0</c> for SQLite, SQL Server, PostgreSQL and MySQL providers,
 /// <c>:p0</c> for Oracle via <see cref="ParameterPrefix"/>). Dates are bound as <c>DateOnly</c> / <c>DateTime</c>
-/// for the provider to map (ISO text on SQLite). Without a sort, rows come back by primary key ascending.
+/// for the provider to map (ISO text on SQLite). <see cref="Query.Filters"/> are ANDed in parentheses, their
+/// <c>?</c> bound the same way. Without a sort, rows come back by primary key ascending.
 /// </summary>
 public sealed class DbRepository(Func<DbConnection> connect, string table) : IRepository
 {
@@ -48,7 +49,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
     public async Task<(long Total, IReadOnlyList<Record> Records)> PageAsync(Query query, CancellationToken ct = default)
     {
         var parameters = new List<object?>();
-        var where = Where(query.Conditions, parameters);
+        var where = Where(query.Conditions, parameters, query.Filters);
         await using var conn = Open();
         var total = Convert.ToInt64(await Command(conn, $"SELECT COUNT(*) FROM {Q(table)}{where}", parameters).ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
         var order = query.Sort.Count > 0
@@ -96,10 +97,18 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
         await Command(conn, $"DELETE FROM {Q(table)} WHERE {Q(_model.Pk!)} IN ({list})", parameters).ExecuteNonQueryAsync(ct);
     }
 
-    /// <summary>The WHERE clause of <paramref name="conditions"/>, values appended to <paramref name="parameters"/>.</summary>
-    internal string Where(IEnumerable<Cond> conditions, List<object?> parameters)
+    /// <summary>The WHERE clause of <paramref name="conditions"/> and <paramref name="filters"/>, values appended to <paramref name="parameters"/>.</summary>
+    internal string Where(IEnumerable<Cond> conditions, List<object?> parameters, IEnumerable<SqlFilter>? filters = null)
     {
         var clauses = new List<string>();
+        foreach (var f in filters ?? [])
+        {
+            // the developer's own SQL, as written; with params, each '?' is one of them, bound like every other value
+            var pieces = f.Params.Length > 0 ? f.Sql.Split('?') : [f.Sql];
+            if (pieces.Length - 1 != f.Params.Length)
+                throw new ArgumentException($"filter: {pieces.Length - 1} '?' for {f.Params.Length} params in \"{f.Sql}\"");
+            clauses.Add("(" + pieces[0] + string.Concat(f.Params.Select((v, i) => P(parameters, v) + pieces[i + 1])) + ")");
+        }
         foreach (var c in conditions)
         {
             var col = Q(c.Field);

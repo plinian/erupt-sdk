@@ -76,6 +76,16 @@ class SqlRepositoryTest < Minitest::Test
                   'AND 1=0 ORDER BY "views" DESC, "title" ASC LIMIT $4 OFFSET $5', ["2026-01-01", "2026-02-01", "%x%", 5, 20]], log[1]
   end
 
+  def test_filters
+    repo, log = fake(:postgres)
+    filters = [["owner = ? OR ? = 'all'", ["u", "x"]], ["done = 0", []]]
+    repo.page(Erupt::Query.new(conditions: [Erupt::Cond.new("views", "EQ", 1)], filters: filters))
+    where = 'WHERE (owner = $1 OR $2 = \'all\') AND (done = 0) AND "views" = $3'
+    assert_equal [["SELECT COUNT(*) AS n FROM \"post\" #{where}", ["u", "x", 1]],
+                  ["SELECT * FROM \"post\" #{where} ORDER BY \"id\" ASC LIMIT $4 OFFSET $5", ["u", "x", 1, 10, 0]]], log
+    assert_raises(ArgumentError) { repo.page(Erupt::Query.new(filters: [["owner = ? OR ?", ["u"]]])) }
+  end
+
   def test_identifiers_are_quoted_and_checked
     assert_equal "`we``ird`", fake(:mysql).first.q("we`ird")
     assert_equal '"we""ird"', fake(:postgres).first.q('we"ird')

@@ -1,6 +1,7 @@
 package erupt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -63,6 +64,23 @@ type Model struct {
 	operations  []*Operation
 	pk          string
 	orderBy     []Order
+	proxies     []DataProxy
+	vis         map[string]view // view code -> what the node applies to that view's table queries
+}
+
+// view is a @Vis view's own filter and order, run on the node and kept out of the build.
+type view struct {
+	filters []Filter
+	orderBy []Order
+}
+
+// NodeVis is a Vis with the attributes the node applies to its table queries, kept out of the build as Java
+// keeps them @Transient: Filter is SQL ANDed as written, OrderBy as WithOrderBy. Pass it where a raw vis
+// entry goes: WithRaw(M{"vis": []NodeVis{...}}); in an M, the keys are "filter" (a string or a list) and "orderBy".
+type NodeVis struct {
+	Vis
+	Filter  []string `json:"filter,omitempty"`
+	OrderBy string   `json:"orderBy,omitempty"`
 }
 
 // Name is the erupt name the server addresses as "<node>.<Name>".
@@ -96,6 +114,7 @@ type modelConfig struct {
 	edits   map[string]any
 	views   map[string]any
 	ops     []Operation
+	proxies []DataProxy
 }
 
 // ModelOption configures NewModel.
@@ -134,6 +153,59 @@ func WithOperations(ops ...Operation) ModelOption {
 	return func(c *modelConfig) { c.ops = append(c.ops, ops...) }
 }
 
+// WithDataProxy declares hooks run around every read and write of the model, in declaration order.
+func WithDataProxy(proxies ...DataProxy) ModelOption {
+	return func(c *modelConfig) { c.proxies = append(c.proxies, proxies...) }
+}
+
+// DataProxy hooks around a model's data, as erupt's Java DataProxy: embed BaseDataProxy, override what you
+// need and pass it to WithDataProxy. A record is what the repository stores, a row what the browser reads;
+// change them in place. Return Fail(...) to refuse with a message.
+type DataProxy interface {
+	SearchCondition(ctx context.Context, condition M) error // default values of the search bar: condition[field] = value
+	// BeforeFetch returns SQL ANDed to a table page's WHERE, as written; with Params, each '?' is bound to one:
+	// Filter{SQL: "owner = ?", Params: []any{uid}}; an empty SQL adds nothing. conditions are the search
+	// bar's. Only SQL repositories apply it; MemoryRepository refuses the page.
+	BeforeFetch(ctx context.Context, conditions []Cond) (Filter, error)
+	AfterFetch(ctx context.Context, rows []M) error        // the rows of a table page, before they are sent
+	AddBehavior(ctx context.Context, record Record) error  // the values a new record's form opens with
+	EditBehavior(ctx context.Context, record Record) error // a record read by its key (edit form, detail view)
+	Validate(ctx context.Context, record Record) error     // a record about to be added or updated
+	BeforeAdd(ctx context.Context, record Record) error
+	AfterAdd(ctx context.Context, record Record) error
+	BeforeUpdate(ctx context.Context, record Record) error
+	AfterUpdate(ctx context.Context, record Record) error
+	BeforeDelete(ctx context.Context, record Record) error
+	AfterDelete(ctx context.Context, record Record) error
+}
+
+// BaseDataProxy is a DataProxy whose hooks do nothing, to embed.
+type BaseDataProxy struct{}
+
+func (BaseDataProxy) SearchCondition(context.Context, M) error            { return nil }
+func (BaseDataProxy) BeforeFetch(context.Context, []Cond) (Filter, error) { return Filter{}, nil }
+func (BaseDataProxy) AfterFetch(context.Context, []M) error               { return nil }
+func (BaseDataProxy) AddBehavior(context.Context, Record) error           { return nil }
+func (BaseDataProxy) EditBehavior(context.Context, Record) error          { return nil }
+func (BaseDataProxy) Validate(context.Context, Record) error              { return nil }
+func (BaseDataProxy) BeforeAdd(context.Context, Record) error             { return nil }
+func (BaseDataProxy) AfterAdd(context.Context, Record) error              { return nil }
+func (BaseDataProxy) BeforeUpdate(context.Context, Record) error          { return nil }
+func (BaseDataProxy) AfterUpdate(context.Context, Record) error           { return nil }
+func (BaseDataProxy) BeforeDelete(context.Context, Record) error          { return nil }
+func (BaseDataProxy) AfterDelete(context.Context, Record) error           { return nil }
+
+// hook runs one DataProxy hook (a method expression, DataProxy.Validate) on every proxy of a model, in
+// declaration order, until one refuses.
+func hook[T any](ctx context.Context, m *Model, h func(DataProxy, context.Context, T) error, v T) error {
+	for _, p := range m.proxies {
+		if err := h(p, ctx, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // NewModel declares an erupt model from a struct whose fields carry `erupt:"..."` tags:
 //
 //	pk                    the primary key
@@ -159,14 +231,18 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	m := &Model{name: cfg.name, title: title, byName: map[string]*field{}}
+	m := &Model{name: cfg.name, title: title, byName: map[string]*field{}, proxies: cfg.proxies}
 	if m.name == "" {
 		m.name = t.Name()
 	}
 	if !identifier.MatchString(m.name) {
 		return nil, fmt.Errorf("erupt name '%s' must be an identifier", m.name)
 	}
-	raw, err := rawObject(cfg.raw, "Erupt", "@erupt "+m.name)
+	pulled, views, err := pullVis(cfg.raw, "@erupt "+m.name)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := rawObject(pulled, "Erupt", "@erupt "+m.name)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +312,68 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	if m.orderBy, err = m.parseOrder(cfg.orderBy); err != nil {
 		return nil, err
 	}
+	m.vis = map[string]view{}
+	for code, v := range views {
+		orders, err := m.parseOrder(v.OrderBy)
+		if err != nil {
+			return nil, err
+		}
+		filters := make([]Filter, len(v.Filter))
+		for i, sql := range v.Filter {
+			filters[i] = Filter{SQL: sql}
+		}
+		m.vis[code] = view{filters, orders}
+	}
 	return m, nil
+}
+
+// pullVis takes "filter" and "orderBy" out of every raw vis entry before the schema check, as they run on the
+// node; a view without a code is addressed by its title.
+func pullVis(raw any, path string) (any, map[string]NodeVis, error) {
+	if raw == nil {
+		return nil, nil, nil
+	}
+	v, err := toJSONValue(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	obj, _ := v.(map[string]any)
+	entries, _ := obj["vis"].([]any)
+	views := map[string]NodeVis{}
+	for i, e := range entries {
+		entry, ok := e.(map[string]any)
+		if !ok {
+			continue // the schema check reports it
+		}
+		if _, ok := entry["code"]; !ok {
+			entry["code"] = str(entry["title"])
+		}
+		var nv NodeVis
+		switch f := entry["filter"].(type) {
+		case nil:
+		case string:
+			nv.Filter = []string{f}
+		case []any:
+			for _, sql := range f {
+				s, ok := sql.(string)
+				if !ok {
+					return nil, nil, fmt.Errorf("%s.vis[%d].filter: a SQL string or a list of them", path, i)
+				}
+				nv.Filter = append(nv.Filter, s)
+			}
+		default:
+			return nil, nil, fmt.Errorf("%s.vis[%d].filter: a SQL string or a list of them", path, i)
+		}
+		if o, ok := entry["orderBy"]; ok {
+			if nv.OrderBy, ok = o.(string); !ok {
+				return nil, nil, fmt.Errorf("%s.vis[%d].orderBy: a string such as \"title desc, id\"", path, i)
+			}
+		}
+		delete(entry, "filter")
+		delete(entry, "orderBy")
+		views[str(entry["code"])] = nv
+	}
+	return v, views, nil
 }
 
 func parseField(model string, sf reflect.StructField, tag string) (*field, error) {

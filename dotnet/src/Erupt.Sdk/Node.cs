@@ -77,7 +77,6 @@ public sealed partial class EruptNode
         _routes =
         [
             ("GET", Route("^/erupt-api/build/([^/]+)$"), Build),
-            ("GET", Route("^/erupt-api/build/([^/]+)/([^/]+)$"), BuildByField),
             ("POST", Route("^/erupt-api/data/table/([^/]+)$"), Table),
             ("POST", Route("^/erupt-api/data/([^/]+)/reference-table/([^/]+)$"), ReferenceTable),
             ("POST", Route("^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$"), OperationFormValue),
@@ -255,13 +254,6 @@ public sealed partial class EruptNode
 
     private async Task<JsonNode?> Build(Request r, string[] _) => r.Model.BuildModel(await Power(r.Model, r.Http), CurrentUser);
 
-    // the reference picker: build of the referenced model, requested under the host model's name
-    private async Task<JsonNode?> BuildByField(Request r, string[] args)
-    {
-        var target = Target(ReferenceField(r.Model, args[0]));
-        return target.Model.BuildModel(await Power(target.Model, r.Http), CurrentUser);
-    }
-
     private async Task<JsonNode?> Table(Request r, string[] _)
     {
         await Require(r, "query");
@@ -295,12 +287,18 @@ public sealed partial class EruptNode
                 throw new EruptFailure($"illegal sort field '{name}'");
             query.Sort.Add((f.Name, Values.Str(Values.Plain(s?["direction"]) ?? "ASC").ToUpperInvariant() == "DESC"));
         }
-        if (query.Sort.Count == 0) query.Sort = [.. model.OrderBy];
+        // a @Vis view's own filter and order, then the DataProxy's
+        var (filters, sort) = model.Views.GetValueOrDefault(Values.Plain(body["vis"]) as string ?? "", ([], []));
+        if (query.Sort.Count == 0) query.Sort = [.. sort.Count > 0 ? sort : model.OrderBy];
+        query.Filters.AddRange(filters);
+        query.Filters.AddRange(model.Filters(query.Conditions));
         var (total, records) = await repo.PageAsync(query, ct);
+        var rows = await Rows(model, records, ct);
+        model.Hook(p => p.AfterFetch(rows.Cast<JsonObject>().ToList()));
         return new JsonObject
         {
             ["pageIndex"] = pageIndex, ["pageSize"] = pageSize, ["total"] = total,
-            ["totalPage"] = (long)Math.Ceiling(total / (double)pageSize), ["list"] = await Rows(model, records, ct),
+            ["totalPage"] = (long)Math.Ceiling(total / (double)pageSize), ["list"] = rows,
             ["sort"] = null, ["alert"] = null, ["extraContent"] = null,
         };
     }
@@ -339,7 +337,9 @@ public sealed partial class EruptNode
     private async Task<JsonNode?> InitValue(Request r, string[] _)
     {
         await Require(r, "add");
-        return new JsonObject(r.Model.Stored.Select(f => KeyValuePair.Create(f.Name, (JsonNode?)null)));
+        var record = new Record(r.Model.Stored.ToDictionary(f => f.Name, _ => (object?)null));
+        r.Model.Hook(p => p.AddBehavior(record));
+        return (await Rows(r.Model, [record], r.Http.RequestAborted))[0];
     }
 
     private async Task<JsonNode?> Get(Request r, string[] args)
@@ -347,13 +347,18 @@ public sealed partial class EruptNode
         var power = await Power(r.Model, r.Http);
         if (!(Bool(power, "edit") || Bool(power, "viewDetails"))) throw new Reply(403);
         var record = await r.Repo.GetAsync(Pk(r.Model, args[0])!, r.Http.RequestAborted) ?? throw new EruptFailure("record not found");
+        r.Model.Hook(p => p.EditBehavior(record));
         return (await Rows(r.Model, [record], r.Http.RequestAborted))[0];
     }
 
     private async Task<JsonNode?> Add(Request r, string[] _)
     {
         await Require(r, "add");
-        await r.Repo.AddAsync(ToRecord(r.Model, BodyObject(r)), r.Http.RequestAborted);
+        var record = ToRecord(r.Model, BodyObject(r));
+        r.Model.Hook(p => p.Validate(record));
+        r.Model.Hook(p => p.BeforeAdd(record));
+        await r.Repo.AddAsync(record, r.Http.RequestAborted);
+        r.Model.Hook(p => p.AfterAdd(record));
         return R();
     }
 
@@ -363,7 +368,11 @@ public sealed partial class EruptNode
         var body = BodyObject(r);
         var pk = Pk(r.Model, Values.Plain(body[r.Model.Pk!]));
         if (pk is null || await r.Repo.GetAsync(pk, r.Http.RequestAborted) is null) throw new EruptFailure("record not found");
-        await r.Repo.UpdateAsync(pk, ToRecord(r.Model, body), r.Http.RequestAborted);
+        var record = ToRecord(r.Model, body);
+        r.Model.Hook(p => p.Validate(record));
+        r.Model.Hook(p => p.BeforeUpdate(record));
+        await r.Repo.UpdateAsync(pk, record, r.Http.RequestAborted);
+        r.Model.Hook(p => p.AfterUpdate(record));
         return R();
     }
 
@@ -371,7 +380,15 @@ public sealed partial class EruptNode
     {
         await Require(r, "delete");
         if (r.Body is not JsonArray ids) throw new EruptFailure("a list of ids is required");
-        await r.Repo.DeleteAsync(ids.Select(id => Pk(r.Model, Values.Plain(id))!).ToList(), r.Http.RequestAborted);
+        var pks = ids.Select(id => Pk(r.Model, Values.Plain(id))!).ToList();
+        // the hooks see each record as it was; reading them costs nothing without a proxy
+        var records = new List<Record>();
+        if (r.Model.Proxies.Count > 0)
+            foreach (var pk in pks)
+                if (await r.Repo.GetAsync(pk, r.Http.RequestAborted) is { } record) records.Add(record);
+        foreach (var record in records) r.Model.Hook(p => p.BeforeDelete(record));
+        await r.Repo.DeleteAsync(pks, r.Http.RequestAborted);
+        foreach (var record in records) r.Model.Hook(p => p.AfterDelete(record));
         return R();
     }
 

@@ -3,7 +3,8 @@ namespace Erupt;
 /// <summary>
 /// Declares a class as an erupt model. <see cref="Name"/> defaults to the class name and is what the server
 /// addresses (<c>node.Name</c>); <see cref="OrderBy"/> is the default table order, applied by the node
-/// (<c>"views desc, id"</c>).
+/// (<c>"views desc, id"</c>); <see cref="DataProxy"/> lists <see cref="IDataProxy"/> classes, run in this order around
+/// every read and write of the model.
 /// </summary>
 [AttributeUsage(AttributeTargets.Class)]
 public sealed class EruptModelAttribute(string title) : Attribute
@@ -13,6 +14,8 @@ public sealed class EruptModelAttribute(string title) : Attribute
     public string? Name { get; set; }
 
     public string? OrderBy { get; set; }
+
+    public Type[] DataProxy { get; set; } = [];
 }
 
 /// <summary>The primary key. The repository assigns it; it is never part of the form.</summary>

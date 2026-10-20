@@ -71,10 +71,10 @@ public final class SQLRepository: Repository {
 
     public func page(_ query: Query) throws -> (total: Int, records: [Record]) {
         var p = Params(dialect)
-        let count = try executor.execute("SELECT COUNT(*) AS n FROM \(q(table))\(try `where`(query.conditions, &p))", p.values)
+        let count = try executor.execute("SELECT COUNT(*) AS n FROM \(q(table))\(try `where`(query, &p))", p.values)
         let total = count.first.flatMap { row in row.first { $0.key.lowercased() == "n" }?.value ?? row.values.first }
         p = Params(dialect)
-        var sql = "SELECT * FROM \(q(table))\(try `where`(query.conditions, &p))"
+        var sql = "SELECT * FROM \(q(table))\(try `where`(query, &p))"
         let sort = query.sort.isEmpty ? [(field: model.pk!, descending: false)] : query.sort
         sql += " ORDER BY " + sort.map { "\(q($0.field)) \($0.descending ? "DESC" : "ASC")" }.joined(separator: ", ")
         sql += " LIMIT \(p.add(.int(Int64(query.limit)))) OFFSET \(p.add(.int(Int64(query.offset))))"
@@ -144,8 +144,16 @@ public final class SQLRepository: Repository {
         record.keys.sorted().filter { $0 != model.pk && model.field($0) != nil }.map { ($0, bindable(model.field($0), record[$0]!)) }
     }
 
-    private func `where`(_ conditions: [Cond], _ p: inout Params) throws -> String {
-        let clauses = try conditions.map { c -> String in
+    private func `where`(_ query: Query, _ p: inout Params) throws -> String {
+        // the developer's own SQL, as written; with params, each '?' is one of them, bound like every other value
+        let filters = try query.filters.map { f -> String in
+            let pieces = f.params.isEmpty ? [f.sql] : f.sql.components(separatedBy: "?")
+            guard pieces.count - 1 == f.params.count else {
+                throw DeclarationError("filter: \(pieces.count - 1) '?' for \(f.params.count) params in \(f.sql)")
+            }
+            return "(" + pieces[0] + zip(f.params, pieces.dropFirst()).map { p.add($0) + $1 }.joined() + ")"
+        }
+        let clauses = try filters + query.conditions.map { c -> String in
             let col = q(c.field)
             let f = model.field(c.field)
             let values = c.value.array ?? [c.value]

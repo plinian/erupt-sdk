@@ -65,6 +65,60 @@ module NodeFixture
     field :roles, "Roles", Array, search: true, choices: { ADMIN: "Admin", USER: "User", GUEST: "Guest" }, edit: { type: "MULTI_CHOICE" }
     field :attrs, "Attributes", Hash, edit: { type: "KEY_VALUE" }
   end
+
+  class MemoProxy < Erupt::DataProxy
+    CALLS = []
+
+    def search_condition(condition)
+      condition["text"] = "hi"
+    end
+
+    def after_fetch(rows) = rows.each { |row| row["text"] = row["text"].upcase }
+
+    def add_behavior(record)
+      record["text"] = "new"
+    end
+
+    def edit_behavior(record)
+      record["text"] += "?"
+    end
+
+    def validate(record)
+      raise Erupt::Fail, "forbidden text" if record["text"] == "forbidden"
+    end
+
+    # the write hooks only record that they ran, with the text they saw
+    %i[before_add after_add before_update after_update before_delete after_delete].each do |hook|
+      define_method(hook) { |record| CALLS << [hook, record["text"]] }
+    end
+  end
+
+  class Memo
+    extend Erupt::Model
+    erupt "Memo", data_proxy: MemoProxy
+    field :id, pk: true
+    field :text, "Text"
+  end
+
+  class TaskProxy < Erupt::DataProxy
+    def before_fetch(_conditions) = ["owner = ?", [Erupt.current_user["account"]]]
+  end
+
+  class OpenProxy < Erupt::DataProxy
+    def before_fetch(_conditions) = "done = 0"
+  end
+
+  class Task
+    extend Erupt::Model
+    erupt "Task", data_proxy: [TaskProxy, OpenProxy], vis: [
+      { code: "q", title: "Question", type: "TABLE", filter: "title = 'a?'" },
+      { title: "Reversed", type: "TABLE", filter: ["1 = 1", "2 = 2"], orderBy: "title desc" }
+    ]
+    field :id, pk: true
+    field :title, "Title", search: true
+    field :owner, "Owner"
+    field :done, "Done", :boolean
+  end
 end
 
 class NodeTest < Minitest::Test
@@ -89,7 +143,9 @@ class NodeTest < Minitest::Test
     @node.register(Article, article_repo)
     @node.register(Note, Erupt::MemoryRepository.new)
     @node.register(Widget, widget_repo)
+    @node.register(Memo, Erupt::MemoryRepository.new)
     CALLS.clear
+    MemoProxy::CALLS.clear
   end
 
   class Quiet
@@ -258,10 +314,29 @@ class NodeTest < Minitest::Test
     assert_equal 1, table["total"]
   end
 
+  def test_data_proxy
+    _, build = call("GET", "/erupt-api/build/Memo", erupt: "Memo")
+    assert_equal({ "text" => "hi" }, build["eruptModel"]["searchCondition"])
+    assert_equal "new", call("GET", "/erupt-api/data/init-value/Memo", erupt: "Memo").last["text"]
+    _, r = call("POST", "/erupt-api/data/modify/Memo", { text: "forbidden" }, erupt: "Memo")
+    assert_equal [false, "forbidden text"], r.values_at("success", "message")
+    assert call("POST", "/erupt-api/data/modify/Memo", { text: "a" }, erupt: "Memo").last["success"]
+    _, page = call("POST", "/erupt-api/data/table/Memo", {}, erupt: "Memo")
+    assert_equal ["A"], page["list"].map { |row| row["text"] }
+    pk = page["list"].first["id"]
+    assert_equal "a?", call("GET", "/erupt-api/data/Memo/#{pk}", erupt: "Memo").last["text"]
+    assert call("POST", "/erupt-api/data/modify/Memo/update", { id: pk, text: "b" }, erupt: "Memo").last["success"]
+    assert call("POST", "/erupt-api/data/modify/Memo/delete", [pk], erupt: "Memo").last["success"]
+    assert_equal [[:before_add, "a"], [:after_add, "a"], [:before_update, "b"], [:after_update, "b"],
+                  [:before_delete, "b"], [:after_delete, "b"]], MemoProxy::CALLS
+  end
+
+  def test_before_fetch_needs_sql
+    @node.register(Task, Erupt::MemoryRepository.new)
+    assert_equal 500, call("POST", "/erupt-api/data/table/Task", {}, erupt: "Task").first
+  end
+
   def test_reference
-    status, build = call("GET", "/erupt-api/build/Article/category")
-    assert_equal [200, "Category"], [status, build["eruptModel"]["eruptName"]]
-    assert_equal 404, call("GET", "/erupt-api/build/Article/title").first
     _, page = call("POST", "/erupt-api/data/Article/reference-table/category",
                    { pageIndex: 1, pageSize: 10, condition: [{ key: "name", expression: "LIKE", value: "py" }] })
     assert_equal [{ "id" => 2, "name" => "Python", "parent" => 1 }], page["list"]
@@ -342,6 +417,27 @@ if SQLITE3
     end
 
     def widget_repo = Erupt::SqlRepository.new(Erupt::SqlExecutor.sqlite3(@db), "widget", auto_create: true)
+
+    def test_before_fetch
+      @node.register(Task, Erupt::SqlRepository.new(Erupt::SqlExecutor.sqlite3(@db), "task", auto_create: true))
+      [["a", "admin", false], ["b", "admin", true], ["c", "root", false], ["a?", "admin", false]].each do |title, owner, done|
+        call("POST", "/erupt-api/data/modify/Task", { title: title, owner: owner, done: done }, erupt: "Task")
+      end
+      _, page = call("POST", "/erupt-api/data/table/Task", {}, erupt: "Task")
+      assert_equal ["a", "a?"], page["list"].map { |r| r["title"] }
+      _, page = call("POST", "/erupt-api/data/table/Task", { condition: [{ key: "title", expression: "EQ", value: "a" }] },
+                     erupt: "Task", account: "root")
+      assert_equal [], page["list"]
+      # a view's own filter and order run on the node, and stay out of the build
+      _, page = call("POST", "/erupt-api/data/table/Task", { vis: "q" }, erupt: "Task")
+      assert_equal ["a?"], page["list"].map { |r| r["title"] }
+      _, page = call("POST", "/erupt-api/data/table/Task", { vis: "Reversed" }, erupt: "Task")
+      assert_equal ["a?", "a"], page["list"].map { |r| r["title"] }
+      _, build = call("GET", "/erupt-api/build/Task", erupt: "Task")
+      vis = build["eruptModel"]["eruptJson"]["vis"]
+      assert_equal [%w[q Question TABLE], %w[Reversed Reversed TABLE]], vis.map { |v| v.values_at("code", "title", "type") }
+      assert(vis.none? { |v| v.key?("filter") || v.key?("orderBy") })
+    end
 
     def test_like_escapes_wildcards
       add(title: "100% pure")

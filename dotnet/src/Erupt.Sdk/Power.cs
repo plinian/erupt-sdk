@@ -44,5 +44,5 @@ public sealed class Record : Dictionary<string, object?>
     }
 }
 
-/// <summary>Thrown by an operation or a repository to show the user a message instead of failing the request.</summary>
+/// <summary>Thrown by an operation, a DataProxy hook or a repository to refuse with a message the user sees.</summary>
 public sealed class EruptFailure(string message) : Exception(message);

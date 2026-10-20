@@ -45,9 +45,19 @@ class Article
   end
 end
 
+class NoteProxy < Erupt::DataProxy
+  def add_behavior(record)
+    record["text"] = "new"
+  end
+
+  def validate(record)
+    raise Erupt::Fail, "forbidden text" if record["text"] == "forbidden"
+  end
+end
+
 class Note
   extend Erupt::Model
-  erupt "Note", power: { delete: false }
+  erupt "Note", power: { delete: false }, data_proxy: NoteProxy
   field :id, pk: true
   field :text, "Text"
 end

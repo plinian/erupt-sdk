@@ -124,3 +124,15 @@ test("driver dates and numbers", async () => {
   assert.throws(() => new SqlRepository(capture(), "w", { dialect: "postgres", autoCreate: true }), /SQLite tables only/);
   assert.throws(() => new SqlRepository(capture(), "w; drop", { dialect: "postgres" }), /illegal table name/);
 });
+
+test("filters are ANDed as written, each ? of one with params bound in the dialect", async () => {
+  const exec = capture();
+  const repo = new SqlRepository(exec, "item", { dialect: "postgres" });
+  repo.bind(Item);
+  await repo.page({ ...search, filters: [["owner = ? OR n > ?", ["a", 1]], ["ok <> '?'", []]] });
+  assert.deepEqual(exec.calls[1], [`SELECT * FROM "item" WHERE (owner = $1 OR n > $2) AND (ok <> '?') AND "name" ILIKE $3 ESCAPE '!' AND "n" IN ($4, $5) ` +
+    `AND "ok" = $6 ORDER BY "id" ASC LIMIT $7 OFFSET $8`, ["a", 1, "%5!%!_!![x%", 1, 2, true, 10, 20]]);
+  assert.match(exec.calls[0][0], /WHERE \(owner = \$1 OR n > \$2\) AND \(ok <> '\?'\) AND/, "count uses the same filter");
+  await assert.rejects(Promise.resolve(repo.page({ ...search, filters: [["owner = ?", ["a", "b"]]] })), /1 '\?' for 2 params/);
+  assert.throws(() => new MemoryRepository().page({ ...search, filters: [["ok", []]] }), /cannot apply/);
+});

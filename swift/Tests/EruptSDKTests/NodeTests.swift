@@ -2,6 +2,7 @@ import Foundation
 import Testing
 
 @testable import EruptSDK
+import EruptSQLite
 
 let token = "node-secret"
 
@@ -25,6 +26,46 @@ func articleModel() throws -> (Model, Model) {
     return (category, article)
 }
 
+final class MemoProxy: DataProxy {
+    var calls: [String] = []
+
+    func searchCondition(_ condition: inout [String: JSON]) { condition["text"] = "hi" }
+    func afterFetch(_ rows: inout [Record]) { for i in rows.indices { rows[i]["text"] = .string(rows[i]["text"]!.text.uppercased()) } }
+    func addBehavior(_ record: inout Record) { record["text"] = "new" }
+    func editBehavior(_ record: inout Record) { record["text"] = .string(record["text"]!.text + "?") }
+    func validate(_ record: Record) throws { if record["text"] == "forbidden" { throw EruptFailure("forbidden text") } }
+
+    // the write hooks only record that they ran, with the text they saw
+    func beforeAdd(_ record: inout Record) { calls.append("beforeAdd \(record["text"]!.text)") }
+    func afterAdd(_ record: Record) { calls.append("afterAdd \(record["text"]!.text)") }
+    func beforeUpdate(_ record: inout Record) { calls.append("beforeUpdate \(record["text"]!.text)") }
+    func afterUpdate(_ record: Record) { calls.append("afterUpdate \(record["text"]!.text)") }
+    func beforeDelete(_ record: Record) { calls.append("beforeDelete \(record["text"]!.text)") }
+    func afterDelete(_ record: Record) { calls.append("afterDelete \(record["text"]!.text)") }
+}
+
+struct TaskProxy: DataProxy {
+    func beforeFetch(_ conditions: [Cond]) -> SQLFilter? { SQLFilter("owner = ?", [.string(User.current?.account ?? "")]) }
+}
+
+struct OpenProxy: DataProxy {
+    func beforeFetch(_ conditions: [Cond]) -> SQLFilter? { "done = 0" }
+}
+
+func taskModel() throws -> Model {
+    try Model(
+        "Task",
+        erupt: Erupt(vis: [Vis(code: "q", title: "Question", type: .table), Vis(title: "Reversed", type: .table)]),
+        dataProxy: [TaskProxy(), OpenProxy()],
+        visQuery: ["q": VisQuery(filter: "title = 'a?'"), "Reversed": VisQuery(filter: ["1 = 1", "2 = 2"], orderBy: "title desc")]
+    ) {
+        Field("id", pk: true)
+        Field("title", "Title", search: true)
+        Field("owner", "Owner")
+        Field("done", "Done", .bool)
+    }
+}
+
 /// A node whose server is unreachable: every call is signed with power enforced, so it never asks it.
 func node() throws -> Node {
     let (category, article) = try articleModel()
@@ -35,9 +76,9 @@ func node() throws -> Node {
 }
 
 func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Article", body: JSON? = nil,
-          signed: Bool = true) -> (Int, JSON?) {
+          signed: Bool = true, account: String = "admin") -> (Int, JSON?) {
     let raw = body.map { Array($0.serialized().utf8) } ?? []
-    let user = Data("{\"account\":\"admin\"}".utf8).base64EncodedString()
+    let user = Data("{\"account\":\"\(account)\"}".utf8).base64EncodedString()
     var headers = ["erupt": erupt, "user": user, "token": "t"]
     if signed {
         let now = Int64(Date().timeIntervalSince1970)
@@ -105,6 +146,59 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(call(n, "POST", "/erupt-api/data/modify/Article/delete", body: [pk]).1?["success"] == true)
         #expect(table([:])["total"] == 1)
         #expect(call(n, "POST", "/erupt-api/data/Article/operator/hello", body: [:]).1?["data"] == "alert('hi')")
+    }
+
+    @Test func dataProxy() throws {
+        let proxy = MemoProxy()
+        let memo = try Model("Memo", dataProxy: [proxy]) {
+            Field("id", pk: true)
+            Field("text", "Text")
+        }
+        let n = try node()
+        try n.register(memo, MemoryRepository())
+        #expect(call(n, "GET", "/erupt-api/build/Memo", erupt: "Memo").1?["eruptModel"]?["searchCondition"] == ["text": "hi"])
+        #expect(call(n, "GET", "/erupt-api/data/init-value/Memo", erupt: "Memo").1?["text"] == "new")
+        let r = call(n, "POST", "/erupt-api/data/modify/Memo", erupt: "Memo", body: ["text": "forbidden"]).1
+        #expect(r?["success"] == false && r?["message"] == "forbidden text")
+        #expect(call(n, "POST", "/erupt-api/data/modify/Memo", erupt: "Memo", body: ["text": "a"]).1?["success"] == true)
+        let page = call(n, "POST", "/erupt-api/data/table/Memo", erupt: "Memo", body: [:]).1
+        #expect(page?["list"]?.array?.map { $0["text"]!.text } == ["A"])
+        let pk = try #require(page?["list"]?[0]?["id"])
+        #expect(call(n, "GET", "/erupt-api/data/Memo/\(pk.text)", erupt: "Memo").1?["text"] == "a?")
+        #expect(call(n, "POST", "/erupt-api/data/modify/Memo/update", erupt: "Memo", body: ["id": pk, "text": "b"]).1?["success"] == true)
+        #expect(call(n, "POST", "/erupt-api/data/modify/Memo/delete", erupt: "Memo", body: [pk]).1?["success"] == true)
+        #expect(proxy.calls == ["beforeAdd a", "afterAdd a", "beforeUpdate b", "afterUpdate b", "beforeDelete b", "afterDelete b"])
+    }
+
+    @Test func beforeFetch() throws {
+        let n = try node()
+        try n.register(try taskModel(), try SQLRepository(try SQLiteExecutor(path: ":memory:"), table: "task", autoCreate: true))
+        for (title, owner, done) in [("a", "admin", false), ("b", "admin", true), ("c", "root", false), ("a?", "admin", false)] {
+            _ = call(n, "POST", "/erupt-api/data/modify/Task", erupt: "Task", body: ["title": .string(title), "owner": .string(owner), "done": .bool(done)])
+        }
+        let titles: (JSON, String) -> [String]? = { body, account in
+            call(n, "POST", "/erupt-api/data/table/Task", erupt: "Task", body: body, account: account).1?["list"]?.array?.map { $0["title"]!.text }
+        }
+        #expect(titles([:], "admin") == ["a", "a?"])
+        #expect(titles(["condition": [["key": "title", "expression": "EQ", "value": "a"]]], "root") == [])
+        // a @Vis view's filter (a '?' in plain SQL stays as written) and order
+        #expect(titles(["vis": "q"], "admin") == ["a?"])
+        #expect(titles(["vis": "Reversed"], "admin") == ["a?", "a"])
+        let vis = call(n, "GET", "/erupt-api/build/Task", erupt: "Task").1?["eruptModel"]?["eruptJson"]?["vis"]?.array ?? []
+        #expect(vis.map { $0["code"]?.text } == ["q", "Reversed"])
+        #expect(vis.allSatisfy { $0["filter"] == nil && $0["orderBy"] == nil })
+        #expect(throws: DeclarationError.self) {
+            try Model("Task", erupt: Erupt(vis: [Vis(title: "A")]), visQuery: ["B": VisQuery(filter: "1 = 1")]) { Field("id", pk: true) }
+        }
+        #expect(throws: DeclarationError.self) {
+            try Model("Task", erupt: Erupt(vis: [Vis(title: "A")]), visQuery: ["A": VisQuery(orderBy: "nope")]) { Field("id", pk: true) }
+        }
+    }
+
+    @Test func beforeFetchNeedsSQL() throws {
+        let n = try node()
+        try n.register(try taskModel(), MemoryRepository())
+        #expect(call(n, "POST", "/erupt-api/data/table/Task", erupt: "Task", body: [:]).0 == 500)
     }
 
     @Test func plainAccessToken() throws {

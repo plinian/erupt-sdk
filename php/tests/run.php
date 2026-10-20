@@ -7,6 +7,8 @@ use Erupt\Attribute\Erupt;
 use Erupt\Attribute\Field;
 use Erupt\Attribute\Operation;
 use Erupt\Cond;
+use Erupt\DataProxy;
+use Erupt\Fail;
 use Erupt\FieldSpec;
 use Erupt\MemoryRepository;
 use Erupt\Model;
@@ -60,6 +62,83 @@ final class Widget
     #[Field('Attributes', edit: ['type' => 'KEY_VALUE'])] public object $attrs;
 }
 
+final class MemoProxy extends DataProxy
+{
+    public static array $calls = [];
+
+    public function searchCondition(array &$condition): void
+    {
+        $condition['text'] = 'hi';
+    }
+
+    public function afterFetch(array &$rows): void
+    {
+        foreach ($rows as &$row) {
+            $row['text'] = strtoupper($row['text']);
+        }
+    }
+
+    public function addBehavior(array &$record): void
+    {
+        $record['text'] = 'new';
+    }
+
+    public function editBehavior(array &$record): void
+    {
+        $record['text'] .= '?';
+    }
+
+    public function validate(array &$record): void
+    {
+        if ($record['text'] === 'forbidden') {
+            throw new Fail('forbidden text');
+        }
+    }
+
+    // the write hooks only record that they ran, with the text they saw
+    public function beforeAdd(array &$record): void { self::$calls[] = ['beforeAdd', $record['text']]; }
+    public function afterAdd(array &$record): void { self::$calls[] = ['afterAdd', $record['text']]; }
+    public function beforeUpdate(array &$record): void { self::$calls[] = ['beforeUpdate', $record['text']]; }
+    public function afterUpdate(array &$record): void { self::$calls[] = ['afterUpdate', $record['text']]; }
+    public function beforeDelete(array &$record): void { self::$calls[] = ['beforeDelete', $record['text']]; }
+    public function afterDelete(array &$record): void { self::$calls[] = ['afterDelete', $record['text']]; }
+}
+
+#[Erupt('Memo', dataProxy: MemoProxy::class)]
+final class Memo
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Text')] public string $text;
+}
+
+final class TaskProxy extends DataProxy
+{
+    public function beforeFetch(array $conditions): string|array|null
+    {
+        return ['owner = ?', [Node::currentUser()['account']]];
+    }
+}
+
+final class OpenProxy extends DataProxy
+{
+    public function beforeFetch(array $conditions): string|array|null
+    {
+        return 'done = 0';
+    }
+}
+
+#[Erupt('Task', dataProxy: [TaskProxy::class, OpenProxy::class], raw: ['vis' => [
+    ['code' => 'q', 'title' => 'Question', 'type' => 'TABLE', 'filter' => "title = 'a?'"],
+    ['title' => 'Reversed', 'type' => 'TABLE', 'filter' => ['1 = 1', '2 = 2'], 'orderBy' => 'title desc'],
+]])]
+final class Task
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Title', search: true)] public string $title;
+    #[Field('Owner')] public string $owner;
+    #[Field('Done')] public bool $done;
+}
+
 #[Erupt('Bad1')] final class BadEditKey { #[Field(pk: true)] public int $id; #[Field('T', edit: ['inputTyp' => ['length' => 9]])] public string $t; }
 #[Erupt('Bad2')] final class BadViewType { #[Field(pk: true)] public int $id; #[Field('T', view: ['sortable' => 'yes'])] public string $t; }
 #[Erupt('Bad3')] final class BadEditType { #[Field(pk: true)] public int $id; #[Field('T', type: 'INPUTT')] public string $t; }
@@ -67,6 +146,7 @@ final class Widget
 #[Erupt('Bad5', raw: ['orderBy' => 'id'])] final class BadRaw { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad6', raw: ['layout' => ['pageSize' => '10']])] final class BadRawType { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad7', orderBy: 'missing desc')] final class BadOrder { #[Field(pk: true)] public int $id; }
+#[Erupt('Bad10', raw: ['vis' => [['title' => 'V', 'type' => 'TABLE', 'orderBy' => 'missing']]])] final class BadVisOrder { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad8', power: ['remove' => false])] final class BadPower { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad9')] final class BadMode { #[Field(pk: true)] public int $id; #[Operation('Go', mode: 'ALL')] public static function go(): void {} }
 #[Erupt('Bad10')] final class BadOpRaw { #[Field(pk: true)] public int $id; #[Operation('Go', raw: ['colour' => 'red'])] public static function go(): void {} }
@@ -108,6 +188,7 @@ $test('declarations are checked against the schema', function () {
         [BadRaw::class, "/Erupt has no attribute 'orderBy'/"],
         [BadRawType::class, '/expected integer/'],
         [BadOrder::class, '/illegal orderBy/'],
+        [BadVisOrder::class, "/illegal orderBy 'missing'/"],
         [BadPower::class, '/unknown power remove/'],
         [BadMode::class, '/is not a RowOperationMode/'],
         [BadOpRaw::class, "/RowOperation has no attribute 'colour'/"],
@@ -324,6 +405,61 @@ $test('virtual and JSON fields', function () {
         eq(['env' => 'prod'], $call('GET', '/erupt-api/data/Widget/1')['attrs'], 'by id');
     }
     unlink($db);
+});
+
+$test('DataProxy hooks', function () {
+    $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Memo::class, new MemoryRepository());
+    $call = function (string $method, string $target, mixed $body = null) use ($node) {
+        $raw = $body === null ? '' : json_encode($body);
+        $ts = time();
+        $headers = ['erupt' => 'Memo', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
+        $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', 'dXNlcg==', $raw);
+        return json_decode($node->handle($method, $target, $headers, $raw, [], $target)->body, true);
+    };
+    eq(['text' => 'hi'], $call('GET', '/erupt-api/build/Memo')['eruptModel']['searchCondition'], 'searchCondition');
+    eq('new', $call('GET', '/erupt-api/data/init-value/Memo')['text'], 'addBehavior');
+    $r = $call('POST', '/erupt-api/data/modify/Memo', ['text' => 'forbidden']);
+    eq([false, 'forbidden text'], [$r['success'], $r['message']], 'validate');
+    eq(true, $call('POST', '/erupt-api/data/modify/Memo', ['text' => 'a'])['success'], 'add');
+    $page = $call('POST', '/erupt-api/data/table/Memo', []);
+    eq(['A'], array_column($page['list'], 'text'), 'afterFetch');
+    $pk = $page['list'][0]['id'];
+    eq('a?', $call('GET', "/erupt-api/data/Memo/$pk")['text'], 'editBehavior');
+    eq(true, $call('POST', '/erupt-api/data/modify/Memo/update', ['id' => $pk, 'text' => 'b'])['success'], 'update');
+    eq(true, $call('POST', '/erupt-api/data/modify/Memo/delete', [$pk])['success'], 'delete');
+    eq([['beforeAdd', 'a'], ['afterAdd', 'a'], ['beforeUpdate', 'b'], ['afterUpdate', 'b'], ['beforeDelete', 'b'], ['afterDelete', 'b']],
+        MemoProxy::$calls, 'write hooks in order');
+});
+
+$test('DataProxy beforeFetch', function () {
+    $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Task::class, new PdoRepository(new \PDO('sqlite::memory:'), 'task'));
+    $call = function (string $method, string $target, mixed $body, string $account = 'admin') use (&$node) {
+        $raw = json_encode($body);
+        $ts = time();
+        $user = base64_encode(json_encode(['uid' => 1, 'account' => $account]));
+        $headers = ['erupt' => 'Task', 'user' => $user, 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
+        $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', $user, $raw);
+        $response = $node->handle($method, $target, $headers, $raw, [], $target);
+        return [$response->status, json_decode($response->body, true)];
+    };
+    foreach ([['a', 'admin', false], ['b', 'admin', true], ['c', 'root', false], ['a?', 'admin', false]] as [$title, $owner, $done]) {
+        $call('POST', '/erupt-api/data/modify/Task', ['title' => $title, 'owner' => $owner, 'done' => $done]);
+    }
+    $page = $call('POST', '/erupt-api/data/table/Task', [])[1];
+    eq([['a', 'a?'], 2], [array_column($page['list'], 'title'), $page['total']], 'owner and open only');
+    $page = $call('POST', '/erupt-api/data/table/Task', ['condition' => [['key' => 'title', 'expression' => 'EQ', 'value' => 'a']]], 'root')[1];
+    eq([], $page['list'], 'with search conditions');
+    // a view's own filter and order run on the node, and stay out of the build
+    eq(['a?'], array_column($call('POST', '/erupt-api/data/table/Task', ['vis' => 'q'])[1]['list'], 'title'), 'view filter as written');
+    eq(['a?', 'a'], array_column($call('POST', '/erupt-api/data/table/Task', ['vis' => 'Reversed'])[1]['list'], 'title'), 'view filters and order');
+    $vis = $call('GET', '/erupt-api/build/Task', null)[1]['eruptModel']['eruptJson']['vis'];
+    eq([['q', 'Question', 'TABLE'], ['Reversed', 'Reversed', 'TABLE']], array_map(fn($v) => [$v['code'], $v['title'], $v['type']], $vis), 'view codes');
+    eq(false, (bool) array_filter($vis, fn($v) => isset($v['filter']) || isset($v['orderBy'])), 'filter and orderBy off the build');
+    $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Task::class, new MemoryRepository());
+    eq(500, $call('POST', '/erupt-api/data/table/Task', [])[0], 'MemoryRepository refuses');
+    $repo = new PdoRepository(new \PDO('sqlite::memory:'), 'task');
+    $repo->bind(Model::of(Task::class));
+    throws("/2 '\\?' for 1 params/", fn() => $repo->page(new Query(filters: [['owner = ? or owner = ?', ['admin']]])), 'placeholder count');
 });
 
 $failed = 0;

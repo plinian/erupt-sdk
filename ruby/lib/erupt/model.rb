@@ -249,21 +249,51 @@ module Erupt
     end
   end
 
+  # A business error shown to the user as a message: raise it from a DataProxy hook or an operation.
+  class Fail < StandardError; end
+
+  # Hooks around a model's data, as erupt's Java +DataProxy+: subclass it, override what you need and pass it
+  # as <tt>erupt ..., data_proxy: ...</tt>. A record is the Hash the repository stores, a row the Hash the
+  # browser reads; change them in place. Raise Fail to refuse with a message.
+  class DataProxy
+    # Default values of the search bar, <tt>condition[field] = value</tt>.
+    def search_condition(condition) = nil
+    # SQL ANDed to a table page's WHERE, as written: <tt>"status <> 'deleted'"</tt>, or with its values bound,
+    # <tt>["owner = ?", [uid]]</tt>. +conditions+ are the search bar's. Only SQL repositories apply it.
+    def before_fetch(conditions) = nil
+    # The rows of a table page, before they are sent.
+    def after_fetch(rows) = nil
+    # The values a new record's form opens with.
+    def add_behavior(record) = nil
+    # A record read by its key, for the edit form or the detail view.
+    def edit_behavior(record) = nil
+    # A record about to be added or updated.
+    def validate(record) = nil
+    def before_add(record) = nil
+    def after_add(record) = nil
+    def before_update(record) = nil
+    def after_update(record) = nil
+    def before_delete(record) = nil
+    def after_delete(record) = nil
+  end
+
   # What +extend Erupt::Model+ declares about a class.
   class ModelSpec
     # fields: stored and served; declared: all of them in order, virtual ones included, for the build
-    attr_reader :cls, :name, :title, :power, :fields, :declared, :operations
+    attr_reader :cls, :name, :title, :power, :fields, :declared, :operations, :proxies
 
     def initialize(cls)
       @cls, @name = cls, cls.name&.split("::")&.last
-      @title, @power, @raw, @order_by = @name, DEFAULTS["power"].dup, {}, nil
-      @fields, @declared, @operations = {}, [], {}
+      @title, @power, @raw, @order_by, @views = @name, DEFAULTS["power"].dup, {}, nil, {}
+      @fields, @declared, @operations, @proxies = {}, [], {}, []
     end
 
-    def configure(title, name, power, order_by, raw)
-      @title, @name, @order_by, @order = title || @title, (name || @name).to_s, order_by, nil
+    def configure(title, name, power, order_by, data_proxy, raw)
+      @title, @name, @order_by, @order, @vis = title || @title, (name || @name).to_s, order_by, nil, nil
+      @proxies = Array(data_proxy).map { |p| p.is_a?(Class) ? p.new : p }
+      raise ArgumentError, "#{@name}: data_proxy must be a DataProxy" unless @proxies.all?(DataProxy)
       @power = DEFAULTS["power"].merge(Erupt.stringify(power || {}))
-      @raw = Erupt.stringify(raw)
+      @raw, @views = pull_vis(Erupt.stringify(raw))
       Schema.check("Erupt", @raw, "erupt #{@name}")
       raise ArgumentError, "erupt name '#{@name}' must be an identifier" unless IDENTIFIER.match?(@name)
     end
@@ -286,8 +316,50 @@ module Erupt
     def pk = @fields.each_value.find(&:pk?)&.name
 
     # The default table order: "views desc, id" -> [["views", true], ["id", false]], checked against the fields.
-    def order
-      @order ||= @order_by.to_s.split(",").map(&:strip).reject(&:empty?).map do |part|
+    def order = @order ||= parse_order(@order_by)
+
+    # View code -> [filters, order] the node applies to that view's table queries.
+    def vis = @vis ||= @views.transform_values { |filters, order_by| [filters.map { |f| [f, []] }, parse_order(order_by)] }
+
+    # Run one DataProxy hook on every proxy, in declaration order.
+    def hook(name, *args) = @proxies.each { |p| p.public_send(name, *args) }
+
+    # The SQL every proxy's +before_fetch+ adds, as <tt>[[sql, params], ...]</tt>.
+    def filters(conditions)
+      @proxies.filter_map do |p|
+        sql = p.before_fetch(conditions)
+        sql.is_a?(String) ? [sql, []] : [sql[0], Array(sql[1])] if sql && !sql.empty?
+      end
+    end
+
+    # Checks what can only be checked once every field is declared; the node calls it on register.
+    def validate!
+      raise ArgumentError, "erupt name '#{@name}' must be an identifier" unless IDENTIFIER.match?(@name.to_s)
+
+      order
+      vis
+      self
+    end
+
+    def build_erupt(operations = [])
+      erupt = Erupt.merge!(Erupt.deep_dup(DEFAULTS["erupt"]), "primaryKeyCol" => pk || "id")
+      erupt["rowOperation"] = operations.map(&:build)
+      Erupt.merge!(erupt, @raw)
+      { "eruptName" => @name, "eruptJson" => erupt, "eruptFieldModels" => @declared.map(&:build),
+        "searchCondition" => {}.tap { |c| hook(:search_condition, c) }, "extraRow" => false, "tags" => {} }
+    end
+
+    def build_model(power, user = nil)
+      operations = @operations.values.select { |op| op.visible?(user) }
+      forms = operations.select(&:form).to_h { |op| [op.code, op.form_model.build_erupt] }
+      { "eruptModel" => build_erupt(operations), "power" => power, "tabErupts" => nil, "combineErupts" => nil,
+        "operationErupts" => forms.empty? ? nil : forms }
+    end
+
+    private
+
+    def parse_order(order_by)
+      order_by.to_s.split(",").map(&:strip).reject(&:empty?).map do |part|
         field, dir, extra = part.split
         unless @fields.key?(field) && extra.nil? && (dir.nil? || %w[asc desc].include?(dir.downcase))
           raise ArgumentError, "#{@name}: illegal order_by '#{part}'"
@@ -297,27 +369,20 @@ module Erupt
       end
     end
 
-    # Checks what can only be checked once every field is declared; the node calls it on register.
-    def validate!
-      raise ArgumentError, "erupt name '#{@name}' must be an identifier" unless IDENTIFIER.match?(@name.to_s)
+    # +filter+ and +orderBy+ of a +vis+ entry run on the node, as Java keeps them off the build (@Transient):
+    # taken out before the schema check. A view without a +code+ is addressed by its title.
+    def pull_vis(raw)
+      return [raw, {}] unless raw["vis"].is_a?(Array)
 
-      order
-      self
-    end
+      views = {}
+      entries = raw["vis"].map do |entry|
+        next entry unless entry.is_a?(Hash)
 
-    def build_erupt(operations = [])
-      erupt = Erupt.merge!(Erupt.deep_dup(DEFAULTS["erupt"]), "primaryKeyCol" => pk || "id")
-      erupt["rowOperation"] = operations.map(&:build)
-      Erupt.merge!(erupt, @raw)
-      { "eruptName" => @name, "eruptJson" => erupt, "eruptFieldModels" => @declared.map(&:build),
-        "searchCondition" => {}, "extraRow" => false, "tags" => {} }
-    end
-
-    def build_model(power, user = nil)
-      operations = @operations.values.select { |op| op.visible?(user) }
-      forms = operations.select(&:form).to_h { |op| [op.code, op.form_model.build_erupt] }
-      { "eruptModel" => build_erupt(operations), "power" => power, "tabErupts" => nil, "combineErupts" => nil,
-        "operationErupts" => forms.empty? ? nil : forms }
+        entry = { "code" => entry["title"].to_s }.merge(entry)
+        views[entry["code"]] = [Array(entry.delete("filter")), entry.delete("orderBy")]
+        entry
+      end
+      [raw.merge("vis" => entries), views]
     end
   end
 
@@ -335,10 +400,12 @@ module Erupt
 
     # +name+ defaults to the class name and is what the server addresses (<tt>node.Name</tt>); +power+
     # switches features off (<tt>{ delete: false }</tt>); +order_by+ is the default table order, applied by
-    # the node (<tt>"views desc, id"</tt>); other keywords are raw +@Erupt+ attributes merged onto the
+    # the node (<tt>"views desc, id"</tt>); +data_proxy+ is one DataProxy or an array of them (classes or
+    # instances), run around every read and write of the model; other keywords are raw +@Erupt+ attributes merged onto the
     # defaults (<tt>layout: { pageSize: 30 }</tt>); an unknown attribute or value fails here, not in the browser.
-    def erupt(title = nil, name: nil, power: nil, order_by: nil, **raw)
-      erupt_model.configure(title, name, power, order_by, raw)
+    # A +vis:+ entry may also carry +filter+ (SQL, one or an array) and +orderBy+, applied by the node to that view.
+    def erupt(title = nil, name: nil, power: nil, order_by: nil, data_proxy: nil, **raw)
+      erupt_model.configure(title, name, power, order_by, data_proxy, raw)
     end
 
     # +kind+ infers the edit type: String INPUT, Integer / Float NUMBER, +:boolean+ BOOLEAN, Date DATE,
