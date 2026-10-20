@@ -10,11 +10,12 @@ import type { Cond, Operator, Query, Repository } from "./repo.js";
 
 export const VERSION = "0.1.0";
 
-const userStore = new AsyncLocalStorage<User | null>();
+// the acting user and the browser's token of the request being served
+const requestStore = new AsyncLocalStorage<{ user: User | null; token: string }>();
 
 /** The acting user of the request being served: `{uid, account, name, tenantId}`. */
 export function currentUser(): User | null {
-  return userStore.getStore() ?? null;
+  return requestStore.getStore()?.user ?? null;
 }
 
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
@@ -165,7 +166,7 @@ export class Node {
       if (parent && parent.split(".").pop() !== name) throw new Reply(404);
       const user = header(req, "user");
       const acting = user ? (JSON.parse(Buffer.from(user, "base64").toString("utf8")) as User) : null;
-      return userStore.run(acting, async () => [200, await handler.call(this, entry[0], entry[1], req, ...args)]);
+      return requestStore.run({ user: acting, token: header(req, "token") ?? "" }, async () => [200, await handler.call(this, entry[0], entry[1], req, ...args)]);
     }
     throw new Reply(404);
   }
@@ -192,14 +193,17 @@ export class Node {
 
   private async table(model: Model, repo: Repository, req: Request): Promise<unknown> {
     await this.require(model, req, "query");
-    return this.page(model, repo, objectBody(req));
+    return this.page(model, repo, objectBody(req), req);
   }
 
-  private async page(model: Model, repo: Repository, body: Record<string, any>): Promise<unknown> {
+  private async page(model: Model, repo: Repository, body: Record<string, any>, req: Request): Promise<unknown> {
     const pageIndex = Math.max(Math.trunc(Number(body.pageIndex)) || 1, 1);
     const pageSize = Math.min(Math.max(Math.trunc(Number(body.pageSize)) || 10, 1), MAX_PAGE_SIZE);
     const query: Query = { conditions: [], sort: [], offset: (pageIndex - 1) * pageSize, limit: pageSize };
-    for (const c of asList(body.condition)) query.conditions.push(...conditions(model, c));
+    // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+    const trusted = req.enforced.has("query");
+    for (const c of asList(body.condition)) query.conditions.push(...conditions(model, c, trusted));
+    const drill = await this.drill(model, req, query);
     for (const s of asList(body.sort)) {
       const f = isObject(s) ? model.fields[s.field] : undefined;
       if (!f || !(f.sortable || f.pk)) throw new Fail(`illegal sort field '${isObject(s) ? s.field : s}'`);
@@ -211,7 +215,7 @@ export class Node {
     // a @Vis view's own filter and order, then the DataProxy's
     const [filters, sort] = model.vis.get(body.vis) ?? [[], []];
     if (!query.sort.length) query.sort = [...(sort.length ? sort : model.orderBy)];
-    query.filters = [...filters, ...await model.filters(query.conditions)];
+    query.filters = [...drill, ...filters, ...await model.filters(query.conditions)];
     const [total, records] = model.linkTree?.[1] && picked == null ? [0, []] : await repo.page(query);
     const rows = this.rows(model, records);
     await model.hook("afterFetch", rows);
@@ -219,6 +223,23 @@ export class Node {
       pageIndex, pageSize, total, totalPage: Math.ceil(total / pageSize), list: rows,
       sort: null, alert: null, extraContent: null,
     };
+  }
+
+  /**
+   * A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+   * joinColumn holds the source row's column; its linkCondition is returned as a filter.
+   */
+  private async drill(model: Model, req: Request, query: Query): Promise<[string, unknown[]][]> {
+    const code = header(req, "drill");
+    if (code === undefined) return [];
+    const source = this.models.get(header(req, "drillsourceerupt") ?? "");
+    const link = source?.[0].drills.get(code);
+    if (!source || !link) throw new Reply(403);
+    if (link.erupt !== model.name || !(link.join in model.fields)) throw new Fail(`illegal erupt from drill '${code}'`);
+    const row = await source[1].get(primaryKey(source[0], header(req, "drillvalue")));
+    if (!row) throw new Fail("record not found");
+    query.conditions.push(condition(model.fields[link.join], "EQ", row[link.column]));
+    return link.condition ? [[link.condition, []]] : [];
   }
 
   private async initValue(model: Model, _repo: Repository, req: Request): Promise<unknown> {
@@ -370,6 +391,29 @@ export class Node {
 
   // ---------------------------------------------------------------- server calls
 
+  /** The config text set for this node on the erupt server (Node Config). */
+  config(): Promise<string> {
+    return this.serverText(`/erupt-cloud-api/node-config/${this.name}`, { "Access-Token": this.accessToken });
+  }
+
+  /** The config text of this node's group on the erupt server. */
+  groupConfig(): Promise<string> {
+    return this.serverText(`/erupt-cloud-api/node-group-config/${this.name}`, { "Access-Token": this.accessToken });
+  }
+
+  /** The acting user's full info from the erupt server (roles, org, post...), for the request being served. */
+  async userInfo(): Promise<Record<string, any> | null> {
+    const text = await this.serverText(`/erupt-cloud-api/userinfo/${this.name}`,
+      { "Access-Token": this.accessToken, token: requestStore.getStore()?.token ?? "" });
+    return text ? JSON.parse(text) : null;
+  }
+
+  private async serverText(path: string, headers: Record<string, string>): Promise<string> {
+    const res = await fetch(this.nextServer() + path, { headers, signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);
+    return res.text();
+  }
+
   private nextServer(): string {
     return this.servers[this.serverIndex++ % this.servers.length];
   }
@@ -474,10 +518,10 @@ function objectBody(req: Request): Record<string, any> {
 
 const asList = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
-function conditions(model: Model, c: unknown): Cond[] {
+function conditions(model: Model, c: unknown, trusted = false): Cond[] {
   const key = isObject(c) ? c.key : undefined;
   const f = typeof key === "string" ? model.fields[key] : undefined;
-  if (!f || f.pk || !f.search) throw new Fail(`illegal search field '${key}'`);
+  if (!f || (!trusted && (f.pk || !f.search))) throw new Fail(`illegal search field '${key}'`);
   const op = String((c as Record<string, unknown>).expression || "EQ");
   if (!OPS.has(op)) throw new Fail(`illegal operator '${op}'`);
   const value = (c as Record<string, unknown>).value;

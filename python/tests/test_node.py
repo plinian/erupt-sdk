@@ -167,6 +167,24 @@ class Order:
     stop = Field("Stop", type="BUTTON", click=_refuse)
 
 
+@erupt("Author", drills=[{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author.id"}}])
+class Author:
+    id: int = Field(pk=True)
+    name: str = Field("Name")
+
+
+@erupt("Book")
+class Book:
+    id: int = Field(pk=True)
+    title: str = Field("Title")
+    author: Author = Field("Author")
+    colour: str = Field("Colour", type="COLOR")
+    stars: int = Field("Stars", type="RATE")
+    secret: str = Field("Secret", type="HIDDEN")
+    readers: list = Field("Readers", type="TRANSFER", ref=Category)
+    shelf: Category = Field("Shelf", edit={"referenceTableType": {"dependField": "author", "dependColumn": "parent"}})
+
+
 class NodeTest(unittest.TestCase):
     repo_factory = staticmethod(lambda: MemoryRepository())
     widget_factory = staticmethod(lambda: MemoryRepository())
@@ -182,6 +200,8 @@ class NodeTest(unittest.TestCase):
         self.node.register(Widget, self.widget_factory())
         self.node.register(Memo, MemoryRepository())
         self.node.register(Order, MemoryRepository())
+        self.node.register(Author, MemoryRepository([{"name": "Ann"}, {"name": "Bob"}]))
+        self.node.register(Book, MemoryRepository([{"title": "a", "author": 1}, {"title": "b", "author": 2}, {"title": "c", "author": 1}]))
         self.node.register(Doc, MemoryRepository([{"title": "a", "topic": 1}, {"title": "b", "topic": 2}, {"title": "c", "topic": 3}]))
         CALLS.clear()
         MemoProxy.calls.clear()
@@ -366,6 +386,38 @@ class NodeTest(unittest.TestCase):
         row = self.call("POST", "/erupt-api/data/table/Order", {}, erupt="Order")[1]["list"][0]
         self.assertEqual(([1, 2], [3]), (row["cats"], row["sections"]))
         self.assertNotIn("calc", row)
+
+    def test_drill(self):
+        drill = {"HTTP_DRILL": "Books", "HTTP_DRILLSOURCEERUPT": "Author", "HTTP_DRILLVALUE": "1"}
+        _, page = self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book", headers=drill)
+        self.assertEqual(["a", "c"], [r["title"] for r in page["list"]])
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book", headers={**drill, "HTTP_DRILL": "x"})[0])
+        _, build = self.call("GET", "/erupt-api/build/Author", erupt="Author")
+        self.assertEqual([{"code": "Books", "title": "Books", "link": {"linkErupt": "Book"}}],
+                         [{k: d[k] for k in ("code", "title")} | {"link": {"linkErupt": d["link"]["linkErupt"]}}
+                          for d in build["eruptModel"]["eruptJson"]["drills"]])
+        self.assertNotIn("joinColumn", build["eruptModel"]["eruptJson"]["drills"][0]["link"])
+
+    def test_simple_types_and_depend_column(self):
+        _, build = self.call("GET", "/erupt-api/build/Book", erupt="Book")
+        edit = {f["fieldName"]: f["eruptFieldJson"]["edit"] for f in build["eruptModel"]["eruptFieldModels"]}
+        self.assertEqual(("COLOR", "RATE", "HIDDEN", "TRANSFER"), tuple(edit[n]["type"] for n in ("colour", "stars", "secret", "readers")))
+        self.assertEqual("parent", edit["shelf"]["referenceTableType"]["dependColumn"], "the server reads it off the build")
+        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Book", {"title": "d", "stars": "4", "readers": [{"id": 2}]}, erupt="Book")[1]["success"])
+        row = self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book")[1]["list"][-1]
+        self.assertEqual((4, [2]), (row["stars"], row["readers"]))
+
+    def test_node_config_and_user_info(self):
+        seen = []
+        def server_text(path, headers):
+            seen.append((path, headers.get("token")))
+            return '{"account": "admin", "roles": ["r"]}' if "userinfo" in path else "cfg"
+        self.node._server_text = server_text
+        self.assertEqual("cfg", self.node.config())
+        self.assertEqual("cfg", self.node.group_config())
+        self.assertEqual({"account": "admin", "roles": ["r"]}, self.node.user_info())
+        self.assertEqual(["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog",
+                          "/erupt-cloud-api/userinfo/blog"], [p for p, _ in seen])
 
     def test_before_fetch_needs_sql(self):
         self.node.register(Task, MemoryRepository())

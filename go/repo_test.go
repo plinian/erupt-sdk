@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -673,5 +674,178 @@ func TestFieldTypesAndInvoke(t *testing.T) {
 	}
 	if _, ok := row["calc"]; ok {
 		t.Error("a BUTTON reached the row")
+	}
+}
+
+type author struct {
+	ID   int64  `json:"id" erupt:"pk"`
+	Name string `json:"name" erupt:"title=Name"`
+}
+
+type book struct {
+	ID      int64   `json:"id" erupt:"pk"`
+	Title   string  `json:"title" erupt:"title=Title"`
+	Author  int64   `json:"author" erupt:"title=Author;ref=Author"`
+	Colour  string  `json:"colour" erupt:"title=Colour;type=COLOR"`
+	Stars   int64   `json:"stars" erupt:"title=Stars;type=RATE"`
+	Secret  string  `json:"secret" erupt:"title=Secret;type=HIDDEN"`
+	Readers []int64 `json:"readers" erupt:"title=Readers;type=TRANSFER;ref=Category"`
+	Shelf   int64   `json:"shelf" erupt:"title=Shelf;ref=Category"`
+}
+
+// bookNode serves Category, Author (drilling into its books) and Book.
+func bookNode(t *testing.T, server string) (*Node, func(method, path, body string, headers map[string]string) (int, map[string]any)) {
+	t.Helper()
+	category, _ := testModels(t)
+	a, err := NewModel(author{}, "Author", WithName("Author"),
+		WithRaw(M{"drills": []M{{"title": "Books", "link": M{"linkErupt": "Book", "joinColumn": "author.id"}}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewModel(book{}, "Book", WithName("Book"),
+		WithFieldEdit("shelf", M{"referenceTableType": M{"dependField": "author", "dependColumn": "parent"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, _ := NewNode(Config{Name: "blog", AccessToken: "secret", Servers: []string{server}})
+	for _, reg := range []struct {
+		m    *Model
+		repo Repository
+	}{
+		{category, NewMemoryRepository()},
+		{a, NewMemoryRepository(Record{"name": "Ann"}, Record{"name": "Bob"})},
+		{b, NewMemoryRepository(Record{"title": "a", "author": 1}, Record{"title": "b", "author": 2}, Record{"title": "c", "author": 1})},
+	} {
+		if err := node.Register(reg.m, reg.repo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return node, func(method, path, body string, headers map[string]string) (int, map[string]any) {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", path[strings.LastIndex(path, "/")+1:])
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var v map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		return w.Code, v
+	}
+}
+
+func powerServer(t *testing.T) string {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func titlesOf(page map[string]any) []string {
+	out := []string{}
+	list, _ := page["list"].([]any)
+	for _, row := range list {
+		out = append(out, str(row.(map[string]any)["title"]))
+	}
+	return out
+}
+
+func TestDrill(t *testing.T) {
+	node, call := bookNode(t, powerServer(t))
+	drill := map[string]string{"Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1"}
+	if _, page := call("POST", "/erupt-api/data/table/Book", `{}`, drill); !reflect.DeepEqual(titlesOf(page), []string{"a", "c"}) {
+		t.Errorf("drilled rows %v", titlesOf(page))
+	}
+	for k, v := range map[string]string{"Drill": "x", "DrillSourceErupt": "Book"} {
+		headers := map[string]string{"Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1", k: v}
+		if status, _ := call("POST", "/erupt-api/data/table/Book", `{}`, headers); status != 403 {
+			t.Errorf("%s=%s: %d", k, v, status)
+		}
+	}
+	if _, r := call("POST", "/erupt-api/data/table/Category", `{}`, drill); r["success"] != false {
+		t.Errorf("a drill into another model %v", r)
+	}
+	_, build := call("GET", "/erupt-api/build/Author", "", nil)
+	drills := build["eruptModel"].(map[string]any)["eruptJson"].(map[string]any)["drills"].([]any)
+	want := []any{M{"code": "Books", "title": "Books", "fold": false, "icon": "fa fa-sitemap", "link": M{"linkErupt": "Book", "linkCondition": ""}}}
+	if !reflect.DeepEqual(drills, want) {
+		t.Errorf("build drills %v", drills)
+	}
+	if _, err := NewModel(author{}, "Author", WithRaw(M{"drills": []M{{"title": "x", "link": M{"linkErupt": "Book"}}}})); err == nil {
+		t.Error("a drill without joinColumn was accepted")
+	}
+	// a signed "query" takes a condition on a field the search bar does not have
+	body := `{"condition":[{"key":"author","expression":"EQ","value":2}]}`
+	if _, r := call("POST", "/erupt-api/data/table/Book", body, nil); r["success"] != false {
+		t.Errorf("an unsigned condition on a non-search field %v", r)
+	}
+	ts := time.Now().Unix()
+	path := "/erupt-api/data/table/Book"
+	signed := map[string]string{HeaderTimestamp: strconv.FormatInt(ts, 10), HeaderEnforced: "power,query",
+		HeaderSignature: Sign(node.cfg.AccessToken, "POST", path, ts, "power,query", "", []byte(body))}
+	if _, page := call("POST", path, body, signed); !reflect.DeepEqual(titlesOf(page), []string{"b"}) {
+		t.Errorf("signed query %v", page)
+	}
+}
+
+func TestSimpleTypesAndDependColumn(t *testing.T) {
+	_, call := bookNode(t, powerServer(t))
+	_, build := call("GET", "/erupt-api/build/Book", "", nil)
+	edit := map[string]map[string]any{}
+	for _, f := range build["eruptModel"].(map[string]any)["eruptFieldModels"].([]any) {
+		f := f.(map[string]any)
+		edit[str(f["fieldName"])] = f["eruptFieldJson"].(map[string]any)["edit"].(map[string]any)
+	}
+	for name, typ := range map[string]string{"colour": "COLOR", "stars": "RATE", "secret": "HIDDEN", "readers": "TRANSFER"} {
+		if edit[name]["type"] != typ {
+			t.Errorf("%s: %v", name, edit[name]["type"])
+		}
+	}
+	if got := edit["shelf"]["referenceTableType"].(map[string]any)["dependColumn"]; got != "parent" {
+		t.Errorf("dependColumn %v: the server reads it off the build", got)
+	}
+	if _, r := call("POST", "/erupt-api/data/modify/Book", `{"title":"d","stars":"4","readers":[{"id":2}]}`, nil); r["success"] != true {
+		t.Fatalf("add %v", r)
+	}
+	_, page := call("POST", "/erupt-api/data/table/Book", `{}`, nil)
+	list := page["list"].([]any)
+	row := list[len(list)-1].(map[string]any)
+	if row["stars"] != float64(4) || !reflect.DeepEqual(row["readers"], []any{float64(2)}) {
+		t.Errorf("stars %v readers %v", row["stars"], row["readers"])
+	}
+}
+
+func TestNodeConfigAndUserInfo(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Access-Token") != "secret" {
+			w.WriteHeader(403)
+			return
+		}
+		seen = append(seen, r.URL.Path+" "+r.Header.Get("token"))
+		if strings.Contains(r.URL.Path, "userinfo") {
+			_, _ = w.Write([]byte(`{"account":"admin","roles":["r"]}`))
+			return
+		}
+		_, _ = w.Write([]byte("cfg"))
+	}))
+	defer server.Close()
+	node, _ := NewNode(Config{Name: "blog", AccessToken: "secret", Servers: []string{server.URL}})
+	ctx := context.Background()
+	if c, err := node.NodeConfig(ctx); c != "cfg" || err != nil {
+		t.Errorf("node config %q %v", c, err)
+	}
+	if c, err := node.GroupConfig(ctx); c != "cfg" || err != nil {
+		t.Errorf("group config %q %v", c, err)
+	}
+	info, err := node.UserInfo(context.WithValue(ctx, tokenKey{}, "tk"))
+	if err != nil || !reflect.DeepEqual(info, M{"account": "admin", "roles": []any{"r"}}) {
+		t.Errorf("user info %v %v", info, err)
+	}
+	want := []string{"/erupt-cloud-api/node-config/blog ", "/erupt-cloud-api/node-group-config/blog ", "/erupt-cloud-api/userinfo/blog tk"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Errorf("calls %q", seen)
 	}
 }

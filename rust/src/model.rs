@@ -8,14 +8,14 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::repo::{Cond, Filter, Repository};
-use crate::schema::{check, defaults};
+use crate::schema::{annotation_defaults, check, defaults};
 use crate::types::{EditType, RowOperationMode};
 use crate::values::{as_f64, number, parse_date_time, text};
 use crate::{Error, Record, Result};
 
 pub(crate) const REFERENCES: [&str; 2] = ["REFERENCE_TABLE", "REFERENCE_TREE"];
 /// many records of another model, stored as the JSON list of their keys
-const COLLECTIONS: [&str; 2] = ["CHECKBOX", "TAB_TREE"];
+const COLLECTIONS: [&str; 3] = ["CHECKBOX", "TAB_TREE", "TRANSFER"];
 
 /// A field's own code, run when the server invokes it (erupt-cloud/PROTOCOL.md §5.5): the form's values and
 /// the call's `value` to the answer's `data`.
@@ -67,6 +67,9 @@ pub struct Field {
     pub(crate) target: Option<Arc<Model>>,
     pub(crate) label: String,
     pub(crate) tree: Option<String>,
+    /// `edit.referenceTableType.dependColumn`, `@Transient` in Java: kept out of the schema check, written into
+    /// the build
+    depend_column: Option<String>,
     view: Value,
     edit: Value,
     fetch: Option<FieldCode>,
@@ -95,6 +98,7 @@ impl Field {
             target: None,
             label: "name".to_string(),
             tree: None,
+            depend_column: None,
             view: json!({}),
             edit: json!({}),
             fetch: None,
@@ -161,6 +165,10 @@ impl Field {
     /// JSON list of their primary keys.
     pub fn tab_tree(target: &Arc<Model>, title: &str) -> Self {
         Field::collection("TAB_TREE", target, title)
+    }
+    /// Records of another model, moved across two lists; stored as the JSON list of their primary keys.
+    pub fn transfer(target: &Arc<Model>, title: &str) -> Self {
+        Field::collection("TRANSFER", target, title)
     }
     fn collection(kind: &str, target: &Arc<Model>, title: &str) -> Self {
         let mut f = Field::new(kind, title);
@@ -354,7 +362,7 @@ impl Field {
                 efj["views"][0]["column"] = json!(self.label);
             }
             // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
-            "CHECKBOX" | "TAB_TREE" => {
+            "CHECKBOX" | "TAB_TREE" | "TRANSFER" => {
                 tpl["fieldReturnName"] = json!(self.target().name);
                 tpl["eruptFieldJson"]["views"][0]["column"] = json!(self.label);
             }
@@ -362,6 +370,9 @@ impl Field {
         }
         let efj = &mut tpl["eruptFieldJson"];
         merge(&mut efj["edit"], &self.edit);
+        if let Some(column) = &self.depend_column {
+            efj["edit"]["referenceTableType"]["dependColumn"] = json!(column);
+        }
         if let Some(view) = efj["views"].get_mut(0) {
             merge(view, &self.view);
         }
@@ -444,7 +455,7 @@ impl Field {
                     "true" | "1"
                 )),
             }),
-            "NUMBER" => as_f64(value)
+            "NUMBER" | "RATE" | "SLIDER" => as_f64(value)
                 .map(number)
                 .ok_or_else(|| format!("illegal number '{}'", text(value))),
             "DATE" | "DATE_TIME" => {
@@ -672,6 +683,8 @@ pub struct Model {
     pub(crate) vis: HashMap<String, (Vec<Filter>, Order)>,
     /// (field, dependNode) of a @LinkTree: the reference the tree beside the table filters
     pub(crate) link_tree: Option<(String, bool)>,
+    /// drill code -> its link, of which `column` and `joinColumn` stay here (`@Transient` in Java)
+    pub(crate) drills: HashMap<String, Drill>,
     raw: Value,
     pub(crate) operations: Vec<Operation>,
     pub(crate) proxies: Vec<Arc<dyn DataProxy>>,
@@ -820,6 +833,8 @@ impl ModelBuilder {
         }
         let (raw, vis) =
             pull_vis(self.raw).map_err(|m| Error::Declaration(format!("{name}: {m}")))?;
+        let (raw, drills) =
+            pull_drills(raw).map_err(|m| Error::Declaration(format!("{name}: {m}")))?;
         check("Erupt", &raw, &format!("model {name}"), true).map_err(Error::Declaration)?;
         let default_power = defaults()["power"].as_object().expect("power");
         let mut power = default_power.clone();
@@ -866,8 +881,20 @@ impl ModelBuilder {
                      AUTO_COMPLETE and BUTTON"
                 ));
             }
+            let table_type = f
+                .edit
+                .get_mut("referenceTableType")
+                .and_then(Value::as_object_mut);
+            match table_type.and_then(|t| t.remove("dependColumn")) {
+                None => {}
+                Some(Value::String(column)) => f.depend_column = Some(column),
+                Some(_) => return fail(format!("{path}: dependColumn must be text")),
+            }
             check("View", &f.view, &format!("{path}.view"), true).map_err(Error::Declaration)?;
             check("Edit", &f.edit, &format!("{path}.edit"), true).map_err(Error::Declaration)?;
+            if (f.is_reference() || f.is_collection()) && f.target.is_none() {
+                return fail(format!("{path}: {} needs a target model", f.kind));
+            }
             if let Some(target) = &f.target {
                 if target.pk.is_none() {
                     return fail(format!("{path}: {} has no primary key", target.name));
@@ -930,6 +957,7 @@ impl ModelBuilder {
             order_by,
             vis,
             link_tree,
+            drills,
             raw,
             operations: self.operations,
             proxies: self.proxies,
@@ -997,6 +1025,65 @@ fn pull_vis(mut raw: Value) -> std::result::Result<(Value, Vec<RawView>), String
         vis.push((text(&entry["code"]), filters, sort));
     }
     Ok((raw, vis))
+}
+
+/// A drill's link as the node applies it.
+pub(crate) struct Drill {
+    /// the linked model
+    pub(crate) erupt: String,
+    /// the source row's column
+    pub(crate) column: String,
+    /// the linked model's field holding it
+    pub(crate) join: String,
+    /// `linkCondition`, SQL as written
+    pub(crate) condition: String,
+}
+
+/// `link.column` / `link.joinColumn` of a drill: the source row's column (`id` by default) and the linked
+/// model's field holding it, applied by the node and kept out of the build. A drill without a `code` is
+/// addressed by its title.
+fn pull_drills(mut raw: Value) -> std::result::Result<(Value, HashMap<String, Drill>), String> {
+    let mut drills = HashMap::new();
+    for entry in raw
+        .get_mut("drills")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(declared) = entry.as_object() else {
+            continue; // the schema check reports it
+        };
+        let mut link = declared.get("link").cloned().unwrap_or(json!({}));
+        let Some(fields) = link.as_object_mut() else {
+            continue;
+        };
+        let column = fields.remove("column").unwrap_or(json!("id"));
+        let join = fields.remove("joinColumn").unwrap_or(Value::Null);
+        let (Some(column), Some(join), Some(erupt)) = (
+            column.as_str(),
+            join.as_str().filter(|j| !j.is_empty()),
+            fields.get("linkErupt").and_then(Value::as_str),
+        ) else {
+            return Err(format!(
+                "drill '{}' needs link.linkErupt and link.joinColumn",
+                text(declared.get("title").unwrap_or(&Value::Null))
+            ));
+        };
+        let drill = Drill {
+            erupt: erupt.to_string(),
+            column: column.to_string(),
+            join: join.split('.').next().unwrap_or(join).to_string(),
+            condition: fields.get("linkCondition").map(text).unwrap_or_default(),
+        };
+        let mut filled = Value::Object(annotation_defaults("Drill"));
+        filled["code"] = declared.get("title").cloned().unwrap_or(json!(""));
+        merge(&mut filled, entry);
+        filled["link"] = Value::Object(annotation_defaults("Link"));
+        merge(&mut filled["link"], &link);
+        drills.insert(text(&filled["code"]), drill);
+        *entry = filled;
+    }
+    Ok((raw, drills))
 }
 
 /// Records to JSON rows: every declared field present (null when missing).

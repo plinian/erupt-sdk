@@ -54,6 +54,8 @@ public sealed partial class EruptNode
 
     private static readonly AsyncLocal<EruptUser?> User = new();
 
+    private static readonly AsyncLocal<string?> Token = new();
+
     private readonly Dictionary<string, (EruptModel Model, IRepository Repo)> _models = [];
     private readonly ConcurrentDictionary<(string, string), (DateTime Expires, JsonObject Power)> _powerCache = new();
     private readonly List<(string Method, Regex Pattern, Func<Request, string[], Task<JsonNode?>> Handler)> _routes;
@@ -185,6 +187,7 @@ public sealed partial class EruptNode
             if (parent.Length > 0 && parent.Split('.')[^1] != name) throw new Reply(404);
             var user = request.Headers["user"].ToString();
             User.Value = user.Length > 0 ? JsonSerializer.Deserialize<EruptUser>(Convert.FromBase64String(user)) : null;
+            Token.Value = request.Headers["token"].ToString();
             var body = ParseJson(raw);
             var args = match.Groups.Cast<Group>().Skip(2).Select(g => g.Value).ToArray();
             return (200, await handler(new Request(context, entry.Model, entry.Repo, body), args));
@@ -255,15 +258,19 @@ public sealed partial class EruptNode
     private async Task<JsonNode?> Table(Request r, string[] _)
     {
         await Require(r, "query");
-        return await Page(r.Model, r.Repo, BodyObject(r), r.Http.RequestAborted);
+        return await Page(r.Model, r.Repo, BodyObject(r), r.Http);
     }
 
-    private async Task<JsonNode> Page(EruptModel model, IRepository repo, JsonObject body, CancellationToken ct)
+    private async Task<JsonNode> Page(EruptModel model, IRepository repo, JsonObject body, HttpContext http)
     {
+        var ct = http.RequestAborted;
         var pageIndex = Math.Max(Int(body["pageIndex"], 1), 1);
         var pageSize = Math.Min(Math.Max(Int(body["pageSize"], 10), 1), MaxPageSize);
         var query = new Query { Offset = (pageIndex - 1) * pageSize, Limit = pageSize };
-        foreach (var c in body["condition"] as JsonArray ?? []) query.Conditions.Add(Condition(model, c as JsonObject ?? []));
+        // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+        var trusted = Enforced(http, "query");
+        foreach (var c in body["condition"] as JsonArray ?? []) query.Conditions.Add(Condition(model, c as JsonObject ?? [], trusted));
+        var drill = await Drill(model, http, query);
         foreach (var s in body["sort"] as JsonArray ?? [])
         {
             var name = Values.Plain(s?["field"]) as string;
@@ -277,6 +284,7 @@ public sealed partial class EruptNode
         // a @Vis view's own filter and order, then the DataProxy's
         var (filters, sort) = model.Views.GetValueOrDefault(Values.Plain(body["vis"]) as string ?? "", ([], []));
         if (query.Sort.Count == 0) query.Sort = [.. sort.Count > 0 ? sort : model.OrderBy];
+        query.Filters.AddRange(drill);
         query.Filters.AddRange(filters);
         query.Filters.AddRange(model.Filters(query.Conditions));
         var (total, records) = model.LinkTree is { DependNode: true } && picked is null ? (0, []) : await repo.PageAsync(query, ct);
@@ -293,10 +301,29 @@ public sealed partial class EruptNode
     private static int Int(JsonNode? node, int fallback) =>
         Values.Plain(node) is { } value && value is not "" and not false ? Convert.ToInt32(value, CultureInfo.InvariantCulture) : fallback;
 
-    private static Cond Condition(EruptModel model, JsonObject c)
+    /// <summary>
+    /// A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose joinColumn
+    /// holds the source row's column; its linkCondition is returned as a filter.
+    /// </summary>
+    private async Task<List<SqlFilter>> Drill(EruptModel model, HttpContext http, Query query)
+    {
+        var headers = http.Request.Headers;
+        var code = headers["Drill"].ToString();
+        if (code.Length == 0) return [];
+        if (!_models.TryGetValue(headers["DrillSourceErupt"].ToString(), out var source) || !source.Model.Drills.TryGetValue(code, out var link))
+            throw new Reply(403);
+        if (link.Erupt != model.Name || !model.FieldMap.TryGetValue(link.Join, out var join) || join.Virtual)
+            throw new EruptFailure($"illegal erupt from drill '{code}'");
+        var row = await source.Repo.GetAsync(Pk(source.Model, headers["DrillValue"].ToString())!, http.RequestAborted)
+                  ?? throw new EruptFailure("record not found");
+        query.Conditions.Add(Condition(join, "EQ", row.GetValueOrDefault(link.Column)));
+        return link.Condition.Length > 0 ? [new SqlFilter(link.Condition)] : [];
+    }
+
+    private static Cond Condition(EruptModel model, JsonObject c, bool trusted)
     {
         var key = Values.Plain(c["key"]) as string;
-        if (key is null || !model.FieldMap.TryGetValue(key, out var f) || f.IsPk || !f.Search)
+        if (key is null || !model.FieldMap.TryGetValue(key, out var f) || f.Virtual || (!trusted && (f.IsPk || !f.Search)))
             throw new EruptFailure($"illegal search field '{key}'");
         var op = Values.Plain(c["expression"]) as string;
         return Condition(f, string.IsNullOrEmpty(op) ? "EQ" : op, Values.Plain(c["value"]));
@@ -523,6 +550,33 @@ public sealed partial class EruptNode
         if (_powerCache.Count > 10000) _powerCache.Clear();
         _powerCache[key] = (DateTime.UtcNow.AddSeconds(5), power);
         return power;
+    }
+
+    // ---------------------------------------------------------------- server calls
+
+    /// <summary>The config text set for this node on the erupt server (Node Config).</summary>
+    public Task<string> ConfigAsync(CancellationToken ct = default) =>
+        ServerText($"/erupt-cloud-api/node-config/{Uri.EscapeDataString(Options.Name)}", null, ct);
+
+    /// <summary>The config text of this node's group on the erupt server.</summary>
+    public Task<string> GroupConfigAsync(CancellationToken ct = default) =>
+        ServerText($"/erupt-cloud-api/node-group-config/{Uri.EscapeDataString(Options.Name)}", null, ct);
+
+    /// <summary>The acting user's full info from the erupt server (roles, org, post...), for the request being served.</summary>
+    public async Task<JsonObject?> UserInfoAsync(CancellationToken ct = default)
+    {
+        var text = await ServerText($"/erupt-cloud-api/userinfo/{Uri.EscapeDataString(Options.Name)}", Token.Value ?? "", ct);
+        return text.Length > 0 ? JsonNode.Parse(text) as JsonObject : null;
+    }
+
+    private async Task<string> ServerText(string path, string? token, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, NextServer() + path);
+        request.Headers.TryAddWithoutValidation("Access-Token", Options.AccessToken);
+        if (token is not null) request.Headers.TryAddWithoutValidation("token", token);
+        using var response = await Http.SendAsync(request, ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadAsStringAsync(ct);
     }
 
     // ---------------------------------------------------------------- registration

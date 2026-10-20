@@ -74,6 +74,12 @@ public sealed class FieldAttribute(string title = "") : Attribute
 
     /// <summary>Parent field of the referenced model: turns the reference picker into a tree.</summary>
     public string? Tree { get; set; }
+
+    /// <summary>
+    /// A REFERENCE_TABLE whose <c>referenceTableType.dependField</c> is set: the referenced model's field the picker
+    /// keeps equal to the depend field's value (<c>@Transient</c> in Java, so not part of <see cref="Erupt.Edit"/>).
+    /// </summary>
+    public string? DependColumn { get; set; }
 }
 
 /// <summary>One option of a CHOICE field, in declaration order.</summary>

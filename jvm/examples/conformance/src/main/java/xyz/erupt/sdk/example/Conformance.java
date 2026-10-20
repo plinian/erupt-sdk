@@ -6,6 +6,8 @@ import xyz.erupt.annotation.exception.EruptException;
 import xyz.erupt.annotation.expr.ExprBool;
 import xyz.erupt.annotation.fun.DataProxy;
 import xyz.erupt.annotation.fun.OperationHandler;
+import xyz.erupt.annotation.sub_erupt.Drill;
+import xyz.erupt.annotation.sub_erupt.Link;
 import xyz.erupt.annotation.sub_erupt.Power;
 import xyz.erupt.annotation.sub_erupt.RowOperation;
 import xyz.erupt.annotation.sub_field.Edit;
@@ -27,7 +29,7 @@ import java.util.List;
 /** The conformance fixture (conformance/README.md), declared with the regular erupt annotations. */
 public final class Conformance {
 
-    @Erupt(name = "Category")
+    @Erupt(name = "Category", drills = @Drill(title = "Articles", link = @Link(linkErupt = Article.class, joinColumn = "category")))
     public static class Category {
         @EruptField
         Long id;

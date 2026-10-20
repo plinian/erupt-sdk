@@ -33,6 +33,8 @@ final class Node
     ];
 
     private static ?array $user = null;
+    /** the session token of the request being served */
+    private static ?string $token = null;
 
     /** @var list<string> */
     private readonly array $servers;
@@ -127,6 +129,7 @@ final class Node
             [$status, $payload] = [500, ['path' => $path, 'status' => 500, 'error' => 'erupt exception', 'message' => $e->getMessage()]];
         } finally {
             self::$user = null;
+            self::$token = null;
             $this->enforced = [];
         }
         return is_string($payload)
@@ -163,6 +166,7 @@ final class Node
             }
             $user = $headers['user'] ?? '';
             self::$user = $user === '' ? null : json_decode((string) base64_decode($user, true), true);
+            self::$token = $headers['token'] ?? null;
             [$model, $repo] = $this->models[$name];
             $args = array_map('rawurldecode', array_slice($m, 2));
             return [200, $this->$handler($model, $repo, new Request($headers, $body), ...$args)];
@@ -199,17 +203,20 @@ final class Node
     private function table(Model $model, Repository $repo, Request $request): array
     {
         $this->requirePower($model, $request, 'query');
-        return $this->page($model, $repo, $request->object());
+        return $this->page($model, $repo, $request->object(), $request);
     }
 
-    private function page(Model $model, Repository $repo, array $body): array
+    private function page(Model $model, Repository $repo, array $body, Request $request): array
     {
         $pageIndex = max((int) (($body['pageIndex'] ?? null) ?: 1), 1);
         $pageSize = min(max((int) (($body['pageSize'] ?? null) ?: 10), 1), self::MAX_PAGE_SIZE);
         $query = new Query([], [], ($pageIndex - 1) * $pageSize, $pageSize);
+        // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+        $trusted = in_array('query', $this->enforced, true);
         foreach ((array) ($body['condition'] ?? []) as $c) {
-            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : []));
+            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : [], $trusted));
         }
+        $drill = $this->drill($model, $request, $query);
         foreach ((array) ($body['sort'] ?? []) as $s) {
             $f = is_array($s) && is_string($s['field'] ?? null) ? ($model->fields[$s['field']] ?? null) : null;
             if ($f === null || !($f->decl->sortable || $f->isPk())) {
@@ -227,7 +234,7 @@ final class Node
         if (!$query->sort) {
             $query->sort = $sort ?: $model->orderBy;
         }
-        $query->filters = [...$filters, ...$model->filters($query->conditions)];
+        $query->filters = [...$drill, ...$filters, ...$model->filters($query->conditions)];
         [$total, $records] = $model->linkTree && $model->linkTree[1] && $picked === null ? [0, []] : $repo->page($query);
         $rows = $this->rows($model, $records);
         $model->hook('afterFetch', $rows);
@@ -236,12 +243,34 @@ final class Node
             'sort' => null, 'alert' => null, 'extraContent' => null];
     }
 
+    /**
+     * A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+     * joinColumn holds the source row's column; its linkCondition is returned as a filter.
+     *
+     * @return list<array{0: string, 1: list<mixed>}>
+     */
+    private function drill(Model $model, Request $request, Query $query): array
+    {
+        $code = $request->headers['drill'] ?? null;
+        if ($code === null) {
+            return [];
+        }
+        [$source, $repo] = $this->models[$request->headers['drillsourceerupt'] ?? ''] ?? [null, null];
+        $drill = $source?->drills[$code] ?? throw new Reply(403);
+        if ($drill['erupt'] !== $model->name || !isset($model->fields[$drill['join']])) {
+            throw new Fail("illegal erupt from drill '$code'");
+        }
+        $row = $repo->get(self::pk($source, $request->headers['drillvalue'] ?? null)) ?? throw new Fail('record not found');
+        $query->conditions[] = $this->condition($model->fields[$drill['join']], 'EQ', $row[$drill['column']] ?? null);
+        return $drill['condition'] === '' ? [] : [[$drill['condition'], []]];
+    }
+
     /** @return list<Cond> */
-    private function conditions(Model $model, array $c): array
+    private function conditions(Model $model, array $c, bool $trusted = false): array
     {
         $key = $c['key'] ?? null;
         $f = is_string($key) ? ($model->fields[$key] ?? null) : null;
-        if ($f === null || $f->isPk() || !$f->decl->search) {
+        if ($f === null || (!$trusted && ($f->isPk() || !$f->decl->search))) {
             throw new Fail("illegal search field '" . (is_scalar($key) ? $key : json_encode($key)) . "'");
         }
         $op = ($c['expression'] ?? null) ?: 'EQ';
@@ -518,6 +547,37 @@ final class Node
         }
         $this->powerCache[$key] = [microtime(true) + 5, $power];
         return $power;
+    }
+
+    // ---------------------------------------------------------------- server calls
+
+    /** The config text set for this node on the erupt server (Node Config). */
+    public function config(): string
+    {
+        return $this->serverText('/erupt-cloud-api/node-config/' . rawurlencode($this->name), ['Access-Token' => $this->accessToken]);
+    }
+
+    /** The config text of this node's group on the erupt server. */
+    public function groupConfig(): string
+    {
+        return $this->serverText('/erupt-cloud-api/node-group-config/' . rawurlencode($this->name), ['Access-Token' => $this->accessToken]);
+    }
+
+    /** The acting user's full info from the erupt server (roles, org, post...), for the request being served. */
+    public function userInfo(): ?array
+    {
+        $text = $this->serverText('/erupt-cloud-api/userinfo/' . rawurlencode($this->name), ['Access-Token' => $this->accessToken, 'token' => self::$token ?? '']);
+        $info = $text === '' ? null : json_decode($text, true, 512, JSON_THROW_ON_ERROR);
+        return is_array($info) ? $info : null;
+    }
+
+    private function serverText(string $path, array $headers): string
+    {
+        [$status, $body] = Http::request('GET', $this->server() . $path, $headers);
+        if ($status !== 200) {
+            throw new \RuntimeException("$path answered $status");
+        }
+        return $body;
     }
 
     // ---------------------------------------------------------------- registration

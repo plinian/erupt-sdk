@@ -40,6 +40,8 @@ final class Model
     public readonly array $vis;
     /** @var array{0: string, 1: bool}|null [field, dependNode] of a @LinkTree: the reference the tree beside the table filters */
     public readonly ?array $linkTree;
+    /** @var array<string, array{erupt: string, column: string, join: string, condition: string}> drill code -> its link, applied by the node */
+    public readonly array $drills;
     private readonly array $raw;
 
     /** The compiled model of an #[Erupt] class; cached, so declarations are checked once. */
@@ -81,6 +83,7 @@ final class Model
         }
         $this->proxies = $proxies;
         [$raw, $vis] = self::pullVis($decl->raw);
+        [$raw, $this->drills] = self::pullDrills($raw);
         Schema::check('Erupt', $raw, "#[Erupt] $this->name");
         $this->raw = $raw;
         $defaults = Schema::defaults()['power'];
@@ -150,7 +153,12 @@ final class Model
                 . implode(', ', array_column(EditType::cases(), 'value')));
         }
         Schema::check('View', $decl->view, "$path.view");
-        Schema::check('Edit', $decl->edit, "$path.edit");
+        // referenceTableType.dependColumn is @Transient in Java: kept out of the schema check, the build carries it
+        $edit = $decl->edit;
+        if (is_array($edit['referenceTableType'] ?? null)) {
+            unset($edit['referenceTableType']['dependColumn']);
+        }
+        Schema::check('Edit', $edit, "$path.edit");
         if ($decl->pk) {
             return new FieldSpec($name, $decl, null);
         }
@@ -234,6 +242,38 @@ final class Model
             $raw['vis'] = $entries;
         }
         return [$raw, $vis];
+    }
+
+    /**
+     * `link.column` / `link.joinColumn` of a drill: the source row's column (`id` by default) and the linked
+     * model's field holding it (its first path segment), applied by the node and kept out of the build, as Java
+     * keeps them `@Transient`. The rest is filled from the schema defaults; a drill without a `code` is
+     * addressed by its title.
+     */
+    private static function pullDrills(array $raw): array
+    {
+        $drills = $entries = [];
+        foreach (is_array($raw['drills'] ?? null) ? $raw['drills'] : [] as $entry) {
+            if (!is_array($entry) || !is_array($entry['link'] ?? [])) {
+                return [$raw, []]; // left to the schema check
+            }
+            $link = $entry['link'] ?? [];
+            $column = $link['column'] ?? 'id';
+            $join = $link['joinColumn'] ?? null;
+            if (!is_string($join) || $join === '' || !is_string($link['linkErupt'] ?? null) || $link['linkErupt'] === '' || !is_string($column)) {
+                throw new \InvalidArgumentException("drill '" . (is_string($entry['title'] ?? null) ? $entry['title'] : '') . "' needs link.linkErupt and link.joinColumn");
+            }
+            unset($link['column'], $link['joinColumn']);
+            $entry = array_merge(Schema::declaredDefaults('Drill'), ['code' => $entry['title'] ?? ''], $entry,
+                ['link' => array_merge(Schema::declaredDefaults('Link'), $link)]);
+            $drills[$entry['code']] = ['erupt' => $link['linkErupt'], 'column' => $column, 'join' => explode('.', $join)[0],
+                'condition' => is_string($link['linkCondition'] ?? null) ? $link['linkCondition'] : ''];
+            $entries[] = $entry;
+        }
+        if (is_array($raw['drills'] ?? null)) {
+            $raw['drills'] = $entries;
+        }
+        return [$raw, $drills];
     }
 
     /** Run one DataProxy hook on every proxy, in declaration order. */

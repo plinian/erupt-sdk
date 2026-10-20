@@ -685,3 +685,194 @@ fn field_types_and_invoke() {
     );
     assert!(row.get("calc").is_none());
 }
+
+fn author_and_book() -> (Arc<Model>, Arc<Model>) {
+    let author = Model::new("Author", "Author")
+        .raw(json!({"drills": [{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author.id"}}]}))
+        .field("id", Field::pk())
+        .field("name", Field::input("Name"))
+        .build()
+        .unwrap();
+    let category = Model::new("Category", "Category")
+        .field("id", Field::pk())
+        .field("name", Field::input("Name"))
+        .field("parent", Field::number("Parent"))
+        .build()
+        .unwrap();
+    let book = Model::new("Book", "Book")
+        .field("id", Field::pk())
+        .field("title", Field::input("Title"))
+        .field("author", Field::reference(&author, "Author"))
+        .field("colour", Field::of(EditType::Color, "Colour"))
+        .field("stars", Field::of(EditType::Rate, "Stars"))
+        .field("secret", Field::of(EditType::Hidden, "Secret"))
+        .field("readers", Field::transfer(&category, "Readers"))
+        .field(
+            "shelf",
+            Field::reference(&category, "Shelf").edit(
+                json!({"referenceTableType": {"dependField": "author", "dependColumn": "parent"}}),
+            ),
+        )
+        .build()
+        .unwrap();
+    (author, book)
+}
+
+fn records(rows: Value) -> Vec<Record> {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_object().cloned().unwrap())
+        .collect()
+}
+
+fn library() -> Node {
+    let (author, book) = author_and_book();
+    let mut n = node();
+    n.register(
+        &author,
+        MemoryRepository::seeded(records(json!([{"name": "Ann"}, {"name": "Bob"}]))),
+    )
+    .unwrap();
+    n.register(
+        &book,
+        MemoryRepository::seeded(records(json!([
+            {"title": "a", "author": 1}, {"title": "b", "author": 2}, {"title": "c", "author": 1}
+        ]))),
+    )
+    .unwrap();
+    n
+}
+
+#[test]
+fn drill() {
+    let n = library();
+    let drill = [
+        ("erupt", "Book"),
+        ("Drill", "Books"),
+        ("DrillSourceErupt", "Author"),
+        ("DrillValue", "1"),
+    ];
+    let table = |headers: &[(&str, &str)]| {
+        call(
+            &n,
+            "POST",
+            "/erupt-api/data/table/Book",
+            Some(json!({})),
+            headers,
+        )
+    };
+    let (_, page) = table(&drill);
+    let titles: Vec<&Value> = page["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| &r["title"])
+        .collect();
+    assert_eq!(vec![&json!("a"), &json!("c")], titles);
+    let mut undeclared = drill;
+    undeclared[1] = ("Drill", "x");
+    assert_eq!(403, table(&undeclared).0);
+
+    let (_, build) = call(
+        &n,
+        "GET",
+        "/erupt-api/build/Author",
+        None,
+        &[("erupt", "Author")],
+    );
+    let drills = &build["eruptModel"]["eruptJson"]["drills"];
+    assert_eq!(
+        json!([{"code": "Books", "fold": false, "icon": "fa fa-sitemap", "title": "Books",
+                "link": {"linkCondition": "", "linkErupt": "Book"}}]),
+        *drills
+    );
+}
+
+#[test]
+fn simple_types_and_depend_column() {
+    let n = library();
+    let call = |method: &str, path: &str, body: Option<Value>| {
+        call(&n, method, path, body, &[("erupt", "Book")])
+    };
+    let (_, build) = call("GET", "/erupt-api/build/Book", None);
+    let edit: Map<String, Value> = build["eruptModel"]["eruptFieldModels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["fieldName"].as_str().unwrap().to_string(),
+                f["eruptFieldJson"]["edit"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ["COLOR", "RATE", "HIDDEN", "TRANSFER"],
+        ["colour", "stars", "secret", "readers"].map(|n| edit[n]["type"].as_str().unwrap())
+    );
+    // the server reads it off the build
+    assert_eq!(
+        json!("parent"),
+        edit["shelf"]["referenceTableType"]["dependColumn"]
+    );
+    let (_, added) = call(
+        "POST",
+        "/erupt-api/data/modify/Book",
+        Some(json!({"title": "d", "stars": "4", "readers": [{"id": 2}]})),
+    );
+    assert_eq!(json!(true), added["success"]);
+    let (_, page) = call("POST", "/erupt-api/data/table/Book", Some(json!({})));
+    let row = page["list"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        (json!(4), json!([2])),
+        (row["stars"].clone(), row["readers"].clone())
+    );
+}
+
+#[test]
+fn node_config_and_user_info() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        erupt::http::serve_listener(
+            listener,
+            1,
+            Arc::new(move |req: &Request| {
+                log.lock().unwrap().push((
+                    req.path.clone(),
+                    req.get_header("access-token").unwrap_or("").to_string(),
+                ));
+                if req.path.contains("userinfo") {
+                    Response::text(200, r#"{"account": "admin", "roles": ["r"]}"#)
+                } else {
+                    Response::text(200, "cfg")
+                }
+            }),
+        )
+    });
+    let n = Node::new("blog", TOKEN, [server]);
+    assert_eq!("cfg", n.config().unwrap());
+    assert_eq!("cfg", n.group_config().unwrap());
+    assert_eq!(
+        Some(json!({"account": "admin", "roles": ["r"]})),
+        n.user_info().unwrap()
+    );
+    assert_eq!(
+        vec![
+            "/erupt-cloud-api/node-config/blog",
+            "/erupt-cloud-api/node-group-config/blog",
+            "/erupt-cloud-api/userinfo/blog"
+        ],
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|(path, token)| {
+                assert_eq!(TOKEN, token);
+                path.as_str()
+            })
+            .collect::<Vec<_>>()
+    );
+}

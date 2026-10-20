@@ -225,6 +225,68 @@ public class NodeTests
         Assert.Contains("belongs to CHOICE", Assert.Throws<ArgumentException>(() => EruptModel.Of<Order>().Fetch(o => o.Note, _ => [("a", "A")])).Message);
     }
 
+    private static EruptNode BookNode()
+    {
+        var node = Node();
+        node.Register(EruptModel.Of<Author>().Drill(new Drill { Title = "Books", Link = new Link { LinkErupt = "Book" } }, joinColumn: "author.id"),
+            new MemoryRepository(new Record { ["name"] = "Ann" }, new Record { ["name"] = "Bob" }));
+        node.Register(EruptModel.Of<Book>().Edit(b => b.Shelf, new Edit { ReferenceTableType = new ReferenceTableType { DependField = "author" } }),
+            new MemoryRepository(new Record { ["title"] = "a", ["author"] = 1 }, new Record { ["title"] = "b", ["author"] = 2 }, new Record { ["title"] = "c", ["author"] = 1 }));
+        return node;
+    }
+
+    [Fact]
+    public async Task Drill()
+    {
+        var node = BookNode();
+        void Drill(HttpRequest r, string code)
+        {
+            r.Headers["Drill"] = code;
+            r.Headers["DrillSourceErupt"] = "Author";
+            r.Headers["DrillValue"] = "1";
+        }
+        var (_, page) = await Call(node, "POST", "/erupt-api/data/table/Book", new { }, "Book", r => Drill(r, "Books"));
+        Assert.Equal(["a", "c"], page!["list"]!.AsArray().Select(r => r!["title"]!.GetValue<string>()));
+        Assert.Equal(403, (await Call(node, "POST", "/erupt-api/data/table/Book", new { }, "Book", r => Drill(r, "x"))).Status);
+        var (_, build) = await Call(node, "GET", "/erupt-api/build/Author", erupt: "Author");
+        var drill = build!["eruptModel"]!["eruptJson"]!["drills"]![0]!.AsObject();
+        Assert.Equal(("Books", "Books", "Book"), (drill["code"]!.GetValue<string>(), drill["title"]!.GetValue<string>(), drill["link"]!["linkErupt"]!.GetValue<string>()));
+        Assert.False(drill["link"]!.AsObject().ContainsKey("joinColumn"));
+    }
+
+    [Fact]
+    public async Task SimpleTypesAndDependColumn()
+    {
+        var node = BookNode();
+        var (_, build) = await Call(node, "GET", "/erupt-api/build/Book", erupt: "Book");
+        var edit = build!["eruptModel"]!["eruptFieldModels"]!.AsArray().ToDictionary(f => f!["fieldName"]!.GetValue<string>(), f => f!["eruptFieldJson"]!["edit"]!);
+        Assert.Equal(["COLOR", "RATE", "HIDDEN", "TRANSFER"], new[] { "colour", "stars", "secret", "readers" }.Select(n => edit[n]["type"]!.GetValue<string>()));
+        Assert.Equal("parent", edit["shelf"]["referenceTableType"]!["dependColumn"]!.GetValue<string>()); // the server reads it off the build
+        Assert.True((await Call(node, "POST", "/erupt-api/data/modify/Book", new { title = "d", stars = "4", readers = new[] { new { id = 2 } } }, "Book")).Body!["success"]!.GetValue<bool>());
+        var row = (await Call(node, "POST", "/erupt-api/data/table/Book", new { }, "Book")).Body!["list"]!.AsArray()[^1]!;
+        Assert.Equal((4, "[2]"), (row["stars"]!.GetValue<long>(), row["readers"]!.ToJsonString()));
+    }
+
+    [Fact]
+    public async Task NodeConfigAndUserInfo()
+    {
+        var node = Node();
+        var seen = new List<(string Path, string? Token)>();
+        node.Http = new HttpClient(new PowerServer(request =>
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            seen.Add((path, request.Headers.TryGetValues("token", out var token) ? token.Single() : null));
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(path.Contains("userinfo") ? """{"account":"admin","roles":["r"]}""" : "cfg"),
+            };
+        }));
+        Assert.Equal("cfg", await node.ConfigAsync());
+        Assert.Equal("cfg", await node.GroupConfigAsync());
+        Assert.Equal("""{"account":"admin","roles":["r"]}""", (await node.UserInfoAsync())!.ToJsonString());
+        Assert.Equal(["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog", "/erupt-cloud-api/userinfo/blog"], seen.Select(s => s.Path));
+    }
+
     [Fact]
     public async Task BeforeFetchNeedsSql()
     {

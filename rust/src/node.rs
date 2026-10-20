@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 
 use crate::http::{self, base64_decode, decode, encode, Request, Response};
 use crate::model::{json_value, Field, Model, OpContext};
-use crate::repo::{Cond, Query, Repository};
+use crate::repo::{Cond, Filter, Query, Repository};
 use crate::signature;
 use crate::types::{QueryExpression, RowOperationMode};
 use crate::values::{as_f64, text};
@@ -36,8 +36,14 @@ const POWER_TTL: Duration = Duration::from_secs(5);
 
 thread_local! {
     static USER: RefCell<Option<Value>> = const { RefCell::new(None) };
-    // the server checked the user's rights (a signed `Erupt-Enforced: power`) for the request on this thread
-    static POWER_ENFORCED: RefCell<bool> = const { RefCell::new(false) };
+    // the session token of the request on this thread
+    static TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
+    // what the server checked (a signed `Erupt-Enforced`, e.g. `power`, `query`) for the request on this thread
+    static ENFORCED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn enforced(what: &str) -> bool {
+    ENFORCED.with(|e| e.borrow().iter().any(|v| v == what))
 }
 
 /// The acting user of the request being served on this thread: `{"uid", "account", "name", "tenantId"}`.
@@ -178,7 +184,8 @@ impl Node {
     pub fn handle(&self, request: &Request) -> Response {
         let result = self.dispatch(request);
         USER.with(|u| *u.borrow_mut() = None);
-        POWER_ENFORCED.with(|p| *p.borrow_mut() = false);
+        TOKEN.with(|t| *t.borrow_mut() = None);
+        ENFORCED.with(|e| e.borrow_mut().clear());
         match result {
             Ok(Value::String(text)) => Response::text(200, &text),
             Ok(value) => Response::json(200, &value),
@@ -248,12 +255,13 @@ impl Node {
             .and_then(base64_decode)
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         USER.with(|u| *u.borrow_mut() = user);
+        TOKEN.with(|t| *t.borrow_mut() = req.get_header("token").map(str::to_string));
         let (model, repo) = (model.as_ref(), repo.as_ref());
         match route {
             Route::Build => Ok(model.build_model(&self.power(model, req), current_user().as_ref())),
             Route::Table => {
                 self.require(model, req, "query")?;
-                self.page(model, repo, &body_object(req)?)
+                self.page(model, repo, &body_object(req)?, req)
             }
             Route::InitValue => {
                 self.require(model, req, "add")?;
@@ -366,7 +374,13 @@ impl Node {
         }
     }
 
-    fn page(&self, model: &Model, repo: &dyn Repository, body: &Map<String, Value>) -> Out {
+    fn page(
+        &self,
+        model: &Model,
+        repo: &dyn Repository,
+        body: &Map<String, Value>,
+        req: &Request,
+    ) -> Out {
         let int = |key: &str| {
             body.get(key)
                 .and_then(as_f64)
@@ -375,6 +389,8 @@ impl Node {
         };
         let page_index = int("pageIndex").unwrap_or(1).max(1) as u64;
         let page_size = int("pageSize").unwrap_or(10).clamp(1, MAX_PAGE_SIZE as i64) as u64;
+        // under a signed `query` the server checked the browser's conditions and may add its own (a dependent picker)
+        let trusted = enforced("query");
         let mut query = Query {
             conditions: Vec::new(),
             sort: Vec::new(),
@@ -388,8 +404,9 @@ impl Node {
             .into_iter()
             .flatten()
         {
-            query.conditions.push(condition(model, c)?);
+            query.conditions.push(condition(model, c, trusted)?);
         }
+        let drill = self.drill(model, req, &mut query)?;
         for s in body
             .get("sort")
             .and_then(Value::as_array)
@@ -428,7 +445,8 @@ impl Node {
                 sort
             };
         }
-        query.filters = filters;
+        query.filters = drill;
+        query.filters.extend(filters);
         query.filters.extend(model.filters(&query.conditions)?);
         let (total, records) = match &model.link_tree {
             Some((_, true)) if picked.is_none() => (0, Vec::new()),
@@ -440,6 +458,44 @@ impl Node {
             "pageIndex": page_index, "pageSize": page_size, "total": total, "totalPage": total.div_ceil(page_size),
             "list": rows, "sort": null, "alert": null, "extraContent": null,
         }))
+    }
+
+    /// A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+    /// `joinColumn` holds the source row's `column`; its `linkCondition` is returned as a filter.
+    fn drill(
+        &self,
+        model: &Model,
+        req: &Request,
+        query: &mut Query,
+    ) -> std::result::Result<Vec<Filter>, Reply> {
+        let Some(code) = req.get_header("drill") else {
+            return Ok(Vec::new());
+        };
+        let source = req
+            .get_header("drillsourceerupt")
+            .and_then(|s| self.entry(s));
+        let Some((source, source_repo, link)) =
+            source.and_then(|(m, r)| Some((m, r, m.drills.get(code)?)))
+        else {
+            return Err(Reply::Status(403));
+        };
+        let Some(join) = model
+            .field(&link.join)
+            .filter(|_| link.erupt == model.name())
+        else {
+            return fail(format!("illegal erupt from drill '{code}'"));
+        };
+        let key = Value::String(req.get_header("drillvalue").unwrap_or("").to_string());
+        let row = source_repo
+            .get(&primary_key(source, &key)?)?
+            .ok_or(Reply::Fail("record not found".into()))?;
+        let value = json_value(row.get(&link.column));
+        query.conditions.push(field_condition(join, "EQ", value)?);
+        Ok(if link.condition.is_empty() {
+            Vec::new()
+        } else {
+            vec![link.condition.as_str().into()]
+        })
     }
 
     /// Records to browser rows. A reference stays its key: the server resolves its label, the flattened
@@ -550,8 +606,8 @@ impl Node {
         ) {
             return Err(Reply::Status(403));
         }
-        let power = enforced.is_some_and(|e| e.split(',').any(|v| v.trim() == "power"));
-        POWER_ENFORCED.with(|p| *p.borrow_mut() = power);
+        let checked = enforced.into_iter().flat_map(|e| e.split(','));
+        ENFORCED.with(|e| *e.borrow_mut() = checked.map(|v| v.trim().to_string()).collect());
         Ok(())
     }
 
@@ -566,7 +622,7 @@ impl Node {
     }
 
     fn power(&self, model: &Model, req: &Request) -> Map<String, Value> {
-        if POWER_ENFORCED.with(|p| *p.borrow()) {
+        if enforced("power") {
             // the server checked the user's rights and restricts the build's power itself: the model's own
             // declaration is all that is left to apply here
             let mut power = model.power.clone();
@@ -639,6 +695,45 @@ impl Node {
             Ok(Value::Object(power)) => Ok(power),
             _ => Err(Error::Other("erupt-power answered no object".into())),
         }
+    }
+
+    /// The config text set for this node on the erupt server (Node Config).
+    pub fn config(&self) -> Result<String> {
+        self.server_text("node-config", &[])
+    }
+
+    /// The config text of this node's group on the erupt server.
+    pub fn group_config(&self) -> Result<String> {
+        self.server_text("node-group-config", &[])
+    }
+
+    /// The acting user's full info from the erupt server (roles, org, post...), for the request being served
+    /// on this thread; None when the server answers nothing.
+    pub fn user_info(&self) -> Result<Option<Value>> {
+        let token = TOKEN.with(|t| t.borrow().clone()).unwrap_or_default();
+        let text = self.server_text("userinfo", &[("token", &token)])?;
+        if text.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| Error::Other(format!("userinfo answered no JSON: {e}")))
+    }
+
+    /// `GET /erupt-cloud-api/{api}/{nodeName}` with the access token, as text.
+    fn server_text(&self, api: &str, headers: &[(&str, &str)]) -> Result<String> {
+        let url = format!(
+            "{}/erupt-cloud-api/{api}/{}",
+            self.server(),
+            encode(&self.name)
+        );
+        let mut all = vec![("Access-Token", self.access_token.as_str())];
+        all.extend_from_slice(headers);
+        let (status, body) = http::fetch("GET", &url, &all, None, Duration::from_secs(5))?;
+        if status != 200 {
+            return Err(Error::Other(format!("{api} answered {status}")));
+        }
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
     fn node_info(&self) -> Value {
@@ -814,9 +909,11 @@ fn primary_key(model: &Model, value: &Value) -> std::result::Result<Value, Reply
         .map_err(|_| Reply::Fail(format!("illegal id '{}'", text(value))))
 }
 
-fn condition(model: &Model, c: &Value) -> std::result::Result<Cond, Reply> {
+/// A condition the browser sent; `trusted` (checked by the server) takes any stored field.
+fn condition(model: &Model, c: &Value, trusted: bool) -> std::result::Result<Cond, Reply> {
     let key = c.get("key").map(text).unwrap_or_default();
-    let Some(f) = model.field(&key).filter(|f| !f.is_pk() && f.search) else {
+    let allowed = |f: &&Field| !f.transient && (trusted || (!f.is_pk() && f.search));
+    let Some(f) = model.field(&key).filter(allowed) else {
         return fail(format!("illegal search field '{key}'"));
     };
     let name = c

@@ -133,7 +133,7 @@ export class MemoryRepository implements Repository {
 const SQL_OPS: Partial<Record<Operator, string>> = { EQ: "=", NEQ: "<>", GT: ">", GTE: ">=", LT: "<", LTE: "<=" };
 
 const SQLITE_TYPES: Record<string, string> = {
-  NUMBER: "NUMERIC", BOOLEAN: "INTEGER", DATE: "TEXT", DATE_TIME: "TEXT", REFERENCE_TABLE: "INTEGER", REFERENCE_TREE: "INTEGER",
+  NUMBER: "NUMERIC", RATE: "NUMERIC", SLIDER: "NUMERIC", BOOLEAN: "INTEGER", DATE: "TEXT", DATE_TIME: "TEXT", REFERENCE_TABLE: "INTEGER", REFERENCE_TREE: "INTEGER",
 };
 
 type Row = Record<string, unknown>;
@@ -329,7 +329,7 @@ export class SqlRepository implements Repository {
         record[f.name] = typeof value === "string" ? value === "1" || value === "true" : !!Number(value);
       } else if (f.type === "DATE" || f.type === "DATE_TIME") {
         record[f.name] = wallClock(value, f.type);
-      } else if (f.pk || f.type === "NUMBER" || f.type === "REFERENCE_TABLE" || f.type === "REFERENCE_TREE") {
+      } else if (f.pk || f.type === "NUMBER" || f.type === "RATE" || f.type === "SLIDER" || f.type === "REFERENCE_TABLE" || f.type === "REFERENCE_TREE") {
         record[f.name] = number(value);
       } else {
         record[f.name] = value;

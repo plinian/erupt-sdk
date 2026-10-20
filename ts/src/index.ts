@@ -1,6 +1,6 @@
 // Erupt node SDK: give any Node.js service an erupt admin UI through an erupt cloud server.
 export { field, Field, isObject, model, Model, operation, Operation } from "./model.js";
-export type { DataProxy, EruptRecord, FieldOptions, ModelOptions, ModelVis, OperationContext, OperationHandler, OperationOptions, Power, RefOptions, User } from "./model.js";
+export type { DataProxy, DrillLink, EruptRecord, FieldOptions, ModelDrill, ModelOptions, ModelVis, OperationContext, OperationHandler, OperationOptions, Power, RefOptions, User } from "./model.js";
 export { currentUser, Fail, Node, VERSION } from "./node.js";
 export type { NodeOptions } from "./node.js";
 export { sign as signRequest, verify as verifySignature } from "./signature.js";

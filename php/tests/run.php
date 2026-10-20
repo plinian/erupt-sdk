@@ -171,6 +171,26 @@ final class Order
     public static function refuse(array $form): array { throw new Fail('not now'); }
 }
 
+#[Erupt('Author', raw: ['drills' => [['title' => 'Books', 'link' => ['linkErupt' => 'Book', 'joinColumn' => 'author.id']]]])]
+final class Author
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Name')] public string $name;
+}
+
+#[Erupt('Book')]
+final class Book
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Title')] public string $title;
+    #[Field('Author')] public ?Author $author;
+    #[Field('Colour', type: 'COLOR')] public string $colour;
+    #[Field('Stars', type: 'RATE')] public int $stars;
+    #[Field('Secret', type: 'HIDDEN')] public string $secret;
+    #[Field('Readers', type: 'TRANSFER', ref: Tag::class)] public array $readers;
+    #[Field('Shelf', edit: ['referenceTableType' => ['dependField' => 'author', 'dependColumn' => 'parent']])] public ?Tag $shelf;
+}
+
 #[Erupt('Bad1')] final class BadEditKey { #[Field(pk: true)] public int $id; #[Field('T', edit: ['inputTyp' => ['length' => 9]])] public string $t; }
 #[Erupt('Bad2')] final class BadViewType { #[Field(pk: true)] public int $id; #[Field('T', view: ['sortable' => 'yes'])] public string $t; }
 #[Erupt('Bad3')] final class BadEditType { #[Field(pk: true)] public int $id; #[Field('T', type: 'INPUTT')] public string $t; }
@@ -189,6 +209,7 @@ final class Order
 #[Erupt('Bad15')] final class BadClick { #[Field(pk: true)] public int $id; #[Field('T', click: 'go')] public string $t; public static function go(): void {} }
 #[Erupt('Bad16')] final class BadFetch { #[Field(pk: true)] public int $id; #[Field('T', type: 'TAGS', fetch: 'missing')] public string $t; }
 #[Erupt('Bad17')] final class BadCheckbox { #[Field(pk: true)] public int $id; #[Field('T', type: 'CHECKBOX')] public array $t; }
+#[Erupt('Bad18', raw: ['drills' => [['title' => 'D', 'link' => ['linkErupt' => 'Tag']]]])] final class BadDrill { #[Field(pk: true)] public int $id; }
 
 // ---------------------------------------------------------------- runner
 
@@ -199,6 +220,19 @@ function eq(mixed $expected, mixed $actual, string $what = ''): void
     if ($expected !== $actual) {
         throw new \RuntimeException("$what: expected " . json_encode($expected) . ', got ' . json_encode($actual));
     }
+}
+/** tests/fake-server.php standing in for the erupt server: [process, port] */
+function fakeServer(): array
+{
+    $socket = stream_socket_server('tcp://127.0.0.1:0');
+    $port = (int) substr(strrchr(stream_socket_get_name($socket, false), ':'), 1);
+    fclose($socket);
+    $server = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", __DIR__ . '/fake-server.php'],
+        [['file', '/dev/null', 'r'], ['file', '/dev/null', 'w'], ['file', '/dev/null', 'w']], $pipes);
+    for ($i = 0; $i < 50 && !@fsockopen('127.0.0.1', $port, $errno, $error, 0.1); $i++) {
+        usleep(100000);
+    }
+    return [$server, $port];
 }
 function throws(string $pattern, callable $fn, string $what = ''): void
 {
@@ -235,6 +269,7 @@ $test('declarations are checked against the schema', function () {
         [BadClick::class, '/click belong to .* BUTTON/'],
         [BadFetch::class, '/fetch must name a static method of BadFetch/'],
         [BadCheckbox::class, '/CHECKBOX needs ref/'],
+        [BadDrill::class, "/drill 'D' needs link.linkErupt and link.joinColumn/"],
     ];
     foreach ($cases as [$class, $pattern]) {
         throws($pattern, fn() => Model::of($class), $class);
@@ -353,14 +388,7 @@ $test('signature agrees with the Java vectors', function () {
 });
 
 $test('handle() serves the protocol', function () {
-    $socket = stream_socket_server('tcp://127.0.0.1:0');
-    $port = (int) substr(strrchr(stream_socket_get_name($socket, false), ':'), 1);
-    fclose($socket);
-    $server = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", __DIR__ . '/fake-server.php'],
-        [['file', '/dev/null', 'r'], ['file', '/dev/null', 'w'], ['file', '/dev/null', 'w']], $pipes);
-    for ($i = 0; $i < 50 && !@fsockopen('127.0.0.1', $port, $errno, $error, 0.1); $i++) {
-        usleep(100000);
-    }
+    [$server, $port] = fakeServer();
     try {
         $node = (new Node('n', 'secret', "http://127.0.0.1:$port", 'http://127.0.0.1:1'))
             ->register(Tag::class, new MemoryRepository([['name' => 'Tech'], ['name' => 'Php', 'parent' => 1]]))
@@ -553,6 +581,64 @@ $test('field types and invoke', function () {
     $row = $call('POST', '/erupt-api/data/table/Order', [])[1]['list'][0];
     eq([[1, 2], [3], false], [$row['cats'], $row['sections'], array_key_exists('calc', $row)], 'row');
     eq([5], Model::of(Order::class)->fields['cats']->coerce('[5]'), 'a JSON string');
+});
+
+/** A signed call to $node for $erupt with Erupt-Enforced $enforced; $headers are added unsigned. */
+function signedCall(Node $node, string $erupt, string $method, string $target, mixed $body = null, string $enforced = 'power', array $headers = []): array
+{
+    $raw = $body === null ? '' : json_encode($body);
+    $ts = time();
+    $headers += ['erupt' => $erupt, 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => $enforced];
+    $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, $enforced, 'dXNlcg==', $raw);
+    $response = $node->handle($method, $target, $headers, $raw, [], $target);
+    return [$response->status, json_decode($response->body, true)];
+}
+
+$books = fn() => (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))
+    ->register(Tag::class, new MemoryRepository([['name' => 'Tech'], ['name' => 'Php', 'parent' => 1]]))
+    ->register(Author::class, new MemoryRepository([['name' => 'Ann'], ['name' => 'Bob']]))
+    ->register(Book::class, new MemoryRepository([['title' => 'a', 'author' => 1], ['title' => 'b', 'author' => 2], ['title' => 'c', 'author' => 1]]));
+
+$test('drills and trusted queries', function () use ($books) {
+    $node = $books();
+    $drill = ['Drill' => 'Books', 'DrillSourceErupt' => 'Author', 'DrillValue' => '1'];
+    $page = signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [], headers: $drill)[1];
+    eq(['a', 'c'], array_column($page['list'], 'title'), 'the drilled author\'s books');
+    eq(403, signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [], headers: ['Drill' => 'x'] + $drill)[0], 'an undeclared drill');
+    eq(false, signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [], headers: ['DrillValue' => '9'] + $drill)[1]['success'], 'a missing source row');
+    $erupt = signedCall($node, 'Author', 'GET', '/erupt-api/build/Author')[1]['eruptModel']['eruptJson'];
+    eq([['Books', 'Books', 'Book']], array_map(fn($d) => [$d['code'], $d['title'], $d['link']['linkErupt']], $erupt['drills']), 'drills in the build');
+    eq(false, isset($erupt['drills'][0]['link']['joinColumn']), 'joinColumn off the build');
+    Schema::check('Erupt', $erupt, 'Author', false);
+    // a condition the server added after checking the browser's: taken on a field the search bar does not have
+    $title = ['condition' => [['key' => 'title', 'expression' => 'EQ', 'value' => 'b']]];
+    eq(['b'], array_column(signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', $title, 'power,query')[1]['list'], 'title'), 'signed query');
+    eq(false, signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', $title)[1]['success'], 'not searchable without it');
+});
+
+$test('simple types and dependColumn', function () use ($books) {
+    $node = $books();
+    $fields = signedCall($node, 'Book', 'GET', '/erupt-api/build/Book')[1]['eruptModel']['eruptFieldModels'];
+    $edit = array_column(array_map(fn($f) => [$f['fieldName'], $f['eruptFieldJson']['edit']], $fields), 1, 0);
+    eq(['COLOR', 'RATE', 'HIDDEN', 'TRANSFER'], array_map(fn($n) => $edit[$n]['type'], ['colour', 'stars', 'secret', 'readers']), 'types');
+    eq('parent', $edit['shelf']['referenceTableType']['dependColumn'], 'the server reads it off the build');
+    eq([], array_column($fields, 'eruptFieldJson', 'fieldName')['secret']['views'], 'HIDDEN has no column');
+    eq(true, signedCall($node, 'Book', 'POST', '/erupt-api/data/modify/Book', ['title' => 'd', 'stars' => '4', 'readers' => [['id' => 2]]])[1]['success'], 'add');
+    $row = signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [])[1]['list'][3];
+    eq([4, [2]], [$row['stars'], $row['readers']], 'row');
+});
+
+$test('node config and user info', function () {
+    [$server, $port] = fakeServer();
+    try {
+        $node = new Node('n', 'secret', "http://127.0.0.1:$port", 'http://127.0.0.1:1');
+        eq('cfg', $node->config(), 'node config');
+        eq('group cfg', $node->groupConfig(), 'group config');
+        eq(['account' => 'admin', 'roles' => ['r']], $node->userInfo(), 'user info');
+    } finally {
+        proc_terminate($server);
+        proc_close($server);
+    }
 });
 
 $failed = 0;

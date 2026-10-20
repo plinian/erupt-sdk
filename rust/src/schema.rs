@@ -14,6 +14,16 @@ pub(crate) fn defaults() -> &'static Value {
     })
 }
 
+/// The declared defaults of an annotation, as Java fills an attribute left out.
+pub(crate) fn annotation_defaults(name: &str) -> serde_json::Map<String, Value> {
+    defs()[name]["properties"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.clone(), v.get("default")?.clone())))
+        .collect()
+}
+
 fn defs() -> &'static serde_json::Map<String, Value> {
     SCHEMA.get_or_init(|| {
         serde_json::from_str(include_str!("../erupt-annotations.schema.json"))

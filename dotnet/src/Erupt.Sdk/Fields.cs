@@ -16,7 +16,7 @@ internal sealed class FieldDef
     internal const string TemplateDateTime = "DATE_TIME"; // a template key, not an EditType: a DATE with a time of day
 
     // many records of another model, stored as the JSON list of their keys
-    private static readonly string[] Collections = ["CHECKBOX", "TAB_TREE"];
+    private static readonly string[] Collections = ["CHECKBOX", "TAB_TREE", "TRANSFER"];
 
     // the edit attribute that names a fetchHandler, by the type that fetches options
     private static readonly Dictionary<string, string> Fetched = new() { ["CHOICE"] = "choiceType", ["MULTI_CHOICE"] = "multiChoiceType", ["TAGS"] = "tagsType" };
@@ -46,6 +46,10 @@ internal sealed class FieldDef
     internal Type? Ref { get; init; }
     internal string Label { get; init; } = "name";
     internal string? Tree { get; init; }
+
+    /// <summary>referenceTableType.dependColumn, <c>@Transient</c> in Java: written into the build here.</summary>
+    internal string? DependColumn { get; init; }
+
     internal JsonObject EditRaw { get; } = [];
     internal JsonObject ViewRaw { get; } = [];
 
@@ -55,6 +59,8 @@ internal sealed class FieldDef
     internal bool IsReference => Type is "REFERENCE_TABLE" or "REFERENCE_TREE";
 
     internal bool IsCollection => Collections.Contains(Type);
+
+    internal bool IsNumber => Type is "NUMBER" or "RATE" or "SLIDER";
 
     /// <summary>Name and primary key of the referenced model, read from its declaration.</summary>
     internal (string Name, string Pk) Target
@@ -99,8 +105,9 @@ internal sealed class FieldDef
         {
             Model = model, Property = property, Name = name, Title = a.Title, Type = type,
             Search = a.Search, NotNull = a.NotNull, Sortable = a.Sortable, Table = a.Table, Form = a.Form, Virtual = isVirtual, IsJson = json || Collections.Contains(type),
-            Choices = choices.Count > 0 ? choices : null, Ref = reference, Label = a.Label, Tree = a.Tree,
+            Choices = choices.Count > 0 ? choices : null, Ref = reference, Label = a.Label, Tree = a.Tree, DependColumn = a.DependColumn,
         };
+        if (a.DependColumn is not null && type != "REFERENCE_TABLE") throw new ArgumentException($"{path}: DependColumn belongs to a REFERENCE_TABLE");
         if (reference is not null) field.CheckReference(path);
         else if (field.IsCollection) throw new ArgumentException($"{path}: a {type} needs Ref");
         return field;
@@ -141,6 +148,7 @@ internal sealed class FieldDef
             case "REFERENCE_TABLE":
                 tpl["fieldReturnName"] = Target.Name;
                 Json.Merge(edit["referenceTableType"]!.AsObject(), new JsonObject { ["id"] = Target.Pk, ["label"] = Label });
+                if (DependColumn is not null) edit["referenceTableType"]!["dependColumn"] = DependColumn;
                 view["column"] = Label;
                 break;
             case "REFERENCE_TREE":
@@ -148,7 +156,7 @@ internal sealed class FieldDef
                 Json.Merge(edit["referenceTreeType"]!.AsObject(), new JsonObject { ["id"] = Target.Pk, ["label"] = Label, ["pid"] = Tree });
                 view["column"] = Label;
                 break;
-            case "CHECKBOX" or "TAB_TREE": // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+            case "CHECKBOX" or "TAB_TREE" or "TRANSFER": // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
                 tpl["fieldReturnName"] = Target.Name;
                 view["column"] = Label;
                 break;
@@ -192,7 +200,7 @@ internal sealed class FieldDef
         {
             case "BOOLEAN":
                 return value is bool b ? b : Values.Str(value).ToLowerInvariant() is "true" or "1";
-            case "NUMBER":
+            case "NUMBER" or "RATE" or "SLIDER":
                 if (value is bool flag) return flag ? 1L : 0L;
                 if (!double.TryParse(Values.Str(value), NumberStyles.Float, CultureInfo.InvariantCulture, out var number) || !double.IsFinite(number))
                     throw new FormatException($"illegal number '{Values.Str(value)}'");

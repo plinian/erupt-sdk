@@ -5,7 +5,7 @@ const Category = model("Category", {
   id: field.pk(),
   name: field.input("Name", { search: true }),
   parent: field.number("Parent"),
-});
+}, { erupt: { drills: [{ title: "Articles", link: { linkErupt: "Article", joinColumn: "category" } }] } });
 
 const PublishForm = model("PublishForm", {
   note: field.input("Note", { notNull: true }),

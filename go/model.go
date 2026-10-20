@@ -70,13 +70,18 @@ type field struct {
 	ref, label, tree              string
 	target                        *Model
 	view, edit                    map[string]any
+	dependColumn                  string // edit.referenceTableType.dependColumn, @Transient in Java: written into the build
 	code                          FieldCode
 }
 
 func (f *field) isReference() bool { return f.typ == typeReferenceTable || f.typ == typeReferenceTree }
 
 // isCollection is a field holding many records of another model, stored as the JSON list of their keys.
-func (f *field) isCollection() bool { return f.typ == "CHECKBOX" || f.typ == "TAB_TREE" }
+func (f *field) isCollection() bool {
+	return f.typ == "CHECKBOX" || f.typ == "TAB_TREE" || f.typ == "TRANSFER"
+}
+
+func (f *field) isNumber() bool { return f.typ == "NUMBER" || f.typ == "RATE" || f.typ == "SLIDER" }
 
 // stored lists the fields a repository keeps, in declaration order: every field but the virtual ones.
 func (m *Model) stored() []*field {
@@ -101,10 +106,15 @@ type Model struct {
 	pk          string
 	orderBy     []Order
 	proxies     []DataProxy
-	vis         map[string]view // view code -> what the node applies to that view's table queries
-	linkTree    string          // the reference field a @LinkTree beside the table filters
-	dependNode  bool            // a @LinkTree table shows no rows until a tree node is picked
+	vis         map[string]view  // view code -> what the node applies to that view's table queries
+	linkTree    string           // the reference field a @LinkTree beside the table filters
+	dependNode  bool             // a @LinkTree table shows no rows until a tree node is picked
+	drills      map[string]drill // drill code -> its link, of which column and joinColumn stay on the node
 }
+
+// drill is a @Drill's link as the node applies it: the linked model's rows whose join field holds the source
+// row's column, plus condition (linkCondition) as written.
+type drill struct{ erupt, column, join, condition string }
 
 // view is a @Vis view's own filter and order, run on the node and kept out of the build.
 type view struct {
@@ -291,6 +301,9 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	if err != nil {
 		return nil, err
 	}
+	if m.drills, err = pullDrills(pulled, "@erupt "+m.name); err != nil {
+		return nil, err
+	}
 	raw, err := rawObject(pulled, "Erupt", "@erupt "+m.name)
 	if err != nil {
 		return nil, err
@@ -323,10 +336,14 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 		m.byName[f.name] = f
 	}
 	for name, edit := range cfg.edits {
-		if m.byName[name] == nil {
+		f := m.byName[name]
+		if f == nil {
 			return nil, fmt.Errorf("%s: WithFieldEdit names no field '%s'", m.name, name)
 		}
-		if m.byName[name].edit, err = rawObject(edit, "Edit", m.name+"."+name+".edit"); err != nil {
+		if v, err := toJSONValue(edit); err == nil {
+			edit, f.dependColumn = v, pullDependColumn(v)
+		}
+		if f.edit, err = rawObject(edit, "Edit", m.name+"."+name+".edit"); err != nil {
 			return nil, err
 		}
 	}
@@ -436,6 +453,49 @@ func pullVis(raw any, path string) (any, map[string]NodeVis, error) {
 	return v, views, nil
 }
 
+// pullDrills takes link.column (id by default) and link.joinColumn (required, its first path segment the field)
+// out of every raw drill entry before the schema check, and fills the Drill and Link defaults so the build
+// validates; a drill without a code is addressed by its title.
+func pullDrills(raw any, path string) (map[string]drill, error) {
+	obj, _ := raw.(map[string]any)
+	entries, _ := obj["drills"].([]any)
+	drills := map[string]drill{}
+	for i, e := range entries {
+		entry, ok := e.(map[string]any)
+		if !ok {
+			continue // the schema check reports it
+		}
+		link, _ := entry["link"].(map[string]any)
+		column, _ := link["column"].(string)
+		join, _ := link["joinColumn"].(string)
+		erupt, _ := link["linkErupt"].(string)
+		if join == "" || erupt == "" {
+			return nil, fmt.Errorf("%s.drills[%d]: needs link.linkErupt and link.joinColumn", path, i)
+		}
+		if column == "" {
+			column = "id"
+		}
+		delete(link, "column")
+		delete(link, "joinColumn")
+		if _, ok := entry["code"]; !ok {
+			entry["code"] = str(entry["title"])
+		}
+		entry["link"] = merge(schemaDefaults("Link"), link)
+		entries[i] = merge(schemaDefaults("Drill"), entry)
+		drills[str(entry["code"])] = drill{erupt, column, strings.Split(join, ".")[0], str(link["linkCondition"])}
+	}
+	return drills, nil
+}
+
+// pullDependColumn takes referenceTableType.dependColumn out of a raw edit before the schema check.
+func pullDependColumn(edit any) string {
+	obj, _ := edit.(map[string]any)
+	table, _ := obj["referenceTableType"].(map[string]any)
+	column, _ := table["dependColumn"].(string)
+	delete(table, "dependColumn")
+	return column
+}
+
 func parseField(model string, sf reflect.StructField, tag string, codes map[string]FieldCode) (*field, error) {
 	f := &field{name: sf.Name, table: true, form: true, label: "name"}
 	if j := strings.Split(sf.Tag.Get("json"), ",")[0]; j != "" && j != "-" {
@@ -519,7 +579,7 @@ func parseField(model string, sf reflect.StructField, tag string, codes map[stri
 }
 
 func resolveType(f *field, t reflect.Type) string {
-	if f.typ == "CHECKBOX" || f.typ == "TAB_TREE" {
+	if f.isCollection() {
 		return f.typ
 	}
 	if f.ref != "" {
@@ -661,7 +721,7 @@ func (f *field) build() map[string]any {
 		tpl["fieldReturnName"] = f.target.name
 		merge(edit["referenceTreeType"].(map[string]any), M{"id": f.target.pk, "label": f.label, "pid": f.tree})
 		view["column"] = f.label
-	case "CHECKBOX", "TAB_TREE":
+	case "CHECKBOX", "TAB_TREE", "TRANSFER":
 		// the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
 		tpl["fieldReturnName"] = f.target.name
 		view["column"] = f.label
@@ -673,6 +733,9 @@ func (f *field) build() map[string]any {
 		edit["onchange"] = "invoke"
 	}
 	merge(edit, f.edit)
+	if table, ok := edit["referenceTableType"].(map[string]any); ok && f.dependColumn != "" {
+		table["dependColumn"] = f.dependColumn
+	}
 	merge(view, f.view)
 	if !f.table {
 		efj["views"] = []any{}
@@ -762,7 +825,7 @@ func (f *field) coerce(v any) (any, error) {
 			return nil, fmt.Errorf("illegal integer '%s'", str(v))
 		}
 		return int64(n), nil
-	case f.typ == "NUMBER":
+	case f.isNumber():
 		var n float64
 		switch t := v.(type) {
 		case bool:

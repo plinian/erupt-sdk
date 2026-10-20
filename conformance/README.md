@@ -36,7 +36,8 @@ answers `reference-tree`, `build/{erupt}/{field}` and `drag-sort` itself, so a n
 Node name `conformance`. Every repository is in memory (PHP: a temporary SQLite file, since `php -S` keeps
 nothing between requests).
 
-**Category**: `id` pk; `name` Name (INPUT, search); `parent` Parent (NUMBER). Seeded in this order:
+**Category**: `id` pk; `name` Name (INPUT, search); `parent` Parent (NUMBER). One drill, title `Articles`, link
+`linkErupt` `Article`, `joinColumn` `category` (the Article rows of the category). Seeded in this order:
 `Tech` (parent null), `Python` (parent 1), `Life` (parent null), so ids 1, 2, 3.
 
 **PublishForm** (title "Publish Options", operation form only, not registered): `note` Note (INPUT, not null).

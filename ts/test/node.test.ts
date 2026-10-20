@@ -271,3 +271,74 @@ test("before fetch", async () => {
   // the memory repository cannot run SQL: it refuses rather than shows every row
   assert.equal((await (await serve(new MemoryRepository()))("/erupt-api/data/table/Task", {}))[0], 500);
 });
+
+const serveAuthorBook = async () => {
+  const erupt = createServer((_req, res) => res.end(JSON.stringify({ add: true, edit: true, delete: true, viewDetails: true })));
+  servers.push(erupt);
+  const node = new Node("blog", "secret", await listen(erupt));
+  const category = model("Category", { id: field.pk(), name: field.input("Name"), parent: field.number("Parent") });
+  const author = model("Author", { id: field.pk(), name: field.input("Name") }, {
+    erupt: { drills: [{ title: "Books", link: { linkErupt: "Book", joinColumn: "author.id" } }] },
+  });
+  node.register(category, new MemoryRepository());
+  node.register(author, new MemoryRepository([{ name: "Ann" }, { name: "Bob" }]));
+  node.register(model("Book", {
+    id: field.pk(),
+    title: field.input("Title"),
+    author: field.ref(author, "Author"),
+    colour: field.of("COLOR", "Colour"),
+    stars: field.of("RATE", "Stars"),
+    secret: field.of("HIDDEN", "Secret"),
+    readers: field.transfer(category, "Readers"),
+    shelf: field.ref(category, "Shelf", { edit: { referenceTableType: { dependField: "author", dependColumn: "parent" } } }),
+  }), new MemoryRepository([{ title: "a", author: 1 }, { title: "b", author: 2 }, { title: "c", author: 1 }]));
+  const app = createServer(node.listener);
+  servers.push(app);
+  const base = await listen(app);
+  const call = async (erupt: string, path: string, body?: unknown, headers: Record<string, string> = {}) => {
+    const res = await fetch(base + path, {
+      method: body === undefined ? "GET" : "POST", body: body === undefined ? undefined : JSON.stringify(body),
+      headers: { "access-token": "secret", erupt, token: "t", ...headers },
+    });
+    return [res.status, (await res.json().catch(() => null)) as any] as const;
+  };
+  return [node, call] as const;
+};
+
+test("drill", async () => {
+  const [, call] = await serveAuthorBook();
+  const drill = { drill: "Books", drillsourceerupt: "Author", drillvalue: "1" };
+  const [, page] = await call("Book", "/erupt-api/data/table/Book", {}, drill);
+  assert.deepEqual(page.list.map((r: any) => r.title), ["a", "c"]);
+  assert.equal((await call("Book", "/erupt-api/data/table/Book", {}, { ...drill, drill: "x" }))[0], 403);
+  const [, build] = await call("Author", "/erupt-api/build/Author");
+  const drills = build.eruptModel.eruptJson.drills;
+  assert.deepEqual(drills.map((d: any) => [d.code, d.title, d.link.linkErupt]), [["Books", "Books", "Book"]]);
+  assert.ok(!("joinColumn" in drills[0].link));
+});
+
+test("simple types and dependColumn", async () => {
+  const [, call] = await serveAuthorBook();
+  const [, build] = await call("Book", "/erupt-api/build/Book");
+  const edit = Object.fromEntries(build.eruptModel.eruptFieldModels.map((f: any) => [f.fieldName, f.eruptFieldJson.edit]));
+  assert.deepEqual(["colour", "stars", "secret", "readers"].map((n) => edit[n].type), ["COLOR", "RATE", "HIDDEN", "TRANSFER"]);
+  assert.equal(edit.shelf.referenceTableType.dependColumn, "parent", "the server reads it off the build");
+  assert.equal((await call("Book", "/erupt-api/data/modify/Book", { title: "d", stars: "4", readers: [{ id: 2 }] }))[1].success, true);
+  const [, page] = await call("Book", "/erupt-api/data/table/Book", {});
+  const row = page.list.at(-1);
+  assert.deepEqual([row.stars, row.readers], [4, [2]]);
+});
+
+test("node config and user info", async () => {
+  const [node] = await serveAuthorBook();
+  const seen: [string, string | undefined][] = [];
+  (node as any).serverText = async (path: string, headers: Record<string, string>) => {
+    seen.push([path, headers.token]);
+    return path.includes("userinfo") ? '{"account": "admin", "roles": ["r"]}' : "cfg";
+  };
+  assert.equal(await node.config(), "cfg");
+  assert.equal(await node.groupConfig(), "cfg");
+  assert.deepEqual(await node.userInfo(), { account: "admin", roles: ["r"] });
+  assert.deepEqual(seen.map(([p]) => p), ["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog",
+    "/erupt-cloud-api/userinfo/blog"]);
+});

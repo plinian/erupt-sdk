@@ -10,7 +10,7 @@ var node = new EruptNode(new NodeOptions
     Address = $"http://127.0.0.1:{port}",
 });
 
-node.Register<Category>(new MemoryRepository(
+node.Register(EruptModel.Of<Category>().Drill(new Drill { Title = "Articles", Link = new Link { LinkErupt = "Article" } }, joinColumn: "category"), new MemoryRepository(
     new Record { ["name"] = "Tech", ["parent"] = null },
     new Record { ["name"] = "Python", ["parent"] = 1 },
     new Record { ["name"] = "Life", ["parent"] = null }));

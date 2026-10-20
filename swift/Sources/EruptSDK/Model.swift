@@ -55,6 +55,9 @@ public struct FormChange {
 /// A field can run its own code, called by the erupt server through the node's invoke endpoint with the form's
 /// values: `fetch` (CHOICE / MULTI_CHOICE / TAGS options), `onchange` (any field), `complete` (AUTO_COMPLETE, with
 /// the typed text) and `click` (BUTTON). Throw an `EruptFailure` to refuse with a message.
+///
+/// `dependColumn` (a reference table whose `referenceTableType.dependField` names another field) is the referenced
+/// model's column the server matches to that field's value: `@Transient` in Java, so not in `ReferenceTableType`.
 public struct Field {
     public let name: String
     public let title: String
@@ -64,6 +67,7 @@ public struct Field {
     let choices: [(value: String, label: String)]?
     let view: View?
     let edit: Edit?
+    let dependColumn: String?
     let fetch: FieldFetch?
     let onchange: ((Record) throws -> FormChange)?
     let complete: ((Record, String) throws -> [String])?
@@ -74,7 +78,8 @@ public struct Field {
     public init(
         _ name: String, _ title: String = "", _ kind: FieldKind = .string, type: EditType? = nil, pk: Bool = false,
         search: Bool = false, notNull: Bool = false, sortable: Bool = false, table: Bool = true, form: Bool = true,
-        choices: KeyValuePairs<String, String>? = nil, view: View? = nil, edit: Edit? = nil, virtual: Bool = false,
+        choices: KeyValuePairs<String, String>? = nil, view: View? = nil, edit: Edit? = nil, dependColumn: String? = nil,
+        virtual: Bool = false,
         fetch: FieldFetch? = nil, onchange: ((Record) throws -> FormChange)? = nil,
         complete: ((Record, String) throws -> [String])? = nil, click: ((Record) throws -> FormChange)? = nil
     ) {
@@ -91,6 +96,7 @@ public struct Field {
         self.choices = choices.map { $0.map { (value: $0.key, label: $0.value) } }
         self.view = view
         self.edit = edit
+        self.dependColumn = dependColumn
         self.virtual = virtual || type == .button
         self.fetch = fetch
         self.onchange = onchange
@@ -98,8 +104,8 @@ public struct Field {
         self.click = click
     }
 
-    /// CHECKBOX / TAB_TREE: many records of another model, stored as the JSON list of their keys
-    static let collections = [EditType.checkbox.rawValue, EditType.tabTree.rawValue]
+    /// CHECKBOX / TAB_TREE / TRANSFER: many records of another model, stored as the JSON list of their keys
+    static let collections = [EditType.checkbox.rawValue, EditType.tabTree.rawValue, EditType.transfer.rawValue]
     /// the edit attribute that names a fetchHandler, by the type that fetches options
     static let fetched = [EditType.choice.rawValue: "choiceType", EditType.multiChoice.rawValue: "multiChoiceType", EditType.tags.rawValue: "tagsType"]
 
@@ -158,6 +164,9 @@ public struct Field {
         if !fetchFits || (complete != nil && type != EditType.autoComplete.rawValue) || (click != nil && type != EditType.button.rawValue) {
             throw DeclarationError("\(path): fetch, complete and click belong to CHOICE / MULTI_CHOICE / TAGS, AUTO_COMPLETE and BUTTON")
         }
+        if dependColumn != nil, type != EditType.referenceTable.rawValue {
+            throw DeclarationError("\(path): dependColumn belongs to a REFERENCE_TABLE")
+        }
         if let (target, label, pid) = reference {
             guard target.pk != nil else { throw DeclarationError("\(path): \(target.name) has no primary key") }
             for key in [label, pid].compactMap({ $0 }) where target.fields[key] == nil {
@@ -197,6 +206,7 @@ public struct Field {
         if fetch != nil, let attr = Field.fetched[type] { edit[attr]!["fetchHandler"] = ["invoke"] }
         if onchange != nil { edit["onchange"] = "invoke" }
         if let override = self.edit { merge(&edit, override.json) }
+        if let dependColumn { edit["referenceTableType"]!["dependColumn"] = .string(dependColumn) }
         if let override = self.view { merge(&view, override.json) }
         tpl["eruptFieldJson"]!["edit"] = edit
         tpl["eruptFieldJson"]!["views"] = table && columns ? [view] : []
@@ -254,7 +264,7 @@ public struct Field {
         case EditType.boolean.rawValue:
             if case .bool = value { return value }
             return .bool(["true", "1"].contains(value.text.lowercased()))
-        case EditType.number.rawValue: return try Values.number(value)
+        case EditType.number.rawValue, EditType.rate.rawValue, EditType.slider.rawValue: return try Values.number(value)
         case dateTimeType: return .string(try Values.dateTime(value))
         case EditType.date.rawValue: return .string(try Values.date(value))
         case EditType.choice.rawValue:
@@ -427,6 +437,19 @@ public struct VisQuery {
     public init(filter: String, orderBy: String? = nil) { self.init(filter: [filter], orderBy: orderBy) }
 }
 
+/// What the node applies when a table is drilled into from a row of this model, given as `Model(..., drillJoin:)`
+/// under the drill's code: the linked model's rows whose `joinColumn` (a field, `"author"` or `"author.id"`) holds
+/// the row's `column`. Java keeps both `@Transient`: they are not in `Link` and never in the build.
+public struct DrillJoin {
+    let column: String
+    let joinColumn: String
+
+    public init(column: String = "id", joinColumn: String) {
+        self.column = column
+        self.joinColumn = joinColumn
+    }
+}
+
 /// One element of a model declaration.
 public enum ModelPart {
     case field(Field)
@@ -482,15 +505,19 @@ public final class Model {
     let vis: [String: (filters: [SQLFilter], order: [(field: String, descending: Bool)])]
     /// (field, dependNode) of a @LinkTree: the reference the tree beside the table filters
     let linkTree: (field: String, dependNode: Bool)?
+    /// drill code -> the linked model, the source row's column, the linked field holding it and the linkCondition
+    let drills: [String: (erupt: String, column: String, join: String, condition: String)]
 
     /// `name` is what the server addresses; `power` switches features off (`["delete": false]`); `orderBy` is
     /// the default table order (`"views desc, id"`); `erupt` carries other `@Erupt` attributes
     /// (`Erupt(layout: Layout(pageSize: 30))`); `dataProxy` runs around every read and write of the model, in
-    /// order; `visQuery` gives a `@Vis` view (by its code, or its title when it has none) a filter and an order.
+    /// order; `visQuery` gives a `@Vis` view (by its code, or its title when it has none) a filter and an order;
+    /// `drillJoin` gives every drill (by its code, or its title when it has none) the columns it joins on.
     /// An unknown attribute or value fails here, not in the browser.
     public init(
         _ name: String, title: String? = nil, power: [String: Bool] = [:], orderBy: String? = nil, erupt: Erupt? = nil,
-        dataProxy: [DataProxy] = [], visQuery: [String: VisQuery] = [:], @ModelBuilder _ body: () -> [ModelPart]
+        dataProxy: [DataProxy] = [], visQuery: [String: VisQuery] = [:], drillJoin: [String: DrillJoin] = [:],
+        @ModelBuilder _ body: () -> [ModelPart]
     ) throws {
         guard isIdentifier(name) else { throw DeclarationError("erupt name '\(name)' must be an identifier") }
         self.name = name
@@ -509,6 +536,24 @@ public final class Model {
             return v
         }
         erupt?.vis = views
+        // a drill without a code is addressed by its title
+        let drillList = erupt?.drills?.map { d in
+            var d = d
+            if d.code == nil { d.code = d.title ?? "" }
+            return d
+        }
+        erupt?.drills = drillList
+        var drills: [String: (erupt: String, column: String, join: String, condition: String)] = [:]
+        for d in drillList ?? [] {
+            guard let target = d.link?.linkErupt, let join = drillJoin[d.code!] else {
+                throw DeclarationError("erupt \(name): drill '\(d.code!)' needs link.linkErupt and a drillJoin")
+            }
+            drills[d.code!] = (target, join.column, String(join.joinColumn.split(separator: ".").first ?? ""), d.link?.linkCondition ?? "")
+        }
+        if let code = drillJoin.keys.sorted().first(where: { drills[$0] == nil }) {
+            throw DeclarationError("erupt \(name): drillJoin '\(code)' is not a declared drill")
+        }
+        self.drills = drills
         self.raw = erupt
         self.proxies = dataProxy
         if let erupt { try Schema.check("Erupt", erupt.json, path: "erupt \(name)") }
@@ -591,6 +636,16 @@ public final class Model {
         erupt["primaryKeyCol"] = .string(pk ?? "id")
         erupt["rowOperation"] = .array(actions.map { $0.build() })
         if let raw { merge(&erupt, raw.json) }
+        // a drill as Java emits it: every attribute left out at its default
+        if let drills = raw?.drills {
+            erupt["drills"] = .array(drills.map { d in
+                var o = JSON.object(Schema.defaults("Drill"))
+                merge(&o, d.json)
+                o["link"] = .object(Schema.defaults("Link"))
+                merge(&o["link"]!, d.link!.json)
+                return o
+            })
+        }
         var condition: [String: JSON] = [:]
         hook { $0.searchCondition(&condition) }
         return [

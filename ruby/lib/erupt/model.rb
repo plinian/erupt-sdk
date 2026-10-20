@@ -17,7 +17,7 @@ module Erupt
   DATE_TIME = "DATE_TIME"
   REFERENCES = [EditType::REFERENCE_TABLE, EditType::REFERENCE_TREE].freeze
   # many records of another model, stored as the JSON list of their keys
-  COLLECTIONS = [EditType::CHECKBOX, EditType::TAB_TREE].freeze
+  COLLECTIONS = [EditType::CHECKBOX, EditType::TAB_TREE, EditType::TRANSFER].freeze
   # the edit attribute that names a fetchHandler, by the type that fetches options
   FETCHED = { EditType::CHOICE => "choiceType", EditType::MULTI_CHOICE => "multiChoiceType", EditType::TAGS => "tagsType" }.freeze
   TIME_PATTERN = /\A(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?)?Z?\z/
@@ -112,6 +112,8 @@ module Erupt
       @ref = ref || (kind if kind.respond_to?(:erupt_model))
       @label, @tree = label.to_s, tree&.to_s
       @view, @edit = Erupt.stringify(view), Erupt.stringify(edit)
+      # referenceTableType.dependColumn is @Transient in Java: kept out of the schema check, written into the build
+      @depend_column = @edit["referenceTableType"].delete("dependColumn") if @edit["referenceTableType"].is_a?(Hash)
       path = "field #{@name}"
       raise ArgumentError, "#{path}: name must be an identifier" unless IDENTIFIER.match?(@name)
 
@@ -165,6 +167,7 @@ module Erupt
       edit[FETCHED[@type]]["fetchHandler"] = ["invoke"] if @fetch
       edit["onchange"] = "invoke" if @onchange
       Erupt.merge!(edit, @edit)
+      edit["referenceTableType"]["dependColumn"] = @depend_column if @depend_column
       Erupt.merge!(view, @view)
       tpl["eruptFieldJson"]["views"] = [] unless table?
       if @choices # CHOICE, or MULTI_CHOICE over an Array
@@ -195,7 +198,7 @@ module Erupt
 
       case @type
       when EditType::BOOLEAN then [true, false].include?(value) ? value : %w[true 1].include?(value.to_s.downcase)
-      when EditType::NUMBER then Erupt.number(value)
+      when EditType::NUMBER, EditType::RATE, EditType::SLIDER then Erupt.number(value)
       when DATE_TIME then Erupt.parse_time(value)
       when EditType::DATE then Erupt.parse_time(value).to_date
       when EditType::CHOICE
@@ -279,6 +282,10 @@ module Erupt
     end
   end
 
+  # A drill: +erupt+ the linked model, +column+ the source row's column, +join+ the linked model's field holding
+  # it, +condition+ the linkCondition (SQL as written).
+  Drill = Struct.new(:erupt, :column, :join, :condition)
+
   # A business error shown to the user as a message: raise it from a DataProxy hook or an operation.
   class Fail < StandardError; end
 
@@ -311,11 +318,13 @@ module Erupt
   class ModelSpec
     # fields: stored and served; declared: all of them in order, virtual ones included, for the build
     attr_reader :cls, :name, :title, :power, :fields, :declared, :operations, :proxies
+    # drill code -> Drill, whose column and joinColumn stay here (@Transient in Java)
+    attr_reader :drills
 
     def initialize(cls)
       @cls, @name = cls, cls.name&.split("::")&.last
       @title, @power, @raw, @order_by, @views = @name, DEFAULTS["power"].dup, {}, nil, {}
-      @fields, @declared, @operations, @proxies = {}, [], {}, []
+      @fields, @declared, @operations, @proxies, @drills = {}, [], {}, [], {}
     end
 
     def configure(title, name, power, order_by, data_proxy, raw)
@@ -324,6 +333,7 @@ module Erupt
       raise ArgumentError, "#{@name}: data_proxy must be a DataProxy" unless @proxies.all?(DataProxy)
       @power = DEFAULTS["power"].merge(Erupt.stringify(power || {}))
       @raw, @views = pull_vis(Erupt.stringify(raw))
+      @raw, @drills = pull_drills(@raw)
       Schema.check("Erupt", @raw, "erupt #{@name}")
       raise ArgumentError, "erupt name '#{@name}' must be an identifier" unless IDENTIFIER.match?(@name)
     end
@@ -423,6 +433,28 @@ module Erupt
         entry
       end
       [raw.merge("vis" => entries), views]
+    end
+
+    # +link.column+ / +link.joinColumn+ of a drill: the source row's column (+id+ by default) and the linked
+    # model's field holding it, applied by the node and kept out of the build. A drill without a +code+ is
+    # addressed by its title.
+    def pull_drills(raw)
+      return [raw, {}] unless raw["drills"].is_a?(Array)
+
+      drills = {}
+      entries = raw["drills"].map do |entry|
+        next entry unless entry.is_a?(Hash)
+
+        link = entry["link"].is_a?(Hash) ? entry["link"].dup : {}
+        column, join = link.delete("column") || "id", link.delete("joinColumn")
+        raise ArgumentError, "#{@name}: drill '#{entry["title"]}' needs link.linkErupt and link.joinColumn" unless join && link["linkErupt"]
+
+        entry = Schema.defaults("Drill").merge("code" => entry["title"].to_s).merge(entry)
+        entry["link"] = Schema.defaults("Link").merge(link)
+        drills[entry["code"]] = Drill.new(link["linkErupt"], column, join.to_s.split(".").first, link["linkCondition"].to_s)
+        entry
+      end
+      [raw.merge("drills" => entries), drills]
     end
   end
 

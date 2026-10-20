@@ -232,6 +232,25 @@ final class Order
 `fetch` belongs to `CHOICE` / `MULTI_CHOICE` (`value => label`) and `TAGS` (a list), `complete` to
 `AUTO_COMPLETE`, `click` to `BUTTON`; `onchange` to any field. Throw `Fail` to refuse with a message.
 
+Also: `COLOR`, `ICON`, `SIGNATURE`, `MAP`, `HIDDEN` (text), `RATE`, `SLIDER` (numbers) and `TRANSFER` (like
+`CHECKBOX`). A reference table depending on another field takes
+`edit: ['referenceTableType' => ['dependField' => 'province', 'dependColumn' => 'province']]`: the erupt server
+keeps the picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```php
+#[Erupt('Author', raw: ['drills' => [['title' => 'Books', 'link' => ['linkErupt' => 'Book', 'joinColumn' => 'author']]]])]
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written (a SQL repository then). Both models must be on the node.
+
+## Server config and user info
+
+`$node->config()` and `$node->groupConfig()` return the config text set for the node and its group on the erupt
+server; `$node->userInfo()` the acting user's full info (roles, org, post), while a request is served.
+
 ## Without a registry
 
 Without Packagist, point Composer at the read-only split repository:

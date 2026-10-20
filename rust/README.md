@@ -164,6 +164,26 @@ let order = Model::new("Order", "Order")
 `AUTO_COMPLETE`, `click` to `BUTTON`, `onchange` to any field; another type fails at `build()`. Return
 `Err(Error::fail(msg))` to refuse with a message.
 
+Also: `Color`, `Icon`, `Signature`, `Map`, `Hidden` (text), `Rate`, `Slider` (numbers), and `Field::transfer`
+(like `Field::checkbox`). A reference table depending on another field takes
+`.edit(json!({"referenceTableType": {"dependField": "province", "dependColumn": "province"}}))`: the erupt server
+keeps the picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```rust
+Model::new("Author", "Author")
+    .raw(json!({"drills": [{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author"}}]}))
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.config()` and `node.group_config()` return the config text set for the node and its group on the erupt
+server; `node.user_info()` the acting user's full info (roles, org, post), on the thread serving a request.
+
 ## Storage
 
 `Repository` (`bind`, `page`, `get`, `add`, `update`, `delete`) puts a model on anything; without a sort it

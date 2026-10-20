@@ -144,6 +144,26 @@ module NodeFixture
     field :calc, "Calc", type: Erupt::EditType::BUTTON, click: ->(_form) { { eval: "alert(1)", formData: { qty: 2 } } }
     field :stop, "Stop", type: Erupt::EditType::BUTTON, click: ->(_form) { raise Erupt::Fail, "not now" }
   end
+
+  class Author
+    extend Erupt::Model
+    erupt "Author", drills: [{ title: "Books", link: { linkErupt: "Book", joinColumn: "author.id" } }]
+    field :id, pk: true
+    field :name, "Name"
+  end
+
+  class Book
+    extend Erupt::Model
+    erupt "Book"
+    field :id, pk: true
+    field :title, "Title"
+    field :author, "Author", Author
+    field :colour, "Colour", type: Erupt::EditType::COLOR
+    field :stars, "Stars", Integer, type: Erupt::EditType::RATE
+    field :secret, "Secret", type: Erupt::EditType::HIDDEN
+    field :readers, "Readers", Array, type: Erupt::EditType::TRANSFER, ref: Category
+    field :shelf, "Shelf", Category, edit: { referenceTableType: { dependField: "author", dependColumn: "parent" } }
+  end
 end
 
 class NodeTest < Minitest::Test
@@ -171,6 +191,8 @@ class NodeTest < Minitest::Test
     @node.register(Memo, Erupt::MemoryRepository.new)
     @node.register(Doc, Erupt::MemoryRepository.new([{ title: "a", topic: 1 }, { title: "b", topic: 2 }, { title: "c", topic: 3 }]))
     @node.register(Order, Erupt::MemoryRepository.new)
+    @node.register(Author, Erupt::MemoryRepository.new([{ name: "Ann" }, { name: "Bob" }]))
+    @node.register(Book, Erupt::MemoryRepository.new([{ title: "a", author: 1 }, { title: "b", author: 2 }, { title: "c", author: 1 }]))
     CALLS.clear
     MemoProxy::CALLS.clear
   end
@@ -257,7 +279,7 @@ class NodeTest < Minitest::Test
   end
 
   def test_build_matches_schema
-    %w[Article Note Category].each do |name|
+    %w[Article Note Category Author].each do |name|
       _, build = call("GET", "/erupt-api/build/#{name}", erupt: name, account: "root")
       [build["eruptModel"], *(build["operationErupts"] || {}).values].each do |m|
         Erupt::Schema.check("Erupt", m["eruptJson"], m["eruptName"], partial: false)
@@ -391,6 +413,56 @@ class NodeTest < Minitest::Test
     row = call("POST", "/erupt-api/data/table/Order", {}, erupt: "Order")[1]["list"][0]
     assert_equal [[1, 2], [3]], row.values_at("cats", "sections")
     refute row.key?("calc")
+  end
+
+  def test_drill
+    drill = { "HTTP_DRILL" => "Books", "HTTP_DRILLSOURCEERUPT" => "Author", "HTTP_DRILLVALUE" => "1" }
+    _, page = call("POST", "/erupt-api/data/table/Book", {}, erupt: "Book", headers: drill)
+    assert_equal %w[a c], page["list"].map { |r| r["title"] }
+    assert_equal 403, call("POST", "/erupt-api/data/table/Book", {}, erupt: "Book", headers: drill.merge("HTTP_DRILL" => "x")).first
+    _, build = call("GET", "/erupt-api/build/Author", erupt: "Author")
+    drills = build["eruptModel"]["eruptJson"]["drills"]
+    assert_equal [%w[Books Books Book]], drills.map { |d| [d["code"], d["title"], d["link"]["linkErupt"]] }
+    refute drills.first["link"].key?("joinColumn")
+  end
+
+  def test_simple_types_and_depend_column
+    _, build = call("GET", "/erupt-api/build/Book", erupt: "Book")
+    edit = build["eruptModel"]["eruptFieldModels"].to_h { |f| [f["fieldName"], f["eruptFieldJson"]["edit"]] }
+    assert_equal %w[COLOR RATE HIDDEN TRANSFER], edit.values_at("colour", "stars", "secret", "readers").map { |e| e["type"] }
+    assert_equal "parent", edit["shelf"]["referenceTableType"]["dependColumn"], "the server reads it off the build"
+    assert call("POST", "/erupt-api/data/modify/Book", { title: "d", stars: "4", readers: [{ id: 2 }] }, erupt: "Book").last["success"]
+    row = call("POST", "/erupt-api/data/table/Book", {}, erupt: "Book").last["list"].last
+    assert_equal [4, [2]], row.values_at("stars", "readers")
+  end
+
+  def test_node_config_and_user_info
+    seen = []
+    @node.define_singleton_method(:server_call) do |_method, path, headers: {}, **|
+      seen << [path, headers["token"]]
+      path.include?("userinfo") ? '{"account": "admin", "roles": ["r"]}' : "cfg"
+    end
+    assert_equal %w[cfg cfg], [@node.config, @node.group_config]
+    assert_equal({ "account" => "admin", "roles" => ["r"] }, @node.user_info)
+    assert_equal %w[/erupt-cloud-api/node-config/blog /erupt-cloud-api/node-group-config/blog /erupt-cloud-api/userinfo/blog],
+                 seen.map(&:first)
+  end
+
+  def test_trusted_query
+    # under a signed query, the server's own condition may name any stored field; an operator is still checked
+    signed = lambda do |condition|
+      body, user, ts = JSON.generate(condition: condition), "e30=", Time.now.to_i
+      path = "/erupt-api/data/table/Article"
+      env = { "REQUEST_METHOD" => "POST", "PATH_INFO" => path, "rack.input" => StringIO.new(body), "HTTP_ERUPT" => "Article",
+              "HTTP_USER" => user, "HTTP_ERUPT_TIMESTAMP" => ts.to_s, "HTTP_ERUPT_ENFORCED" => "power,query",
+              "HTTP_ERUPT_SIGNATURE" => Erupt::Signature.sign(TOKEN, "POST", path, ts, "power,query", user, body) }
+      JSON.parse(@node.call(env).last.join)
+    end
+    add(title: "A", views: 1)
+    add(title: "B", views: 2)
+    assert_equal ["A"], titles(signed.call([{ key: "views", expression: "EQ", value: 1 }]))
+    refute signed.call([{ key: "views", expression: "DROP", value: 1 }])["success"]
+    refute call("POST", "/erupt-api/data/table/Article", { condition: [{ key: "views", expression: "EQ", value: 1 }] }).last["success"]
   end
 
   def test_before_fetch_needs_sql

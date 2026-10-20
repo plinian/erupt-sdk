@@ -55,7 +55,8 @@ func (NoteProxy) Validate(_ context.Context, record erupt.Record) error {
 }
 
 func main() {
-	category := must(erupt.NewModel(Category{}, "Category"))
+	category := must(erupt.NewModel(Category{}, "Category",
+		erupt.WithRaw(erupt.M{"drills": []erupt.M{{"title": "Articles", "link": erupt.M{"linkErupt": "Article", "joinColumn": "category"}}}})))
 	form := must(erupt.NewModel(PublishForm{}, "Publish Options"))
 	article := must(erupt.NewModel(Article{}, "Article",
 		erupt.WithOrderBy("id desc"),

@@ -9,7 +9,7 @@ final class FieldSpec
 {
     public const REFERENCES = ['REFERENCE_TABLE', 'REFERENCE_TREE'];
     /** many records of another model, stored as the JSON list of their keys */
-    public const COLLECTIONS = ['CHECKBOX', 'TAB_TREE'];
+    public const COLLECTIONS = ['CHECKBOX', 'TAB_TREE', 'TRANSFER'];
     /** the edit attribute that names a fetchHandler, by the type that fetches options */
     public const FETCHED = ['CHOICE' => 'choiceType', 'MULTI_CHOICE' => 'multiChoiceType', 'TAGS' => 'tagsType'];
     /** invoke kind -> the #[Field] attribute naming its code */
@@ -21,6 +21,8 @@ final class FieldSpec
         'BOOLEAN' => 'bool', 'DATE' => 'date', 'DATE_TIME' => 'datetime',
         'TAGS' => 'string', 'AUTO_COMPLETE' => 'string', 'ATTACHMENT' => 'string', 'HTML_EDITOR' => 'string',
         'MARKDOWN' => 'string', 'CODE_EDITOR' => 'string',
+        'COLOR' => 'string', 'ICON' => 'string', 'SIGNATURE' => 'string', 'MAP' => 'string', 'HIDDEN' => 'string',
+        'RATE' => 'number', 'SLIDER' => 'number',
     ];
 
     /** what a JSON field holds: an `array` property a list, an `object` property an object */

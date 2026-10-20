@@ -9,6 +9,11 @@ public enum Schema {
         return defs
     }()
 
+    /// The declared defaults of definition `name`, as Java fills an attribute left out.
+    static func defaults(_ name: String) -> [String: JSON] {
+        (defs[name]?["properties"]?.object ?? [:]).compactMapValues { $0["default"] }
+    }
+
     /// Throws unless `value` fits definition `name`. `partial` (an override) lets every attribute be omitted;
     /// otherwise the attributes the Java side always emits must be present.
     public static func check(_ name: String, _ value: JSON, path: String? = nil, partial: Bool = true) throws {

@@ -40,7 +40,7 @@ public class DeclarationTests
 
     [Theory]
     [InlineData(typeof(TwoPks), "at most one [Pk]")]
-    [InlineData(typeof(UnsupportedType), "edit type MAP is not supported yet")]
+    [InlineData(typeof(UnsupportedType), "edit type TPL is not supported yet")]
     [InlineData(typeof(MissingLabel), "has no field 'title'")]
     [InlineData(typeof(BadOrder), "illegal OrderBy 'missing desc'")]
     [InlineData(typeof(BadName), "must be an identifier")]

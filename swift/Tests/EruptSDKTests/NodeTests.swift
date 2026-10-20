@@ -69,6 +69,28 @@ func taskModel() throws -> Model {
     }
 }
 
+func authorAndBook() throws -> (Model, Model) {
+    let category = try articleModel().0
+    let author = try Model(
+        "Author", erupt: Erupt(drills: [Drill(link: Link(linkErupt: "Book"), title: "Books")]),
+        drillJoin: ["Books": DrillJoin(joinColumn: "author.id")]
+    ) {
+        Field("id", pk: true)
+        Field("name", "Name")
+    }
+    let book = try Model("Book") {
+        Field("id", pk: true)
+        Field("title", "Title")
+        Field("author", "Author", .ref(author))
+        Field("colour", "Colour", type: .color)
+        Field("stars", "Stars", type: .rate)
+        Field("secret", "Secret", type: .hidden)
+        Field("readers", "Readers", .ref(category), type: .transfer)
+        Field("shelf", "Shelf", .ref(category), edit: Edit(referenceTableType: ReferenceTableType(dependField: "author")), dependColumn: "parent")
+    }
+    return (author, book)
+}
+
 /// A node whose server is unreachable: every call is signed with power enforced, so it never asks it.
 func node() throws -> Node {
     let (category, article) = try articleModel()
@@ -79,7 +101,7 @@ func node() throws -> Node {
 }
 
 func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Article", body: JSON? = nil,
-          signed: Bool = true, account: String = "admin") -> (Int, JSON?) {
+          signed: Bool = true, account: String = "admin", headers extra: [String: String] = [:]) -> (Int, JSON?) {
     let raw = body.map { Array($0.serialized().utf8) } ?? []
     let user = Data("{\"account\":\"\(account)\"}".utf8).base64EncodedString()
     var headers = ["erupt": erupt, "user": user, "token": "t"]
@@ -92,7 +114,7 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
     } else {
         headers["Access-Token"] = token
     }
-    let response = node.handle(NodeRequest(method: method, target: target, headers: headers, body: raw))
+    let response = node.handle(NodeRequest(method: method, target: target, headers: headers.merging(extra) { $1 }, body: raw))
     return (response.status, response.body.isEmpty ? nil : try? JSON.parse(response.body))
 }
 
@@ -282,6 +304,66 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(throws: DeclarationError.self) { try Model("M") { Field("id", pk: true); Field("a", "A", click: { _ in FormChange() }) } }
         #expect(throws: DeclarationError.self) { try Model("M") { Field("id", pk: true); Field("a", "A", fetch: .tags { _ in [] }) } }
         #expect(throws: DeclarationError.self) { try Model("M") { Field("id", pk: true); Field("a", "A", type: .checkbox) } }
+    }
+
+    @Test func drill() throws {
+        let n = try node()
+        let (author, book) = try authorAndBook()
+        try n.register(author, MemoryRepository([["name": "Ann"], ["name": "Bob"]]))
+        try n.register(book, MemoryRepository([["title": "a", "author": 1], ["title": "b", "author": 2], ["title": "c", "author": 1]]))
+        let drill = ["Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1"]
+        let page = call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [:], headers: drill).1
+        #expect(page?["list"]?.array?.map { $0["title"]!.text } == ["a", "c"])
+        #expect(call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [:], headers: drill.merging(["Drill": "x"]) { $1 }).0 == 403)
+        let eruptJson = call(n, "GET", "/erupt-api/build/Author", erupt: "Author").1?["eruptModel"]?["eruptJson"]
+        try Schema.check("Erupt", eruptJson!, partial: false)
+        let drills = eruptJson?["drills"]?.array ?? []
+        #expect(drills.map { [$0["code"], $0["title"], $0["link"]?["linkErupt"]] } == [["Books", "Books", "Book"]])
+        #expect(drills[0]["link"]?["joinColumn"] == nil)
+        #expect(throws: DeclarationError.self) {
+            try Model("A", erupt: Erupt(drills: [Drill(link: Link(linkErupt: "Book"), title: "Books")])) { Field("id", pk: true) }
+        }
+    }
+
+    @Test func simpleTypesAndDependColumn() throws {
+        let n = try node()
+        let (author, book) = try authorAndBook()
+        try n.register(author, MemoryRepository())
+        try n.register(book, MemoryRepository())
+        let build = call(n, "GET", "/erupt-api/build/Book", erupt: "Book").1?["eruptModel"]?["eruptFieldModels"]?.array ?? []
+        // dependColumn is @Transient in Java, so the schema does not know it
+        for f in build where f["fieldName"] != "shelf" { try Schema.check("EruptField", f["eruptFieldJson"]!, partial: false) }
+        let edit = Dictionary(uniqueKeysWithValues: build.map { ($0["fieldName"]!.text, $0["eruptFieldJson"]!["edit"]!) })
+        #expect(["colour", "stars", "secret", "readers"].map { edit[$0]?["type"] } == ["COLOR", "RATE", "HIDDEN", "TRANSFER"])
+        #expect(edit["shelf"]?["referenceTableType"]?["dependColumn"] == "parent", "the server reads it off the build")
+        let add = call(n, "POST", "/erupt-api/data/modify/Book", erupt: "Book", body: ["title": "d", "stars": "4", "readers": [["id": 2]]]).1
+        #expect(add?["success"] == true)
+        let row = call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [:]).1?["list"]?[0]
+        #expect(row?["stars"] == 4 && row?["readers"] == [2])
+        #expect(throws: DeclarationError.self) { try Model("M") { Field("id", pk: true); Field("a", "A", dependColumn: "x") } }
+    }
+
+    @Test func nodeConfigAndUserInfo() throws {
+        var seen: [(String, String?)] = []
+        let server = try HTTPServer(host: "127.0.0.1", port: 0) { req in
+            seen.append((req.path, req.header("token")))
+            let body = req.path.contains("userinfo") ? "{\"account\":\"admin\",\"roles\":[\"r\"]}" : "cfg"
+            return NodeResponse(status: 200, contentType: "text/plain", body: Array(body.utf8))
+        }
+        server.start()
+        defer { server.close() }
+        var n: Node?
+        let who = try Model("Who") {
+            Field("id", pk: true)
+            RowAction("who", "Who", mode: .button) { _ in try n!.userInfo()?["account"]?.text }
+        }
+        n = try Node(name: "blog", accessToken: token, servers: ["http://127.0.0.1:\(server.port)"], log: { _, _ in })
+        try n!.register(who, MemoryRepository())
+        #expect(try n!.config() == "cfg")
+        #expect(try n!.groupConfig() == "cfg")
+        #expect(call(n!, "POST", "/erupt-api/invoke/Who/operation/who", erupt: "Who", body: ["ids": []]).1?["data"] == "admin")
+        #expect(seen.map(\.0) == ["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog", "/erupt-cloud-api/userinfo/blog"])
+        #expect(seen.last?.1 == "t", "the request's token")
     }
 
     @Test func beforeFetchNeedsSQL() throws {

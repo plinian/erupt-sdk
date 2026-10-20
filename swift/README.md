@@ -198,6 +198,29 @@ let order = try Model("Order") {
 `fetch: .options` belongs to CHOICE / MULTI_CHOICE, `.tags` to TAGS, `complete` to AUTO_COMPLETE, `click` to
 BUTTON; `onchange` to any field. Throw an `EruptFailure` to refuse with a message.
 
+Also: `.color`, `.icon`, `.signature`, `.map`, `.hidden` (text), `.rate`, `.slider` (numbers) and `.transfer` (like
+`.checkbox`). A reference table depending on another field takes
+`edit: Edit(referenceTableType: ReferenceTableType(dependField: "province")), dependColumn: "province"`: the erupt
+server keeps the picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```swift
+let author = try Model(
+    "Author", erupt: Erupt(drills: [Drill(link: Link(linkErupt: "Book"), title: "Books")]),
+    drillJoin: ["Books": DrillJoin(joinColumn: "author")]
+) { ... }
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`DrillJoin(column:)`, `id` by default);
+`link.linkCondition` adds SQL as written. `column` and `joinColumn` are `@Transient` in Java, so they go in
+`drillJoin`, keyed by the drill's code (its title when it has none). Both models must be on the node.
+
+## Server config and user info
+
+`node.config()` and `node.groupConfig()` return the config text set for the node and its group on the erupt
+server; `node.userInfo()` the acting user's full info (roles, org, post), while a request is served.
+
 ## Storage
 
 Storage is any `Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:

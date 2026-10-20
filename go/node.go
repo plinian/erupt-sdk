@@ -32,6 +32,8 @@ type User struct {
 
 type userKey struct{}
 
+type tokenKey struct{} // the session token of the request being served, for UserInfo
+
 // UserFrom returns the acting user of the request being served, nil without one.
 func UserFrom(ctx context.Context) *User {
 	u, _ := ctx.Value(userKey{}).(*User)
@@ -264,7 +266,7 @@ func (n *Node) dispatch(hr *http.Request) (any, error) {
 		if parent != "" && parent[strings.LastIndex(parent, ".")+1:] != name {
 			return nil, reply{404}
 		}
-		ctx := hr.Context()
+		ctx := context.WithValue(hr.Context(), tokenKey{}, hr.Header.Get("token"))
 		if header := hr.Header.Get("user"); header != "" {
 			raw, err := base64.StdEncoding.DecodeString(header)
 			if err != nil {
@@ -359,7 +361,7 @@ func (n *Node) table(q *request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return n.page(q.ctx, q.model, q.repo, body)
+	return n.page(q, body)
 }
 
 func number(v any, fallback int) int {
@@ -369,7 +371,8 @@ func number(v any, fallback int) int {
 	return fallback
 }
 
-func (n *Node) page(ctx context.Context, m *Model, repo Repository, body map[string]any) (any, error) {
+func (n *Node) page(req *request, body map[string]any) (any, error) {
+	ctx, m, repo := req.ctx, req.model, req.repo
 	pageIndex := number(body["pageIndex"], 1)
 	if pageIndex < 1 {
 		pageIndex = 1
@@ -383,11 +386,15 @@ func (n *Node) page(ctx context.Context, m *Model, repo Repository, body map[str
 		if !ok {
 			return nil, Fail("illegal condition")
 		}
-		cond, err := condition(m, obj)
+		// under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+		cond, err := condition(m, obj, req.enforced["query"])
 		if err != nil {
 			return nil, err
 		}
 		q.Conditions = append(q.Conditions, cond)
+	}
+	if err := n.drill(req, &q); err != nil {
+		return nil, err
 	}
 	sorts, _ := body["sort"].([]any)
 	for _, s := range sorts {
@@ -445,10 +452,55 @@ func (n *Node) page(ctx context.Context, m *Model, repo Repository, body map[str
 		"sort": nil, "alert": nil, "extraContent": nil}, nil
 }
 
-func condition(m *Model, c map[string]any) (Cond, error) {
+// drill narrows a table read from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose join
+// field holds the source row's column, and its linkCondition as a filter ahead of the others.
+func (n *Node) drill(req *request, q *Query) error {
+	header := req.r.Header
+	if len(header.Values("Drill")) == 0 {
+		return nil
+	}
+	code := header.Get("Drill")
+	n.mu.RLock()
+	source := n.models[header.Get("DrillSourceErupt")]
+	n.mu.RUnlock()
+	if source == nil {
+		return reply{403}
+	}
+	link, ok := source.model.drills[code]
+	if !ok {
+		return reply{403}
+	}
+	join := req.model.byName[link.join]
+	if link.erupt != req.model.name || join == nil || join.virtual {
+		return Fail("illegal erupt from drill '%s'", code)
+	}
+	pk, err := primaryKey(source.model, header.Get("DrillValue"))
+	if err != nil {
+		return err
+	}
+	row, err := source.repo.Get(req.ctx, pk)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return Fail("record not found")
+	}
+	cond, err := fieldCondition(join, "EQ", row[link.column])
+	if err != nil {
+		return err
+	}
+	q.Conditions = append(q.Conditions, cond)
+	if link.condition != "" {
+		q.Filters = append(q.Filters, Filter{SQL: link.condition})
+	}
+	return nil
+}
+
+// condition checks a table condition: on a searchable field, or on any stored one when trusted.
+func condition(m *Model, c map[string]any, trusted bool) (Cond, error) {
 	key := str(c["key"])
 	f := m.byName[key]
-	if f == nil || f.pk || !f.search {
+	if f == nil || f.virtual || (!trusted && (f.pk || !f.search)) {
 		return Cond{}, Fail("illegal search field '%s'", key)
 	}
 	op := str(c["expression"])

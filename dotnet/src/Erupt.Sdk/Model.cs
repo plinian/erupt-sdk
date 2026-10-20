@@ -33,6 +33,9 @@ public partial class EruptModel
     /// <summary>View code -> the filters and order the node applies to that <c>@Vis</c> view's table queries.</summary>
     internal Dictionary<string, (List<SqlFilter> Filters, List<(string Field, bool Desc)> Sort)> Views { get; } = [];
 
+    /// <summary>Drill code -> its link; <c>column</c> and <c>joinColumn</c> stay here (<c>@Transient</c> in Java).</summary>
+    internal Dictionary<string, DrillLink> Drills { get; } = [];
+
     /// <summary>The reference field a <c>@LinkTree</c> filters the table by, and whether a tree node must be picked first.</summary>
     internal (string Field, bool DependNode)? LinkTree { get; private protected set; }
 
@@ -193,6 +196,7 @@ public sealed class EruptModel<T> : EruptModel
                 throw new ArgumentException($"{Name}: linkTree.field '{link}' must be a reference field");
             LinkTree = (link, Raw["linkTree"]?["dependNode"]?.GetValue<bool>() == true);
         }
+        if (options.Drills is not null) throw new ArgumentException($"{Name}: declare a drill through Drill(...)");
         if (options.Vis is null) return this;
         Views.Clear();
         foreach (var entry in Raw["vis"]!.AsArray()) View(entry!.AsObject(), [], []);
@@ -218,6 +222,28 @@ public sealed class EruptModel<T> : EruptModel
         entry["code"] ??= entry["title"]?.DeepClone() ?? "";
         if (!Views.TryAdd(entry["code"]!.GetValue<string>(), (filters, sort)))
             throw new ArgumentException($"{Name}: vis code '{entry["code"]}' declared twice");
+    }
+
+    /// <summary>
+    /// One <c>@Erupt(drills)</c> entry: opens <c>Link.LinkErupt</c> (a model on this node) filtered to the rows whose
+    /// <paramref name="joinColumn"/> (its first path segment, <c>"author.id"</c> -> <c>author</c>) holds the source row's
+    /// <paramref name="column"/>, plus <c>Link.LinkCondition</c> as written. Both stay on the node, as Java keeps them
+    /// <c>@Transient</c>. A drill without a <c>Code</c> is addressed by its title.
+    /// </summary>
+    public EruptModel<T> Drill(Drill drill, string joinColumn, string column = "id")
+    {
+        var entry = Schema.Override("Drill", drill, $"[EruptModel] {Name}.drills");
+        var link = Json.Merge(Schema.DefaultsOf("Link"), entry["link"] as JsonObject ?? []);
+        var erupt = link["linkErupt"]?.GetValue<string>();
+        if (string.IsNullOrEmpty(erupt) || string.IsNullOrEmpty(joinColumn))
+            throw new ArgumentException($"{Name}: drill '{entry["title"]}' needs Link.LinkErupt and a joinColumn");
+        entry = Json.Merge(Json.Merge(Schema.DefaultsOf("Drill"), new JsonObject { ["code"] = entry["title"]?.DeepClone() ?? "" }), entry);
+        entry["link"] = link;
+        var code = entry["code"]!.GetValue<string>();
+        if (!Drills.TryAdd(code, new DrillLink(erupt, column, joinColumn.Split('.')[0], link["linkCondition"]!.GetValue<string>())))
+            throw new ArgumentException($"{Name}: drill code '{code}' declared twice");
+        ((Raw["drills"] ??= new JsonArray()) as JsonArray)!.Add(entry);
+        return this;
     }
 
     /// <summary>Switch features off; the server narrows them further per user.</summary>
@@ -300,6 +326,9 @@ public sealed class EruptModel<T> : EruptModel
             ? member.Member.Name
             : throw new ArgumentException($"{Name}: expected a property access like x => x.Title");
 }
+
+/// <summary>A drill's link as the node applies it: the linked model, the source row's column, the linked model's field holding it.</summary>
+internal sealed record DrillLink(string Erupt, string Column, string Join, string Condition);
 
 internal static class Json
 {

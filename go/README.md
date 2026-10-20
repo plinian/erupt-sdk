@@ -176,6 +176,28 @@ erupt.NewModel(Order{}, "Order",
 `BUTTON`; `Onchange` to any field. A field with `Fetch` and no `type` is a `CHOICE` (a `MULTI_CHOICE` for a
 slice). Return `erupt.Fail(...)` to refuse with a message.
 
+Also: `COLOR`, `ICON`, `SIGNATURE`, `MAP`, `HIDDEN` (text), `RATE`, `SLIDER` (numbers) and `TRANSFER` (like
+`CHECKBOX`). A reference table depending on another field takes
+`erupt.WithFieldEdit("city", erupt.M{"referenceTableType": erupt.M{"dependField": "province", "dependColumn": "province"}})`:
+the erupt server keeps the picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```go
+erupt.NewModel(Author{}, "Author", erupt.WithRaw(erupt.M{"drills": []erupt.M{
+	{"title": "Books", "link": erupt.M{"linkErupt": "Book", "joinColumn": "author"}},
+}}))
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.NodeConfig(ctx)` and `node.GroupConfig(ctx)` return the config text set for the node and its group on the
+erupt server; `node.UserInfo(ctx)` the acting user's full info (roles, org, post), with the ctx of a request
+being served.
+
 ## Storage
 
 Any `erupt.Repository` (`Page`, `Get`, `Add`, `Update`, `Delete`, each with a `context.Context`; the
@@ -192,7 +214,7 @@ bound parameter; dates are stored as ISO text. `AutoCreate` creates the table wi
 `Node` is an `http.Handler`: mount it in your own server and run `node.Heartbeat(ctx)` (set
 `Config.Address`) and `node.Deregister()` yourself, or let `ListenAndServe` do all three.
 
-Not yet: sub-tables, TPL operations, depend fields of reference tables. Trees, file upload and Excel are done by
+Not yet: sub-tables, TPL operations. Trees, file upload and Excel are done by
 the erupt server.
 
 ## Without a registry

@@ -6,7 +6,7 @@ require "erupt"
 
 class Category
   extend Erupt::Model
-  erupt "Category"
+  erupt "Category", drills: [{ title: "Articles", link: { linkErupt: "Article", joinColumn: "category" } }]
   field :id, pk: true
   field :name, "Name", search: true
   field :parent, "Parent", Integer

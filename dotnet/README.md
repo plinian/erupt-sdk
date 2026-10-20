@@ -134,9 +134,14 @@ erupt server builds both trees from the node's table, and the node keeps the row
 ## Field types and field code
 
 Besides the inferred types, `Type =` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores the
-upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR` (all text), `BUTTON` (form only), and
-`CHECKBOX` / `TAB_TREE` with `Ref =`: the picked records, stored as the JSON list of their keys. A collection
-property with `[Choice]`s is a `MULTI_CHOICE`.
+upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR`, `COLOR`, `ICON`, `SIGNATURE`, `MAP`,
+`HIDDEN` (all text), `RATE`, `SLIDER` (numbers), `BUTTON` (form only), and `CHECKBOX` / `TAB_TREE` / `TRANSFER`
+with `Ref =`: the picked records, stored as the JSON list of their keys. A collection property with `[Choice]`s
+is a `MULTI_CHOICE`.
+
+A reference table depending on another field takes `[Field("Shelf", DependColumn = "province")]` plus
+`.Edit(x => x.Shelf, new Edit { ReferenceTableType = new ReferenceTableType { DependField = "province" } })`: the
+erupt server keeps the picked model's rows whose `DependColumn` holds the depend field's value.
 
 A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
 values. Attributes cannot hold code, so the model builder registers it by property:
@@ -164,6 +169,21 @@ node.Register(EruptModel.Of<Order>()
 `Fetch` belongs to `CHOICE` / `MULTI_CHOICE` (value / label pairs) and `TAGS` (strings), `Complete` to
 `AUTO_COMPLETE`, `Click` to `BUTTON`, `OnChange` to any field; anything else throws at declaration. Each takes
 a plain or an async function; throw `EruptFailure` to refuse with a message.
+
+## Drills
+
+```csharp
+node.Register(EruptModel.Of<Author>()
+    .Drill(new Drill { Title = "Books", Link = new Link { LinkErupt = "Book" } }, joinColumn: "author"), repository);
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`column:`, `id` by default);
+`Link.LinkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.ConfigAsync()` and `node.GroupConfigAsync()` return the config text set for the node and its group on the
+erupt server; `node.UserInfoAsync()` the acting user's full info (roles, org, post), while a request is served.
 
 ## Run
 

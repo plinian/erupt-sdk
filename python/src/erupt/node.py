@@ -27,6 +27,7 @@ log = logging.getLogger("erupt")
 __version__ = "0.1.0"
 
 _user = contextvars.ContextVar("erupt_user", default=None)
+_token = contextvars.ContextVar("erupt_token", default=None)
 
 # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
 _UNSUPPORTED_POWER = {"print": False, "ai": False}
@@ -151,6 +152,7 @@ class Node:
                     raise _Reply(404, "")
                 user = environ.get("HTTP_USER")
                 _user.set(json.loads(base64.b64decode(user)) if user else None)
+                _token.set(environ.get("HTTP_TOKEN"))
                 model, repo = self.models[name]
                 args = [urllib.parse.unquote(g) for g in match.groups()[1:]]
                 return 200, handler(model, repo, environ, *args)
@@ -182,14 +184,17 @@ class Node:
 
     def _table(self, model, repo, environ):
         self._require(model, environ, "query")
-        return self._page(model, repo, _read_json(environ) or {})
+        return self._page(model, repo, _read_json(environ) or {}, environ)
 
-    def _page(self, model, repo, body):
+    def _page(self, model, repo, body, environ):
         page_index = max(int(body.get("pageIndex") or 1), 1)
         page_size = min(max(int(body.get("pageSize") or 10), 1), _MAX_PAGE_SIZE)
         query = Query(offset=(page_index - 1) * page_size, limit=page_size)
+        # under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+        trusted = "query" in environ.get("erupt.enforced", ())
         for c in body.get("condition") or []:
-            query.conditions.extend(self._conditions(model, c))
+            query.conditions.extend(self._conditions(model, c, trusted))
+        drill = self._drill(model, environ, query)
         for s in body.get("sort") or []:
             f = model.fields.get(s.get("field"))
             if f is None or not (f.sortable or f.pk):
@@ -203,7 +208,7 @@ class Node:
         filters, sort = model.vis.get(body.get("vis"), ([], []))
         if not query.sort:
             query.sort = list(sort or model.order_by)
-        query.filters = filters + model.filters(query.conditions)
+        query.filters = drill + filters + model.filters(query.conditions)
         total, records = (0, []) if model.link_tree and model.link_tree[1] and picked is None else repo.page(query)
         rows = self._rows(model, records)
         model.hook("after_fetch", rows)
@@ -211,10 +216,28 @@ class Node:
                 "totalPage": math.ceil(total / page_size), "list": rows,
                 "sort": None, "alert": None, "extraContent": None}
 
+    def _drill(self, model, environ, query):
+        """A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+        joinColumn holds the source row's column; its linkCondition is returned as a filter."""
+        code = environ.get("HTTP_DRILL")
+        if code is None:
+            return []
+        source = self.models.get(environ.get("HTTP_DRILLSOURCEERUPT") or "")
+        link = source[0].drills.get(code) if source else None
+        if link is None:
+            raise _Reply(403, "")
+        if link.erupt != model.name or link.join not in model.fields:
+            raise Fail(f"illegal erupt from drill '{code}'")
+        row = source[1].get(self._pk(source[0], environ.get("HTTP_DRILLVALUE")))
+        if row is None:
+            raise Fail("record not found")
+        query.conditions.append(self._condition(model.fields[link.join], "EQ", row.get(link.column)))
+        return [(link.condition, [])] if link.condition else []
+
     @staticmethod
-    def _conditions(model, c):
+    def _conditions(model, c, trusted=False):
         f = model.fields.get(c.get("key"))
-        if f is None or f.pk or not f.search:
+        if f is None or (not trusted and (f.pk or not f.search)):
             raise Fail(f"illegal search field '{c.get('key')}'")
         op = c.get("expression") or "EQ"
         if op not in _OPS:
@@ -415,6 +438,24 @@ class Node:
         return power
 
     # ---------------------------------------------------------------- server calls
+
+    def config(self):
+        """The config text set for this node on the erupt server (Node Config)."""
+        return self._server_text(f"/erupt-cloud-api/node-config/{self.name}", {"Access-Token": self.access_token})
+
+    def group_config(self):
+        """The config text of this node's group on the erupt server."""
+        return self._server_text(f"/erupt-cloud-api/node-group-config/{self.name}", {"Access-Token": self.access_token})
+
+    def user_info(self):
+        """The acting user's full info from the erupt server (roles, org, post...), for the request being served."""
+        text = self._server_text(f"/erupt-cloud-api/userinfo/{self.name}",
+                                 {"Access-Token": self.access_token, "token": _token.get() or ""})
+        return json.loads(text) if text else None
+
+    def _server_text(self, path, headers):
+        with urllib.request.urlopen(urllib.request.Request(next(self._server_cycle) + path, headers=headers), timeout=5) as resp:
+            return resp.read().decode("utf-8")
 
     def _server_get(self, path, params, headers):
         url = next(self._server_cycle) + path + "?" + urllib.parse.urlencode(params)

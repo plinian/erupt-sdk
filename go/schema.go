@@ -58,6 +58,18 @@ func toJSONValue(v any) (any, error) {
 	return out, decode(data, &out)
 }
 
+// schemaDefaults are the declared defaults of an annotation, as Java fills an attribute left out.
+func schemaDefaults(name string) map[string]any {
+	out := map[string]any{}
+	props, _ := schemaDefs[name]["properties"].(map[string]any)
+	for k, p := range props {
+		if v, ok := p.(map[string]any)["default"]; ok {
+			out[k] = deepCopy(v)
+		}
+	}
+	return out
+}
+
 // checkSchema returns an error unless value fits definition name. partial (an override) lets every
 // attribute be omitted; otherwise the attributes the Java side always emits must be present.
 func checkSchema(name string, value any, path string, partial bool) error {

@@ -18,7 +18,7 @@ use Erupt\PdoRepository;
 
 require_once __DIR__ . '/../../autoload.php';
 
-#[Erupt('Category')]
+#[Erupt('Category', raw: ['drills' => [['title' => 'Articles', 'link' => ['linkErupt' => 'Article', 'joinColumn' => 'category']]]])]
 final class Category
 {
     #[Field(pk: true)] public int $id;

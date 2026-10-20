@@ -23,6 +23,12 @@ final class Schema
         return self::$defaults ??= Json::decode(file_get_contents(__DIR__ . '/../resources/erupt-node-defaults.json'));
     }
 
+    /** The declared defaults of an annotation, as Java fills an attribute left out. */
+    public static function declaredDefaults(string $name): array
+    {
+        return array_map(fn($p) => $p['default'], array_filter(self::defs()[$name]['properties'], fn($p) => array_key_exists('default', $p)));
+    }
+
     /**
      * Throw \InvalidArgumentException unless $value fits definition $name. $partial (an override) lets every
      * attribute be omitted; otherwise the attributes the Java side always emits must be present.

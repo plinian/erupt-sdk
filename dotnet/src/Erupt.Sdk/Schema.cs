@@ -31,6 +31,11 @@ internal static partial class Schema
         return JsonNode.Parse(stream)!.AsObject();
     }
 
+    /// <summary>The declared defaults of definition <paramref name="name"/>, as Java fills an attribute left out.</summary>
+    internal static JsonObject DefaultsOf(string name) =>
+        new(Defs[name]!["properties"]!.AsObject().Where(p => p.Value!["default"] is not null)
+            .Select(p => KeyValuePair.Create(p.Key, (JsonNode?)p.Value!["default"]!.DeepClone())));
+
     /// <summary>A generated annotation object (or raw JSON) as JSON, checked as a partial override of <paramref name="name"/>.</summary>
     internal static JsonObject Override(string name, object? value, string path)
     {

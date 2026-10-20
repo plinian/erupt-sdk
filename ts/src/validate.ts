@@ -11,6 +11,7 @@ interface Schema {
   properties?: Record<string, Schema>;
   additionalProperties?: Schema | boolean;
   required?: string[];
+  default?: unknown;
 }
 
 const DEFS = (SCHEMA as unknown as { $defs: Record<string, Schema> }).$defs;
@@ -30,6 +31,11 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "obj
  */
 export function check(name: string, value: unknown, path = name, partial = true): void {
   walk({ $ref: "#/$defs/" + name }, value, path, partial);
+}
+
+/** The declared defaults of definition `name`, as Java fills an attribute left out. */
+export function defaults(name: string): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(DEFS[name].properties!).filter(([, v]) => "default" in v).map(([k, v]) => [k, v.default]));
 }
 
 function walk(schema: Schema, value: unknown, path: string, partial: boolean): void {

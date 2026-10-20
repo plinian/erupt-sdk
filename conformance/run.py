@@ -164,9 +164,9 @@ def fail_r(r, what=""):
     return body
 
 
-def table(n, condition=(), sort=(), size=10, erupt="Article"):
+def table(n, condition=(), sort=(), size=10, erupt="Article", headers=None):
     status, page = n.call("POST", f"/erupt-api/data/table/{erupt}",
-                          {"pageIndex": 1, "pageSize": size, "condition": list(condition), "sort": list(sort)}, erupt=erupt)
+                          {"pageIndex": 1, "pageSize": size, "condition": list(condition), "sort": list(sort)}, erupt=erupt, headers=headers)
     eq(200, status, f"table {condition} {sort} -> {page}")
     return page
 
@@ -383,6 +383,31 @@ def references(n):
     eq(1, table(n, [{"key": "category", "expression": "EQ", "value": {"id": 2, "name": "Python"}}])["total"], "search by reference")
     eq(0, table(n, [{"key": "category", "expression": "IN", "value": [{"id": 1}, {"id": 3}]}])["total"], "IN by reference")
     fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "category", "expression": "LIKE", "value": "x"}]}), "LIKE on a reference")
+
+
+@check
+def drill(n):
+    # the JVM lite node drills from erupt 2.4.0; the conformance example still runs 2.3.0
+    if not invoked():
+        return
+    clear_articles(n)
+    add(n, title="Py", category={"id": 2, "name": "Python"})
+    add(n, title="Other", category={"id": 3, "name": "Life"})
+    headers = {"Drill": "Articles", "DrillSourceErupt": "Category", "DrillValue": "2"}
+    eq(["Py"], [r["title"] for r in table(n, headers=headers)["list"]], "the rows of the drilled category")
+    eq(403, n.call("POST", "/erupt-api/data/table/Article", {}, headers={**headers, "Drill": "nope"})[0], "an undeclared drill")
+
+
+@check
+def trusted_query(n):
+    if not invoked():
+        return
+    # a condition the server added after checking the browser's: taken on a field the search bar does not have
+    status, page = n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "views", "expression": "EQ", "value": 1}]},
+                          signed=True, enforced="power,query")
+    eq(200, status, "signed query")
+    if not isinstance(page, dict) or "list" not in page:
+        raise AssertionError(f"signed query: expected a page, got {page}")
 
 
 @check

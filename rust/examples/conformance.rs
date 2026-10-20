@@ -25,6 +25,7 @@ impl DataProxy for NoteProxy {
 
 fn main() -> erupt::Result<()> {
     let category = Model::new("Category", "Category")
+        .raw(json!({"drills": [{"title": "Articles", "link": {"linkErupt": "Article", "joinColumn": "category"}}]}))
         .field("id", Field::pk())
         .field("name", Field::input("Name").search())
         .field("parent", Field::number("Parent"))

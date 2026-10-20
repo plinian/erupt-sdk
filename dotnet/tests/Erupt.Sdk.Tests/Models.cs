@@ -57,6 +57,26 @@ public sealed class Order
     [Field("Stop", Type = EditType.BUTTON)] public object? Stop { get; set; }
 }
 
+[EruptModel("Author")]
+public sealed class Author
+{
+    [Pk] public long Id { get; set; }
+    [Field("Name")] public string? Name { get; set; }
+}
+
+[EruptModel("Book")]
+public sealed class Book
+{
+    [Pk] public long Id { get; set; }
+    [Field("Title")] public string? Title { get; set; }
+    [Field("Author")] public Author? Author { get; set; }
+    [Field("Colour", Type = EditType.COLOR)] public string? Colour { get; set; }
+    [Field("Stars", Type = EditType.RATE)] public long? Stars { get; set; }
+    [Field("Secret", Type = EditType.HIDDEN)] public string? Secret { get; set; }
+    [Field("Readers", Type = EditType.TRANSFER, Ref = typeof(Category))] public List<long>? Readers { get; set; }
+    [Field("Shelf", DependColumn = "parent")] public Category? Shelf { get; set; }
+}
+
 [EruptModel("Memo", DataProxy = [typeof(MemoProxy)])]
 public sealed class Memo
 {
@@ -128,7 +148,7 @@ public sealed class TwoPks
 public sealed class UnsupportedType
 {
     [Pk] public long Id { get; set; }
-    [Field("Map", Type = EditType.MAP)] public string? Map { get; set; }
+    [Field("Tpl", Type = EditType.TPL)] public string? Tpl { get; set; }
 }
 
 [EruptModel("Bad")]

@@ -190,6 +190,25 @@ end
 `fetch` belongs to `CHOICE` / `MULTI_CHOICE` (`{ value => label }` or pairs) and `TAGS` (an array), `complete`
 to `AUTO_COMPLETE`, `click` to `BUTTON`; `onchange` to any field. Raise `Erupt::Fail` to refuse with a message.
 
+Also: `COLOR`, `ICON`, `SIGNATURE`, `MAP`, `HIDDEN` (text), `RATE`, `SLIDER` (numbers) and `TRANSFER` (like
+`CHECKBOX`). A reference table depending on another field takes
+`edit: { referenceTableType: { dependField: "province", dependColumn: "province" } }`: the erupt server keeps the
+picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```ruby
+erupt "Author", drills: [{ title: "Books", link: { linkErupt: "Book", joinColumn: "author" } }]
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.config` and `node.group_config` return the config text set for the node and its group on the erupt
+server; `node.user_info` the acting user's full info (roles, org, post), while a request is served.
+
 ## Storage
 
 Storage is any `Erupt::Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:
@@ -221,7 +240,7 @@ end
 A single connection is used by one thread at a time. Without a sort, every repository returns rows by primary
 key ascending. `Erupt.current_user` returns the acting user inside a repository call.
 
-Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of reference tables, i18n of messages. Trees, file
+Not yet: sub-tables (TAB_TABLE_*), TPL operations, i18n of messages. Trees, file
 upload and Excel are done by the erupt server.
 
 ## Without a registry

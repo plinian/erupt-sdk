@@ -5,8 +5,8 @@
 // overrides values on top of it.
 import DEFAULTS from "./defaults.json" with { type: "json" };
 import type { Awaitable, Cond, Repository } from "./repo.js";
-import type { Edit, EditType, Erupt, RowOperation, RowOperationMode, View, Vis } from "./types.js";
-import { check } from "./validate.js";
+import type { Drill, Edit, EditType, Erupt, Link, ReferenceTableType, RowOperation, RowOperationMode, View, Vis } from "./types.js";
+import { check, defaults } from "./validate.js";
 
 /** A record as repositories store it: field name -> value (a reference holds the referenced primary key). */
 export type EruptRecord = Record<string, unknown>;
@@ -34,7 +34,7 @@ const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const REFERENCES = ["REFERENCE_TABLE", "REFERENCE_TREE"];
 // many records of another model, stored as the JSON list of their keys
-const COLLECTIONS = ["CHECKBOX", "TAB_TREE"];
+const COLLECTIONS = ["CHECKBOX", "TAB_TREE", "TRANSFER"];
 // the edit attribute that names a fetchHandler, by the type that fetches options
 const FETCHED: Record<string, string> = { CHOICE: "choiceType", MULTI_CHOICE: "multiChoiceType", TAGS: "tagsType" };
 
@@ -59,8 +59,11 @@ export interface FieldOptions {
   form?: boolean;
   /** raw @View attributes, checked against the schema */
   view?: View;
-  /** raw @Edit attributes, checked against the schema */
-  edit?: Edit;
+  /**
+   * raw @Edit attributes, checked against the schema; `referenceTableType.dependColumn` (the picked model's
+   * column holding the `dependField` value) is written into the build for the erupt server
+   */
+  edit?: Edit & { referenceTableType?: ReferenceTableType & { dependColumn?: string } };
   /** a form-only element (DIVIDE, CALLOUT, EMPTY, GROUP): in the build, never read or written */
   virtual?: boolean;
   // the field's own code, run by the node when the server invokes it with the form's values
@@ -86,6 +89,8 @@ export class Field {
   name = "";
   /** holds a JSON value (MULTI_CHOICE array, KEY_VALUE object, picked keys): SQL repositories store it as JSON text */
   json = false;
+  /** edit.referenceTableType.dependColumn, @Transient in Java: kept out of the schema check, written into the build */
+  readonly dependColumn: string | null;
 
   constructor(
     readonly title: string,
@@ -96,7 +101,11 @@ export class Field {
     readonly target: Model | null = null,
     readonly label = "name",
     readonly tree: string | null = null,
-  ) {}
+  ) {
+    const { dependColumn, ...tableType } = options.edit?.referenceTableType ?? {};
+    this.dependColumn = dependColumn ?? null;
+    if (dependColumn) this.options = { ...options, edit: { ...options.edit, referenceTableType: tableType } };
+  }
 
   get pk(): boolean {
     return this.type === null;
@@ -157,6 +166,7 @@ export class Field {
       tpl.fieldReturnName = this.target!.name;
       view.column = this.label;
     }
+    if (this.dependColumn) edit.referenceTableType.dependColumn = this.dependColumn;
     if (this.options.fetch && FETCHED[this.type!]) edit[FETCHED[this.type!]].fetchHandler = ["invoke"];
     if (this.options.onchange) edit.onchange = "invoke";
     merge(edit, (this.options.edit ?? {}) as Json);
@@ -198,6 +208,8 @@ export class Field {
       case "BOOLEAN":
         return typeof value === "boolean" ? value : ["true", "1"].includes(String(value).toLowerCase());
       case "NUMBER":
+      case "RATE":
+      case "SLIDER":
         return toNumber(value);
       case "DATE_TIME":
         return formatDateTime(parseDateTime(value));
@@ -298,6 +310,8 @@ export const field = {
       options.label ?? "name", options.tree ?? null),
   /** records of `target` picked by checkboxes: the repository stores the JSON list of their keys */
   checkbox: (target: Model, title: string, options: RefOptions = {}) => collection("CHECKBOX", target, title, options),
+  /** records of `target` picked in a transfer box, stored as `checkbox` stores them */
+  transfer: (target: Model, title: string, options: RefOptions = {}) => collection("TRANSFER", target, title, options),
   /** records of `target` picked in its own tree (`erupt.tree`), stored as `checkbox` stores them */
   tabTree: (target: Model, title: string, options: RefOptions = {}) => collection("TAB_TREE", target, title, options),
   /** a form-only button whose `click` runs on the node */
@@ -423,6 +437,26 @@ export interface DataProxy {
  */
 export type ModelVis = Vis & { filter?: string | string[]; orderBy?: string };
 
+/**
+ * A drill as declared: a button on each row opening `link.linkErupt` filtered to the rows whose `link.joinColumn`
+ * holds the row's `link.column` (`id` by default). Both are applied by the node and kept out of the build, as
+ * Java keeps them `@Transient`; `link.linkCondition` adds SQL as written. A drill without a `code` is addressed by
+ * its title.
+ */
+export type ModelDrill = Omit<Drill, "link"> & { link: Link & { linkErupt: string; column?: string; joinColumn: string } };
+
+/** A drill as the node applies it. */
+export interface DrillLink {
+  /** the linked model */
+  erupt: string;
+  /** the source row's column */
+  column: string;
+  /** the linked model's field holding it */
+  join: string;
+  /** linkCondition, SQL as written */
+  condition: string;
+}
+
 export interface ModelOptions {
   /** display name; not sent to the browser (the menu names the page) */
   title?: string;
@@ -431,7 +465,7 @@ export interface ModelOptions {
   /** default table order, applied by the node: `"views desc, id"` */
   orderBy?: string;
   /** raw @Erupt attributes merged onto the defaults (`{ layout: { pageSize: 30 } }`), checked against the schema */
-  erupt?: Omit<Erupt, "vis"> & { vis?: ModelVis[] };
+  erupt?: Omit<Erupt, "vis" | "drills"> & { vis?: ModelVis[]; drills?: ModelDrill[] };
   operations?: Record<string, Operation>;
   /** one DataProxy or several, run around every read and write of the model */
   dataProxy?: DataProxy | DataProxy[];
@@ -452,15 +486,18 @@ export class Model {
   readonly proxies: DataProxy[];
   /** view code -> the filters and order the node applies to that view's table */
   readonly vis = new Map<string, [[string, unknown[]][], [string, boolean][]]>();
+  /** drill code -> its link */
+  readonly drills = new Map<string, DrillLink>();
   /** the declared @Erupt attributes, views without their node-only `filter` and `orderBy` */
   private readonly erupt: Erupt;
 
   constructor(readonly name: string, fields: Record<string, Field>, readonly options: ModelOptions = {}) {
     if (!IDENTIFIER.test(name)) throw new Error(`erupt name '${name}' must be an identifier`);
     this.power = { ...TEMPLATES.power, ...options.power };
-    const { vis, ...erupt } = options.erupt ?? {};
+    const { vis, drills, ...erupt } = options.erupt ?? {};
     const views = (vis ?? []).map(({ filter, orderBy, ...view }) => [{ code: view.title ?? "", ...view }, filter, orderBy] as const);
     this.erupt = vis ? { ...erupt, vis: views.map(([view]) => view) } : erupt;
+    if (drills) this.erupt.drills = drills.map((d) => this.pullDrill(d));
     check("Erupt", this.erupt, `model ${name}`);
     for (const [attr, f] of Object.entries(fields)) {
       if (!(f instanceof Field)) throw new Error(`${name}.${attr}: not a field`);
@@ -498,6 +535,15 @@ export class Model {
     for (const [view, filter, orderBy] of views) this.vis.set(view.code, [[filter ?? []].flat().map((sql) => [sql, []]), this.parseOrder(orderBy)]);
     this.proxies = [options.dataProxy ?? []].flat();
     if (!this.proxies.every(isObject)) throw new Error(`${name}: dataProxy must be a DataProxy`);
+  }
+
+  /** A drill's node-only `column` / `joinColumn` taken out, its Drill and Link defaults filled for the build. */
+  private pullDrill(entry: ModelDrill): Drill {
+    const { column = "id", joinColumn, ...link } = entry.link ?? {};
+    if (!joinColumn || !link.linkErupt) throw new Error(`drill '${entry.title}' needs link.linkErupt and link.joinColumn`);
+    const drill = { ...defaults("Drill"), code: entry.title ?? "", ...entry, link: { ...defaults("Link"), ...link } } as Drill;
+    this.drills.set(drill.code!, { erupt: link.linkErupt, column, join: joinColumn.split(".")[0], condition: link.linkCondition ?? "" });
+    return drill;
   }
 
   /** Run one DataProxy hook on every proxy, in declaration order. */

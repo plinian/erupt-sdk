@@ -156,6 +156,9 @@ public final class Node: @unchecked Sendable {
 
     // MARK: - requests
 
+    /// The `token` of the request being served: the acting user's session, for `userInfo()`
+    @TaskLocal private static var token: String?
+
     /// Answered with a bare status
     private struct Reply: Error {
         let status: Int
@@ -234,7 +237,9 @@ public final class Node: @unchecked Sendable {
                 return User(json)
             }
             let context = Context(request: req, model: entry.model, repo: entry.repo, args: Array(captures.dropFirst()), enforced: enforced)
-            return try User.$current.withValue(user) { try route.handler(self)(context) }
+            return try Node.$token.withValue(req.header("token")) {
+                try User.$current.withValue(user) { try route.handler(self)(context) }
+            }
         }
         throw Reply(status: 404)
     }
@@ -261,14 +266,17 @@ public final class Node: @unchecked Sendable {
 
     private func table(_ c: Context) throws -> JSON {
         try requirePower(c.model, c, "query")
-        return try page(c.model, c.repo, try readObject(c))
+        return try page(c.model, c.repo, try readObject(c), c)
     }
 
-    private func page(_ model: Model, _ repo: Repository, _ body: [String: JSON]) throws -> JSON {
+    private func page(_ model: Model, _ repo: Repository, _ body: [String: JSON], _ c: Context) throws -> JSON {
         let pageIndex = max(try int(body["pageIndex"] ?? 1), 1)
         let pageSize = min(max(try int(body["pageSize"] ?? 10), 1), Node.maxPageSize)
         var query = Query(offset: (pageIndex - 1) * pageSize, limit: pageSize)
-        for c in body["condition"]?.array ?? [] { query.conditions += try conditions(model, c) }
+        // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+        let trusted = c.enforced.contains("query")
+        for cond in body["condition"]?.array ?? [] { query.conditions += try conditions(model, cond, trusted: trusted) }
+        let drill = try self.drill(model, c, &query)
         for s in body["sort"]?.array ?? [] {
             let fieldName = s["field"]?.text ?? ""
             guard let f = model.field(fieldName), f.sortable || f.pk else { throw EruptFailure("illegal sort field '\(fieldName)'") }
@@ -280,7 +288,7 @@ public final class Node: @unchecked Sendable {
         // a @Vis view's own filter and order, then the DataProxy's
         let vis = body["vis"]?.string.flatMap { model.vis[$0] }
         if query.sort.isEmpty { query.sort = vis?.order.isEmpty == false ? vis!.order : model.order }
-        query.filters = (vis?.filters ?? []) + (try model.filters(query.conditions))
+        query.filters = drill + (vis?.filters ?? []) + (try model.filters(query.conditions))
         let (total, records) = model.linkTree?.dependNode == true && picked == nil ? (0, []) : try repo.page(query)
         var list = rows(model, records)
         try model.hook { try $0.afterFetch(&list) }
@@ -291,9 +299,24 @@ public final class Node: @unchecked Sendable {
         ]
     }
 
-    private func conditions(_ model: Model, _ c: JSON) throws -> [Cond] {
+    /// A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+    /// joinColumn holds the source row's column; its linkCondition is returned as a filter.
+    private func drill(_ model: Model, _ c: Context, _ query: inout Query) throws -> [SQLFilter] {
+        guard let code = c.request.header("Drill") else { return [] }
+        guard let source = lock.locked({ models[c.request.header("DrillSourceErupt") ?? ""] }), let link = source.model.drills[code] else {
+            throw Reply(status: 403)
+        }
+        guard link.erupt == model.name, let join = model.field(link.join) else { throw EruptFailure("illegal erupt from drill '\(code)'") }
+        guard let row = try source.repo.get(try pkOf(source.model, .string(c.request.header("DrillValue") ?? ""))) else {
+            throw EruptFailure("record not found")
+        }
+        query.conditions.append(try condition(join, "EQ", row[link.column] ?? .null))
+        return link.condition.isEmpty ? [] : [SQLFilter(link.condition)]
+    }
+
+    private func conditions(_ model: Model, _ c: JSON, trusted: Bool) throws -> [Cond] {
         let key = c["key"]?.text ?? ""
-        guard let f = model.field(key), !f.pk, f.search else { throw EruptFailure("illegal search field '\(key)'") }
+        guard let f = model.field(key), trusted || (!f.pk && f.search) else { throw EruptFailure("illegal search field '\(key)'") }
         let op = c["expression"]?.string ?? "EQ"
         guard Node.ops.contains(op) else { throw EruptFailure("illegal operator '\(op)'") }
         let value = c["value"] ?? .null
@@ -486,6 +509,26 @@ public final class Node: @unchecked Sendable {
 
     // MARK: - server calls
 
+    /// The config text set for this node on the erupt server (Node Config).
+    public func config() throws -> String {
+        try serverText("/erupt-cloud-api/node-config/\(name)", headers: ["Access-Token": accessToken])
+    }
+
+    /// The config text of this node's group on the erupt server.
+    public func groupConfig() throws -> String {
+        try serverText("/erupt-cloud-api/node-group-config/\(name)", headers: ["Access-Token": accessToken])
+    }
+
+    /// The acting user's full info from the erupt server (roles, org, post...), for the request being served.
+    public func userInfo() throws -> JSON? {
+        let text = try serverText("/erupt-cloud-api/userinfo/\(name)", headers: ["Access-Token": accessToken, "token": Node.token ?? ""])
+        return text.isEmpty ? nil : try JSON.parse(Array(text.utf8))
+    }
+
+    private func serverText(_ path: String, headers: [String: String]) throws -> String {
+        String(decoding: try serverData("GET", path, headers: headers), as: UTF8.self)
+    }
+
     private func nextServer() -> String {
         lock.locked {
             tick += 1
@@ -502,6 +545,14 @@ public final class Node: @unchecked Sendable {
         _ method: String, _ path: String, server: String? = nil, query: [String: String]? = nil, json: JSON? = nil,
         form: [String: String]? = nil, headers: [String: String] = [:], timeout: TimeInterval = 5
     ) throws -> JSON? {
+        let data = try serverData(method, path, server: server, query: query, json: json, form: form, headers: headers, timeout: timeout)
+        return data.isEmpty ? nil : try JSON.parse(Array(data))
+    }
+
+    private func serverData(
+        _ method: String, _ path: String, server: String? = nil, query: [String: String]? = nil, json: JSON? = nil,
+        form: [String: String]? = nil, headers: [String: String] = [:], timeout: TimeInterval = 5
+    ) throws -> Data {
         guard var url = URLComponents(string: (server ?? nextServer()) + path) else { throw ServerError(description: "illegal server URL") }
         if let query { url.queryItems = query.keys.sorted().map { URLQueryItem(name: $0, value: query[$0]) } }
         var request = URLRequest(url: url.url!, timeoutInterval: timeout)
@@ -532,7 +583,7 @@ public final class Node: @unchecked Sendable {
         }
         let (status, data) = try result.get()
         guard (200..<300).contains(status) else { throw ServerError(description: "\(path) answered HTTP \(status)") }
-        return data.isEmpty ? nil : try JSON.parse(Array(data))
+        return data
     }
 
     private func formEncode(_ form: [String: String]) -> String {

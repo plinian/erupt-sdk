@@ -93,7 +93,7 @@ module Erupt
         @log.error("erupt node error: #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}")
         [500, { "path" => env["PATH_INFO"], "status" => 500, "error" => "erupt exception", "message" => e.message }]
       ensure
-        Thread.current[:erupt_user] = nil
+        Thread.current[:erupt_user] = Thread.current[:erupt_token] = nil
       end
       payload, type = body.is_a?(String) ? [body, "text/plain; charset=utf-8"] : [JSON.generate(body), "application/json; charset=utf-8"]
       [status, { "content-type" => type, "content-length" => payload.bytesize.to_s }, [payload]]
@@ -130,6 +130,19 @@ module Erupt
       deregister
     end
 
+    # The config text set for this node on the erupt server (Node Config).
+    def config = server_call(:get, "/erupt-cloud-api/node-config/#{@name}", headers: { "Access-Token" => @access_token }, parse: false)
+
+    # The config text of this node's group on the erupt server.
+    def group_config = server_call(:get, "/erupt-cloud-api/node-group-config/#{@name}", headers: { "Access-Token" => @access_token }, parse: false)
+
+    # The acting user's full info from the erupt server (roles, org, post...), for the request being served.
+    def user_info
+      headers = { "Access-Token" => @access_token, "token" => Thread.current[:erupt_token].to_s }
+      text = server_call(:get, "/erupt-cloud-api/userinfo/#{@name}", headers: headers, parse: false)
+      text.to_s.empty? ? nil : JSON.parse(text)
+    end
+
     private
 
     def dispatch(env)
@@ -153,6 +166,7 @@ module Erupt
 
         user = env["HTTP_USER"].to_s
         Thread.current[:erupt_user] = user.empty? ? nil : JSON.parse(user.unpack1("m"))
+        Thread.current[:erupt_token] = env["HTTP_TOKEN"]
         model, repo = @models[name]
         return [200, send(handler, model, repo, env, *match.captures.drop(1).map { |g| unescape(g) })]
       end
@@ -183,14 +197,17 @@ module Erupt
 
     def table(model, repo, env)
       require_power(model, env, "query")
-      page(model, repo, read_object(env))
+      page(model, repo, read_object(env), env)
     end
 
-    def page(model, repo, body)
+    def page(model, repo, body, env)
       page_index = [int(body["pageIndex"] || 1), 1].max
       page_size = int(body["pageSize"] || 10).clamp(1, MAX_PAGE_SIZE)
       query = Query.new(offset: (page_index - 1) * page_size, limit: page_size)
-      Array(body["condition"]).each { |c| query.conditions.concat(conditions(model, c)) }
+      # under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+      trusted = env["erupt.enforced"].include?("query")
+      Array(body["condition"]).each { |c| query.conditions.concat(conditions(model, c, trusted)) }
+      drilled = drill(model, env, query)
       Array(body["sort"]).each do |s|
         f = s.is_a?(Hash) && model.fields[s["field"]]
         raise Fail, "illegal sort field '#{s["field"] if s.is_a?(Hash)}'" unless f && (f.sortable? || f.pk?)
@@ -204,7 +221,7 @@ module Erupt
       # a @Vis view's own filter and order, then the DataProxy's
       filters, sort = model.vis.fetch(body["vis"], [[], []])
       query.sort = (sort.empty? ? model.order : sort).dup if query.sort.empty?
-      query.filters = filters + model.filters(query.conditions)
+      query.filters = drilled + filters + model.filters(query.conditions)
       total, records = depend && picked.nil? ? [0, []] : repo.page(query)
       list = rows(model, records)
       model.hook(:after_fetch, list)
@@ -212,10 +229,26 @@ module Erupt
         "list" => list, "sort" => nil, "alert" => nil, "extraContent" => nil }
     end
 
-    def conditions(model, c)
+    # A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+    # joinColumn holds the source row's column; its linkCondition is returned as a filter.
+    def drill(model, env, query)
+      code = env["HTTP_DRILL"]
+      return [] if code.nil?
+
+      source, source_repo = @models[env["HTTP_DRILLSOURCEERUPT"].to_s]
+      link = source && source.drills[code]
+      raise Reply, 403 if link.nil?
+      raise Fail, "illegal erupt from drill '#{code}'" if link.erupt != model.name || !model.fields.key?(link.join)
+
+      row = source_repo.get(pk_of(source, env["HTTP_DRILLVALUE"])) or raise Fail, "record not found"
+      query.conditions << condition(model.fields[link.join], "EQ", row.key?(link.column) ? row[link.column] : row[link.column.to_sym])
+      link.condition.empty? ? [] : [[link.condition, []]]
+    end
+
+    def conditions(model, c, trusted = false)
       c = {} unless c.is_a?(Hash)
       f = model.fields[c["key"]]
-      raise Fail, "illegal search field '#{c["key"]}'" if f.nil? || f.pk? || !f.search?
+      raise Fail, "illegal search field '#{c["key"]}'" if f.nil? || (!trusted && (f.pk? || !f.search?))
 
       op = c["expression"] || "EQ"
       raise Fail, "illegal operator '#{op}'" unless OPS.include?(op)
@@ -416,8 +449,8 @@ module Erupt
 
     def next_server = @servers[(@tick += 1) % @servers.size]
 
-    # GET with a query (JSON answer), or POST a JSON / form body; raises unless the server answers 2xx.
-    def server_call(method, path, server: next_server, query: nil, json: nil, form: nil, headers: {}, timeout: 5)
+    # GET with a query (JSON answer, or the text without +parse+), or POST a JSON / form body; raises unless the server answers 2xx.
+    def server_call(method, path, server: next_server, query: nil, json: nil, form: nil, headers: {}, timeout: 5, parse: true)
       uri = URI(server + path)
       uri.query = URI.encode_www_form(query) if query
       request = method == :get ? Net::HTTP::Get.new(uri, headers) : Net::HTTP::Post.new(uri, headers)
@@ -430,6 +463,8 @@ module Erupt
         http.request(request)
       end
       raise "#{uri.path} answered HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+      return response.body.to_s.dup.force_encoding(Encoding::UTF_8) unless parse
 
       response.body.to_s.empty? ? nil : JSON.parse(response.body)
     end

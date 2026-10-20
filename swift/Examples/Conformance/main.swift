@@ -14,7 +14,10 @@ struct NoteProxy: DataProxy {
 }
 
 do {
-    let category = try Model("Category") {
+    let category = try Model(
+        "Category", erupt: Erupt(drills: [Drill(link: Link(linkErupt: "Article"), title: "Articles")]),
+        drillJoin: ["Articles": DrillJoin(joinColumn: "category")]
+    ) {
         Field("id", pk: true)
         Field("name", "Name", search: true)
         Field("parent", "Parent", .number)
