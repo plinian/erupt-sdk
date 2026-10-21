@@ -50,7 +50,6 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
-      - uses: dart-lang/setup-dart@v1
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.1"
@@ -64,7 +63,6 @@ jobs:
           (cd dotnet && dotnet run --project tools/GenTypes -- ../schema)
           (cd rust && cargo run --bin gen-types -- ../schema)
           (cd ruby && ruby tools/gen_types.rb ../schema)
-          (cd dart && dart run tool/gen_types.dart ../schema)
           (cd swift && swift run erupt-gen-types ../schema)
           # jvm/ is erupt-cloud-node-lite in the erupt repository, built from erupt-annotation itself: nothing to generate
           (cd python && PYTHONPATH=src python -m unittest discover -s tests)

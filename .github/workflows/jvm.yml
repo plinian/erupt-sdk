@@ -1,7 +1,8 @@
 name: jvm
 
-# The JVM node is erupt-cloud-node-lite in the erupt repository; here only its examples and the conformance
-# suite run, against the erupt branch / tag given (develop by default).
+# The JVM nodes (erupt-cloud-node, erupt-cloud-node-lite) live in the erupt repository; here only their examples and the conformance
+# suite run: the lite ones against the erupt branch / tag given (develop by default), the Spring blog against the
+# released erupt.
 on:
   # also run by release.yml before anything is published
   workflow_call:
@@ -46,3 +47,15 @@ jobs:
           python-version: "3.12"
       - name: Conformance
         run: python conformance/run.py -- java -jar jvm/examples/conformance/target/erupt-conformance.jar
+
+  spring-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Spring blog against the released erupt-cloud-node-jpa
+        run: mvn -B -q -f jvm/examples/spring-blog/pom.xml package

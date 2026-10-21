@@ -1,5 +1,5 @@
 # Publishes one language per tag: python/v1.2.3, ts/v1.2.3, go/v1.2.3, php/v1.2.3, dotnet/v1.2.3, rust/v1.2.3,
-# ruby/v1.2.3, dart/v1.2.3, swift/v1.2.3. The JVM node (xyz.erupt:erupt-cloud-node-lite) is released with erupt.
+# ruby/v1.2.3, swift/v1.2.3. The JVM node (xyz.erupt:erupt-cloud-node-lite) is released with erupt.
 # Each runs that language's full CI first and refuses a tag that differs from the package version.
 # Publishing uses OpenID Connect trusted publishing; no registry token is stored in this repository.
 # One-time setup per registry: see RELEASING.md.
@@ -7,7 +7,7 @@ name: release
 
 on:
   push:
-    tags: ["python/v*", "ts/v*", "go/v*", "php/v*", "dotnet/v*", "rust/v*", "ruby/v*", "dart/v*", "swift/v*"]
+    tags: ["python/v*", "ts/v*", "go/v*", "php/v*", "dotnet/v*", "rust/v*", "ruby/v*", "swift/v*"]
 
 permissions:
   contents: read
@@ -23,7 +23,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          [[ "$TAG" =~ ^(python|ts|go|php|dotnet|rust|ruby|dart|swift)/v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]] || { echo "illegal tag $TAG"; exit 1; }
+          [[ "$TAG" =~ ^(python|ts|go|php|dotnet|rust|ruby|swift)/v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]] || { echo "illegal tag $TAG"; exit 1; }
           echo "lang=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           echo "version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
 
@@ -249,37 +249,6 @@ jobs:
       - run: gem build erupt-sdk.gemspec
       - run: gem push "erupt-sdk-$VERSION.gem"
 
-  # ---------------------------------------------------------------- GitHub release
-
-  # ---------------------------------------------------------------- dart -> pub.dev
-
-  dart-ci:
-    needs: meta
-    if: needs.meta.outputs.lang == 'dart'
-    uses: ./.github/workflows/dart.yml
-
-  dart:
-    needs: [meta, dart-ci]
-    runs-on: ubuntu-latest
-    environment: pub-dev
-    permissions:
-      id-token: write
-    env:
-      VERSION: ${{ needs.meta.outputs.version }}
-    defaults:
-      run:
-        working-directory: dart
-    steps:
-      - uses: actions/checkout@v4
-      # trusted publishing: setup-dart exchanges the workflow's OIDC token for pub.dev credentials
-      - uses: dart-lang/setup-dart@v1
-      - name: Tag matches the package version
-        run: |
-          grep -qx "version: $VERSION" pubspec.yaml || { echo "pubspec.yaml is not $VERSION"; exit 1; }
-          grep -qx "const version = '$VERSION';" lib/src/node.dart || { echo "version in lib/src/node.dart is not $VERSION"; exit 1; }
-      - run: dart pub get
-      - run: dart pub publish --force
-
   # ---------------------------------------------------------------- swift -> SwiftPM (via a split repository)
 
   swift-ci:
@@ -313,8 +282,10 @@ jobs:
           git tag "$VERSION" swift-split
           git push "$url" "$VERSION"
 
+  # ---------------------------------------------------------------- GitHub release
+
   github-release:
-    needs: [meta, python, ts, go, php, dotnet, rust, ruby, dart, swift]
+    needs: [meta, python, ts, go, php, dotnet, rust, ruby, swift]
     # exactly one language job ran; the others are skipped
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
