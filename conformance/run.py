@@ -387,9 +387,6 @@ def references(n):
 
 @check
 def drill(n):
-    # the JVM lite node drills from erupt 2.4.0; the conformance example still runs 2.3.0
-    if not invoked():
-        return
     clear_articles(n)
     add(n, title="Py", category={"id": 2, "name": "Python"})
     add(n, title="Other", category={"id": 3, "name": "Life"})
