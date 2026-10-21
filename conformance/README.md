@@ -11,7 +11,6 @@ python conformance/run.py -- node ts/dist/examples/conformance.js
 python conformance/run.py -- php php/examples/conformance.php
 (cd rust && cargo build --release --example conformance) && python conformance/run.py -- rust/target/release/examples/conformance
 python conformance/run.py -- ruby ruby/examples/conformance.rb
-(cd dart && dart pub get && dart compile exe example/conformance.dart -o /tmp/erupt-dart-conformance) && python conformance/run.py -- /tmp/erupt-dart-conformance
 (cd swift && swift build -c release --product Conformance) && python conformance/run.py -- swift/.build/release/Conformance
 mvn -B -q -f jvm/examples/pom.xml -pl conformance package && python conformance/run.py -- java -jar jvm/examples/conformance/target/erupt-conformance.jar
 (cd dotnet && dotnet build -c Release) && python conformance/run.py -- dotnet dotnet/examples/Conformance/bin/Release/net8.0/Conformance.dll
