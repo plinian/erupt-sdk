@@ -2,6 +2,10 @@
 
 Serve Ruby models as an erupt admin UI. Zero gem dependencies, Ruby 3.1+.
 
+```bash
+gem install erupt-sdk      # or in a Gemfile: gem "erupt-sdk"
+```
+
 ```ruby
 require "erupt"
 
@@ -123,6 +127,17 @@ A single connection is used by one thread at a time. Without a sort, every repos
 key ascending. `Erupt.current_user` returns the acting user inside a repository call.
 
 Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload, Excel, i18n of messages.
+
+## Without a registry
+
+From the repository, without RubyGems (Bundler):
+
+```ruby
+gem "erupt-sdk", git: "https://github.com/erupt-io/erupt-sdk", tag: "ruby/v0.1.0", glob: "ruby/*.gemspec"
+```
+
+Or copy `ruby/lib/` (`erupt.rb` and `erupt/`, including its `.json` files) onto your load path and
+`require "erupt"`. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `Erupt::VERSION` untouched so the server shows which release the node runs.
 
 ## Generated code
 

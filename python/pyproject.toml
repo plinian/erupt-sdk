@@ -12,4 +12,4 @@ license = { text = "Apache-2.0" }
 dependencies = []
 
 [tool.setuptools.package-data]
-erupt = ["_defaults.json"]
+erupt = ["*.json"]

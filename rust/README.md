@@ -101,6 +101,17 @@ The built-in server (`Node::serve`) is HTTP/1.1 on std::net with a thread pool, 
 connection, 64 KiB header and 16 MiB body limits and 30 s timeouts. Calls back to the erupt server
 (registration, per-user power) are plain `http://`; put a TLS-terminating proxy in front of an https server.
 
+## Without a registry
+
+From the repository, without crates.io (Cargo finds the crate inside the repository):
+
+```toml
+erupt-sdk = { git = "https://github.com/erupt-io/erupt-sdk", tag = "rust/v0.1.0", features = ["sqlite"] }
+```
+
+Or copy `rust/` (`Cargo.toml`, `src/` and the two `.json` files, which are compiled in) into your workspace and
+use `erupt-sdk = { path = "third_party/erupt-sdk", features = ["sqlite"] }`. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `VERSION` in `node.rs` untouched so the server shows which release the node runs.
+
 ## Generated code
 
 `src/types.rs` is generated from the erupt annotation JSON Schema; the schema and the field templates are

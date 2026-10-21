@@ -2,6 +2,10 @@
 
 Serve Node.js models as an erupt admin UI. Node 22+, zero runtime dependencies.
 
+```bash
+npm install erupt-sdk
+```
+
 ```ts
 import { field, model, Node, SqliteRepository } from "erupt-sdk";
 
@@ -113,6 +117,20 @@ its local fields, which is how pg and mysql2 build it from a column without a ti
 
 Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload,
 Excel, i18n of messages.
+
+## Without a registry
+
+npm cannot install a subdirectory of a git repository, so build a tarball from the repository:
+
+```bash
+git clone --depth 1 -b ts/v0.1.0 https://github.com/erupt-io/erupt-sdk && cd erupt-sdk/ts
+npm ci && npm pack                       # erupt-sdk-0.1.0.tgz
+npm install /path/to/erupt-sdk-0.1.0.tgz # in your project
+```
+
+Or copy `ts/src/` into your project and compile it with your own sources: it needs Node 22+, TypeScript 5.3+,
+`"module": "nodenext"` and `"resolveJsonModule": true`, and keeps `schema.json` and `defaults.json` next to the
+code. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `VERSION` in `node.ts` untouched so the server shows which release the node runs.
 
 ## Development
 

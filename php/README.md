@@ -123,6 +123,20 @@ the operation and refuses to run it. A returned string is executed as JavaScript
 return only code you wrote. Throw `Erupt\Fail` to show the user a message; any other exception answers 500.
 `Node::currentUser()` returns the acting user anywhere in a request.
 
+## Without a registry
+
+Without Packagist, point Composer at the read-only split repository:
+
+```json
+{
+  "repositories": [{ "type": "vcs", "url": "https://github.com/erupt-io/erupt-sdk-php" }],
+  "require": { "erupt-io/erupt-sdk": "^0.1" }
+}
+```
+
+Or copy `php/` (`autoload.php`, `src/` and `resources/`) into your project and `require` its `autoload.php`.
+A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `Node::VERSION` untouched so the server shows which release the node runs.
+
 ## Differences from the Python SDK
 
 - Operation code defaults to the method name; `show` names a static method instead of taking a lambda.

@@ -128,6 +128,14 @@ let articles = try SQLRepository(postgres, table: "article")
 Every value is a bound parameter; identifiers are the model's checked field names, quoted; LIKE escapes with
 `ESCAPE '!'`. On Linux, `EruptSQLite` needs `libsqlite3-dev` (`apt install libsqlite3-dev`).
 
+## Without a registry
+
+SwiftPM reads git repositories directly, so the package above needs no registry. It is the read-only split
+of `swift/` in https://github.com/erupt-io/erupt-sdk; SwiftPM cannot use that subdirectory itself, since it needs `Package.swift` at the root.
+
+To vendor it instead, copy `swift/Sources/EruptSDK/` into your package as a target with no dependencies (add
+`EruptSQLite` and `CSQLite` the same way for SQLite). A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `version` in `Node.swift` untouched so the server shows which release the node runs.
+
 ## Development
 
 ```bash

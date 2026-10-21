@@ -107,6 +107,18 @@ MySQL / SQL Server), values parameterized as `@pN`, LIKE escaped with `ESCAPE '!
 | SQL Server 2012+ | `Quote = ("[", "]"), Paging = Paging.OffsetFetch` |
 | Oracle 12c+ | `ParameterPrefix = ":", Paging = Paging.OffsetFetch` |
 
+## Without a registry
+
+NuGet has no git source. Without nuget.org, copy `dotnet/src/Erupt.Sdk/` (the `.csproj`, the sources and
+`Resources/`, which the project embeds) into your solution and reference it:
+
+```bash
+dotnet add reference third_party/Erupt.Sdk/Erupt.Sdk.csproj
+```
+
+Or `dotnet pack dotnet/src/Erupt.Sdk -o ./packages` and add `./packages` as a local package source.
+A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `Node.Version` untouched so the server shows which release the node runs.
+
 ## Generated code
 
 `src/Erupt.Sdk/Types.g.cs` and the embedded `Resources/*.json` come from the erupt schema:

@@ -3,6 +3,10 @@
 Serve Go models as an erupt admin UI through an erupt cloud server. Standard library only at runtime,
 Go 1.21+.
 
+```bash
+go get github.com/erupt-io/erupt-sdk/go
+```
+
 ```go
 import erupt "github.com/erupt-io/erupt-sdk/go"
 
@@ -86,6 +90,20 @@ bound parameter; dates are stored as ISO text. `AutoCreate` creates the table wi
 `Config.Address`) and `node.Deregister()` yourself, or let `ListenAndServe` do all three.
 
 Not yet: sub-tables, TPL operations, depend fields of references, tree models, file upload, Excel.
+
+## Without a registry
+
+Go modules come straight from GitHub, so no registry is involved: a `go/vX.Y.Z` tag is the release, and
+`GOPROXY=direct` skips the module proxy too.
+
+To vendor it instead, copy `go/` without the tests (`go.mod`, the `.go` files and the two `.json` files, which
+are embedded) into your repository and redirect the import path:
+
+```bash
+go mod edit -replace github.com/erupt-io/erupt-sdk/go=./third_party/erupt
+```
+
+A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `Version` in `node.go` untouched so the server shows which release the node runs.
 
 ## Generated code
 

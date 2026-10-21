@@ -2,6 +2,10 @@
 
 Serve Python models as an erupt admin UI. Zero dependencies, Python 3.9+.
 
+```bash
+pip install erupt-sdk
+```
+
 ```python
 import datetime, os
 from erupt import Field, Node, SqliteRepository, erupt
@@ -88,6 +92,17 @@ Without a sort, every repository returns rows by primary key ascending. `erupt.c
 acting user inside a repository call.
 
 Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload, Excel, i18n of messages.
+
+## Without a registry
+
+From the repository, without PyPI:
+
+```bash
+pip install "erupt-sdk @ git+https://github.com/erupt-io/erupt-sdk@python/v0.1.0#subdirectory=python"
+```
+
+Or copy `python/src/erupt/` into your project as the package `erupt`; it has no dependencies, keep the two
+`.json` files next to the code. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `__version__` in `node.py` untouched so the server shows which release the node runs.
 
 ## Generated code
 
