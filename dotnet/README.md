@@ -68,6 +68,62 @@ var article = EruptModel.Of<Article>()
 returning a non-empty string has it run as JavaScript in the browser, so return only code you wrote; throw
 `EruptFailure` to show the user a message. `EruptNode.CurrentUser` is the acting user anywhere in a request.
 
+## DataProxy
+
+Hooks around a model's reads and writes, as erupt's Java `DataProxy`. Implement only the methods you need
+(the others default to no-ops); throw `EruptFailure` to refuse with a message the user sees.
+
+```csharp
+class ArticleProxy : IDataProxy
+{
+    public void AddBehavior(Record record) => record["status"] = "draft";        // the new form's values
+
+    public void Validate(Record record)                                           // before every add and update
+    {
+        if ((record["title"] as string ?? "").Contains("spam")) throw new EruptFailure("no spam");
+    }
+
+    public SqlFilter? BeforeFetch(IReadOnlyList<Cond> conditions) =>             // SQL ANDed to the table's WHERE, values bound
+        new("owner = ?", EruptNode.CurrentUser?.Uid);
+
+    public void AfterFetch(IReadOnlyList<JsonObject> rows)                       // a table page, before it is sent
+    {
+        foreach (var row in rows) row["title"] = row["title"]?.GetValue<string>().Trim();
+    }
+}
+
+[EruptModel("Article", DataProxy = [typeof(ArticleProxy)])]                     // one or more, run in this order
+class Article { ... }
+```
+
+| Hook | Runs |
+|------|------|
+| `SearchCondition(condition)` | building the model: default values of the search bar |
+| `BeforeFetch(conditions)` | before a table page is read: SQL ANDed to its WHERE as written, `"sql"` or `new SqlFilter("sql with ?", values)` (with values, each `?` is one of them); SQL repositories only, `MemoryRepository` refuses it |
+| `AfterFetch(rows)` | after a table page is read |
+| `AddBehavior(record)` | for the new record form (`init-value`) |
+| `EditBehavior(record)` | after a record is read by its key (edit form, detail view) |
+| `Validate(record)` | before an add or an update |
+| `BeforeAdd` / `AfterAdd(record)` | around `AddAsync` |
+| `BeforeUpdate` / `AfterUpdate(record)` | around `UpdateAsync`, with the submitted values |
+| `BeforeDelete` / `AfterDelete(record)` | around `DeleteAsync`, once per record as stored |
+
+## Views
+
+`Vis(...)` on the builder declares one extra view of `@Erupt(vis = ...)`. Its `filter` (SQL strings, each ANDed
+as written) and `orderBy` (as `OrderBy`) are applied by the node when the table is read for that view, and kept
+out of the build, as Java keeps them `@Transient`; they are SDK-only arguments, not properties of the generated
+`Vis`. A view without a `Code` is addressed by its title. Like `BeforeFetch`, a filter needs a SQL repository.
+`EruptOptions.Vis` declares views without them, and replaces the views declared so far.
+
+```csharp
+EruptModel.Of<TaskItem>()
+    .Vis(new Vis { Title = "Board", Type = VisType.BOARD, BoardView = new BoardView { GroupField = "status" } }, filter: "archived = 0")
+    .Vis(new Vis { Title = "Recent", Type = VisType.TABLE }, orderBy: "created desc");
+```
+
+Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
+
 ## Run
 
 ```csharp

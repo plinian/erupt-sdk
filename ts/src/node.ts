@@ -37,8 +37,8 @@ class Reply extends Error {
   }
 }
 
-/** A business error shown to the user as an R message. */
-class Fail extends Error {}
+/** A business error shown to the user as a message: throw it from a DataProxy hook or an operation. */
+export class Fail extends Error {}
 
 const r = (success = true, message: string | null = null, data: unknown = null) =>
   ({ success, status: success ? "SUCCESS" : "ERROR", message, data, promptWay: "MESSAGE" });
@@ -83,7 +83,6 @@ export class Node {
     this.address = options.address?.replace(/\/+$/, "") ?? null;
     this.routes = [
       ["GET", /^\/erupt-api\/build\/([^/]+)$/, this.build],
-      ["GET", /^\/erupt-api\/build\/([^/]+)\/([^/]+)$/, this.buildByField],
       ["POST", /^\/erupt-api\/data\/table\/([^/]+)$/, this.table],
       ["POST", /^\/erupt-api\/data\/([^/]+)\/reference-table\/([^/]+)$/, this.referenceTable],
       ["POST", /^\/erupt-api\/data\/([^/]+)\/operator\/([^/]+)\/form-value$/, this.operationFormValue],
@@ -196,12 +195,6 @@ export class Node {
     return model.buildModel(await this.power(model, req), currentUser());
   }
 
-  // the reference picker: build of the referenced model, requested under the host model's name
-  private async buildByField(model: Model, _repo: Repository, req: Request, field: string): Promise<unknown> {
-    const target = referenceField(model, field).target!;
-    return target.buildModel(await this.power(target, req), currentUser());
-  }
-
   private async table(model: Model, repo: Repository, req: Request): Promise<unknown> {
     await this.require(model, req, "query");
     return this.page(model, repo, objectBody(req));
@@ -222,17 +215,24 @@ export class Node {
       if (!f || !(f.sortable || f.pk)) throw new Fail(`illegal sort field '${isObject(s) ? s.field : s}'`);
       query.sort.push([f.name, String((s as Record<string, unknown>).direction ?? "ASC").toUpperCase() === "DESC"]);
     }
-    if (!query.sort.length) query.sort = [...model.orderBy];
+    // a @Vis view's own filter and order, then the DataProxy's
+    const [filters, sort] = model.vis.get(body.vis) ?? [[], []];
+    if (!query.sort.length) query.sort = [...(sort.length ? sort : model.orderBy)];
+    query.filters = [...filters, ...await model.filters(query.conditions)];
     const [total, records] = await repo.page(query);
+    const rows = this.rows(model, records);
+    await model.hook("afterFetch", rows);
     return {
-      pageIndex, pageSize, total, totalPage: Math.ceil(total / pageSize), list: this.rows(model, records),
+      pageIndex, pageSize, total, totalPage: Math.ceil(total / pageSize), list: rows,
       sort: null, alert: null, extraContent: null,
     };
   }
 
   private async initValue(model: Model, _repo: Repository, req: Request): Promise<unknown> {
     await this.require(model, req, "add");
-    return Object.fromEntries(Object.keys(model.fields).map((name) => [name, null]));
+    const record = Object.fromEntries(Object.keys(model.fields).map((name) => [name, null]));
+    await model.hook("addBehavior", record);
+    return this.rows(model, [record])[0];
   }
 
   private async get(model: Model, repo: Repository, req: Request, pk: string): Promise<unknown> {
@@ -240,12 +240,17 @@ export class Node {
     if (!(power.edit || power.viewDetails)) throw new Reply(403);
     const record = await repo.get(primaryKey(model, pk));
     if (!record) throw new Fail("record not found");
+    await model.hook("editBehavior", record);
     return this.rows(model, [record])[0];
   }
 
   private async add(model: Model, repo: Repository, req: Request): Promise<unknown> {
     await this.require(model, req, "add");
-    await repo.add(coerceRecord(model, objectBody(req)));
+    const record = coerceRecord(model, objectBody(req));
+    await model.hook("validate", record);
+    await model.hook("beforeAdd", record);
+    await repo.add(record);
+    await model.hook("afterAdd", record);
     return r();
   }
 
@@ -254,7 +259,11 @@ export class Node {
     const body = objectBody(req);
     const pk = primaryKey(model, body[model.pk!]);
     if (!(await repo.get(pk))) throw new Fail("record not found");
-    await repo.update(pk, coerceRecord(model, body));
+    const record = coerceRecord(model, body);
+    await model.hook("validate", record);
+    await model.hook("beforeUpdate", record);
+    await repo.update(pk, record);
+    await model.hook("afterUpdate", record);
     return r();
   }
 
@@ -262,7 +271,12 @@ export class Node {
     await this.require(model, req, "delete");
     const body = readJson(req);
     if (!Array.isArray(body)) throw new Fail("a list of ids is required");
-    await repo.delete(body.map((pk) => primaryKey(model, pk)));
+    const pks = body.map((pk) => primaryKey(model, pk));
+    // the hooks see each record as it was; reading them costs nothing without a proxy
+    const records = model.proxies.length ? (await Promise.all(pks.map((pk) => repo.get(pk)))).filter((x) => x != null) : [];
+    for (const record of records) await model.hook("beforeDelete", record);
+    await repo.delete(pks);
+    for (const record of records) await model.hook("afterDelete", record);
     return r();
   }
 

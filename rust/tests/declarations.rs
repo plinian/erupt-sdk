@@ -49,6 +49,14 @@ fn rejects_unknown_annotation_values() {
             "expected integer",
         ),
         (base().order_by("missing desc"), "illegal order_by"),
+        (
+            base().raw(json!({"vis": [{"title": "V", "orderBy": "missing"}]})),
+            "illegal order_by",
+        ),
+        (
+            base().raw(json!({"vis": [{"title": "V", "filter": 1}]})),
+            "a vis filter must be SQL text",
+        ),
         (base().power(json!({"remove": false})), "illegal power"),
         (base().field("id2", Field::pk()), "at most one"),
         (

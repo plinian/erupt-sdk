@@ -71,7 +71,7 @@ The edit type follows the property type: `string` INPUT, `int` / `float` NUMBER,
 `DateTimeInterface` DATE_TIME, another #[Erupt] class a reference; `type:` overrides it (`'DATE'`,
 `'TEXTAREA'`), `choices:` makes a CHOICE. Options: `search`, `notNull`, `sortable`, `table` (column),
 `form`, and raw `view:` / `edit:` attributes. #[Erupt] takes `power: ['delete' => false]`,
-`orderBy: 'views desc, id'` (applied by the node) and raw `raw:` attributes (`['layout' => ['pageSize' => 30]]`).
+`orderBy: 'views desc, id'` (applied by the node), `dataProxy:` ([DataProxy](#dataproxy)) and raw `raw:` attributes (`['layout' => ['pageSize' => 30]]`).
 
 Raw attributes are described by the generated array shapes in `Erupt\Types\Annotations` and the enums
 in `Erupt\Types` (`EditType`, `RowOperationMode`, ...), and checked against the erupt annotation schema
@@ -122,6 +122,76 @@ string replaces its text. `show: 'isRoot'` names a static method taking the user
 the operation and refuses to run it. A returned string is executed as JavaScript in the browser, so
 return only code you wrote. Throw `Erupt\Fail` to show the user a message; any other exception answers 500.
 `Node::currentUser()` returns the acting user anywhere in a request.
+
+## DataProxy
+
+Hooks around a model's reads and writes, as erupt's Java `DataProxy`. Extend `Erupt\DataProxy` and override
+what you need; records and rows come by reference, change them in place. Throw `Erupt\Fail` to refuse with a
+message the user sees.
+
+```php
+use Erupt\{DataProxy, Fail, Node};
+
+final class ArticleProxy extends DataProxy
+{
+    public function addBehavior(array &$record): void      // the new form's values
+    {
+        $record['status'] = 'draft';
+    }
+
+    public function validate(array &$record): void         // before every add and update
+    {
+        if (str_contains($record['title'] ?? '', 'spam')) {
+            throw new Fail('no spam');
+        }
+    }
+
+    public function beforeFetch(array $conditions): string|array|null   // SQL ANDed to the table's WHERE, values bound
+    {
+        return ['owner = ?', [Node::currentUser()['uid']]];
+    }
+
+    public function afterFetch(array &$rows): void         // a table page, before it is sent
+    {
+        foreach ($rows as &$row) {
+            $row['title'] = trim($row['title']);
+        }
+    }
+}
+
+#[Erupt('Article', dataProxy: ArticleProxy::class)]   // one proxy or a list, classes or instances
+final class Article { /* ... */ }
+```
+
+| Hook | Runs |
+|------|------|
+| `searchCondition(&$condition)` | building the model: default values of the search bar |
+| `beforeFetch($conditions)` | before a table page is read: SQL ANDed to its WHERE as written, `'sql'` or `['sql with ?', [values]]` (with values, each `?` is one of them); SQL repositories only, `MemoryRepository` refuses it |
+| `afterFetch(&$rows)` | after a table page is read |
+| `addBehavior(&$record)` | for the new record form (`init-value`) |
+| `editBehavior(&$record)` | after a record is read by its key (edit form, detail view) |
+| `validate(&$record)` | before an add or an update |
+| `beforeAdd` / `afterAdd(&$record)` | around `Repository::add` |
+| `beforeUpdate` / `afterUpdate(&$record)` | around `Repository::update`, with the submitted values |
+| `beforeDelete` / `afterDelete(&$record)` | around `Repository::delete`, once per record as stored |
+
+## Views
+
+`raw: ['vis' => ...]` declares the extra views of `@Erupt(vis = ...)`. A view's `filter` (one SQL string or a
+list, ANDed as written) and `orderBy` (as the model's `orderBy`) are applied by the node when the table is read
+for that view, and kept out of the build, as Java keeps them `@Transient`; they are not in the generated
+`Erupt\Types\Annotations`. A view without a `code` is addressed by its title. Like `beforeFetch`, a filter needs
+a SQL repository.
+
+```php
+#[Erupt('Task', raw: ['vis' => [
+    ['title' => 'Board', 'type' => 'BOARD', 'boardView' => ['groupField' => 'status'], 'filter' => 'archived = 0'],
+    ['title' => 'Recent', 'type' => 'TABLE', 'orderBy' => 'created desc'],
+]])]
+final class Task { /* ... */ }
+```
+
+Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
 ## Without a registry
 

@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 
-from erupt import Field, MemoryRepository, Node, SqliteRepository, _schema, erupt, operation
+from erupt import DataProxy, Fail, Field, current_user, MemoryRepository, Node, SqliteRepository, _schema, erupt, operation
 
 TOKEN = "node-secret"
 
@@ -70,6 +70,72 @@ class Widget:
     attrs: dict = Field("Attributes", edit={"type": "KEY_VALUE"})
 
 
+class MemoProxy(DataProxy):
+    calls = []
+
+    def search_condition(self, condition):
+        condition["text"] = "hi"
+
+    def after_fetch(self, rows):
+        for row in rows:
+            row["text"] = row["text"].upper()
+
+    def add_behavior(self, record):
+        record["text"] = "new"
+
+    def edit_behavior(self, record):
+        record["text"] += "?"
+
+    def validate(self, record):
+        if record.get("text") == "forbidden":
+            raise Fail("forbidden text")
+
+    # the write hooks only record that they ran, with the text they saw
+    def before_add(self, record):
+        self.calls.append(("before_add", record["text"]))
+
+    def after_add(self, record):
+        self.calls.append(("after_add", record["text"]))
+
+    def before_update(self, record):
+        self.calls.append(("before_update", record["text"]))
+
+    def after_update(self, record):
+        self.calls.append(("after_update", record["text"]))
+
+    def before_delete(self, record):
+        self.calls.append(("before_delete", record["text"]))
+
+    def after_delete(self, record):
+        self.calls.append(("after_delete", record["text"]))
+
+
+@erupt("Memo", data_proxy=MemoProxy)
+class Memo:
+    id: int = Field(pk=True)
+    text: str = Field("Text")
+
+
+class TaskProxy(DataProxy):
+    def before_fetch(self, conditions):
+        return "owner = ?", [current_user()["account"]]
+
+
+class OpenProxy(DataProxy):
+    def before_fetch(self, conditions):
+        return "done = 0"
+
+
+@erupt("Task", data_proxy=[TaskProxy, OpenProxy], vis=[
+    {"code": "q", "title": "Question", "type": "TABLE", "filter": "title = 'a?'"},
+    {"title": "Reversed", "type": "TABLE", "filter": ["1 = 1", "2 = 2"], "orderBy": "title desc"}])
+class Task:
+    id: int = Field(pk=True)
+    title: str = Field("Title", search=True)
+    owner: str = Field("Owner")
+    done: bool = Field("Done")
+
+
 class NodeTest(unittest.TestCase):
     repo_factory = staticmethod(lambda: MemoryRepository())
     widget_factory = staticmethod(lambda: MemoryRepository())
@@ -83,7 +149,9 @@ class NodeTest(unittest.TestCase):
         self.node.register(Article, self.repo_factory())
         self.node.register(Note, MemoryRepository())
         self.node.register(Widget, self.widget_factory())
+        self.node.register(Memo, MemoryRepository())
         CALLS.clear()
+        MemoProxy.calls.clear()
 
     def call(self, method, path, body=None, erupt="Article", headers=None, account="admin"):
         raw = b"" if body is None else json.dumps(body).encode()
@@ -213,11 +281,27 @@ class NodeTest(unittest.TestCase):
         _, r = self.call("GET", f"/erupt-api/data/Widget/{a['id']}", erupt="Widget")
         self.assertEqual(["ADMIN", "USER"], r["roles"])
 
+    def test_data_proxy(self):
+        _, build = self.call("GET", "/erupt-api/build/Memo", erupt="Memo")
+        self.assertEqual({"text": "hi"}, build["eruptModel"]["searchCondition"])
+        self.assertEqual("new", self.call("GET", "/erupt-api/data/init-value/Memo", erupt="Memo")[1]["text"])
+        _, r = self.call("POST", "/erupt-api/data/modify/Memo", {"text": "forbidden"}, erupt="Memo")
+        self.assertEqual((False, "forbidden text"), (r["success"], r["message"]))
+        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Memo", {"text": "a"}, erupt="Memo")[1]["success"])
+        _, page = self.call("POST", "/erupt-api/data/table/Memo", {}, erupt="Memo")
+        self.assertEqual(["A"], [row["text"] for row in page["list"]])
+        pk = page["list"][0]["id"]
+        self.assertEqual("a?", self.call("GET", f"/erupt-api/data/Memo/{pk}", erupt="Memo")[1]["text"])
+        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Memo/update", {"id": pk, "text": "b"}, erupt="Memo")[1]["success"])
+        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Memo/delete", [pk], erupt="Memo")[1]["success"])
+        self.assertEqual([("before_add", "a"), ("after_add", "a"), ("before_update", "b"), ("after_update", "b"),
+                          ("before_delete", "b"), ("after_delete", "b")], MemoProxy.calls)
+
+    def test_before_fetch_needs_sql(self):
+        self.node.register(Task, MemoryRepository())
+        self.assertEqual(500, self.call("POST", "/erupt-api/data/table/Task", {}, erupt="Task")[0])
+
     def test_reference(self):
-        status, build = self.call("GET", "/erupt-api/build/Article/category")
-        self.assertEqual(200, status)
-        self.assertEqual("Category", build["eruptModel"]["eruptName"])
-        self.assertEqual(404, self.call("GET", "/erupt-api/build/Article/title")[0])
         _, page = self.call("POST", "/erupt-api/data/Article/reference-table/category",
                             {"pageIndex": 1, "pageSize": 10, "condition": [{"key": "name", "expression": "LIKE", "value": "py"}]})
         self.assertEqual([{"id": 2, "name": "Python", "parent": 1}], page["list"])
@@ -310,6 +394,25 @@ class SqliteNodeTest(NodeTest):
 
     def tearDown(self):
         os.remove(self.db)
+
+    def test_before_fetch(self):
+        self.node.register(Task, SqliteRepository(self.db, "task"))
+        for title, owner, done in [("a", "admin", False), ("b", "admin", True), ("c", "root", False), ("a?", "admin", False)]:
+            self.call("POST", "/erupt-api/data/modify/Task", {"title": title, "owner": owner, "done": done}, erupt="Task")
+        _, page = self.call("POST", "/erupt-api/data/table/Task", {}, erupt="Task")
+        self.assertEqual(["a", "a?"], [r["title"] for r in page["list"]])
+        _, page = self.call("POST", "/erupt-api/data/table/Task", {"condition": [{"key": "title", "expression": "EQ", "value": "a"}]},
+                            erupt="Task", account="root")
+        self.assertEqual([], page["list"])
+        # a view's own filter and order run on the node, and stay out of the build
+        _, page = self.call("POST", "/erupt-api/data/table/Task", {"vis": "q"}, erupt="Task")
+        self.assertEqual(["a?"], [r["title"] for r in page["list"]])
+        _, page = self.call("POST", "/erupt-api/data/table/Task", {"vis": "Reversed"}, erupt="Task")
+        self.assertEqual(["a?", "a"], [r["title"] for r in page["list"]])
+        _, build = self.call("GET", "/erupt-api/build/Task", erupt="Task")
+        self.assertEqual([{"code": "q", "title": "Question", "type": "TABLE"}, {"code": "Reversed", "title": "Reversed", "type": "TABLE"}],
+                         [{k: v[k] for k in ("code", "title", "type")} for v in build["eruptModel"]["eruptJson"]["vis"]])
+        self.assertFalse(any("filter" in v or "orderBy" in v for v in build["eruptModel"]["eruptJson"]["vis"]))
 
     def test_like_escapes_wildcards(self):
         self.add(title="100% pure")

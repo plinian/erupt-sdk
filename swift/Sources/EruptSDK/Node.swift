@@ -186,7 +186,6 @@ public final class Node: @unchecked Sendable {
 
     private static let routes: [Route] = [
         ("GET", ["build", "*"], { $0.build }),
-        ("GET", ["build", "*", "*"], { $0.buildByField }),
         ("POST", ["data", "table", "*"], { $0.table }),
         ("POST", ["data", "*", "reference-table", "*"], { $0.referenceTable }),
         ("POST", ["data", "*", "operator", "*", "form-value"], { $0.operationFormValue }),
@@ -261,28 +260,19 @@ public final class Node: @unchecked Sendable {
 
     private func build(_ c: Context) throws -> JSON { c.model.buildModel(power: try power(c.model, c), user: c.user) }
 
-    // the reference picker: build of the referenced model, requested under the host model's name
-    private func buildByField(_ c: Context) throws -> JSON {
-        let target = try referenceField(c.model, c.arg!).reference!.target
-        return target.buildModel(power: try power(target, c), user: c.user)
-    }
-
     private func table(_ c: Context) throws -> JSON {
         try requirePower(c.model, c, "query")
         return try page(c.model, c.repo, try readObject(c))
     }
 
     private func referenceTable(_ c: Context) throws -> JSON {
-        let target = try referenceField(c.model, c.arg!, EditType.referenceTable).reference!.target
+        guard let f = c.model.field(c.arg!), f.type == EditType.referenceTable.rawValue, let target = f.reference?.target else {
+            throw Reply(status: 404)
+        }
         guard let entry = lock.locked({ models[target.name] }), entry.model === target else {
             throw DeclarationError("referenced erupt '\(target.name)' is not registered on this node")
         }
         return try page(target, entry.repo, try readObject(c))
-    }
-
-    private func referenceField(_ model: Model, _ name: String, _ type: EditType? = nil) throws -> Field {
-        guard let f = model.field(name), f.isReference, type == nil || f.type == type!.rawValue else { throw Reply(status: 404) }
-        return f
     }
 
     private func page(_ model: Model, _ repo: Repository, _ body: [String: JSON]) throws -> JSON {
@@ -295,11 +285,16 @@ public final class Node: @unchecked Sendable {
             guard let f = model.field(fieldName), f.sortable || f.pk else { throw EruptFailure("illegal sort field '\(fieldName)'") }
             query.sort.append((f.name, (s["direction"]?.text ?? "").uppercased() == "DESC"))
         }
-        if query.sort.isEmpty { query.sort = model.order }
+        // a @Vis view's own filter and order, then the DataProxy's
+        let vis = body["vis"]?.string.flatMap { model.vis[$0] }
+        if query.sort.isEmpty { query.sort = vis?.order.isEmpty == false ? vis!.order : model.order }
+        query.filters = (vis?.filters ?? []) + (try model.filters(query.conditions))
         let (total, records) = try repo.page(query)
+        var list = rows(model, records)
+        try model.hook { try $0.afterFetch(&list) }
         return [
             "pageIndex": .int(Int64(pageIndex)), "pageSize": .int(Int64(pageSize)), "total": .int(Int64(total)),
-            "totalPage": .int(Int64((total + pageSize - 1) / pageSize)), "list": .array(rows(model, records)),
+            "totalPage": .int(Int64((total + pageSize - 1) / pageSize)), "list": .array(list.map(JSON.object)),
             "sort": nil, "alert": nil, "extraContent": nil,
         ]
     }
@@ -333,19 +328,26 @@ public final class Node: @unchecked Sendable {
 
     private func initValue(_ c: Context) throws -> JSON {
         try requirePower(c.model, c, "add")
-        return .object(Dictionary(uniqueKeysWithValues: c.model.fieldNames.map { ($0, JSON.null) }))
+        var record = Record(uniqueKeysWithValues: c.model.fieldNames.map { ($0, JSON.null) })
+        try c.model.hook { try $0.addBehavior(&record) }
+        return .object(rows(c.model, [record])[0])
     }
 
     private func get(_ c: Context) throws -> JSON {
         let granted = try power(c.model, c)
         guard granted["edit"] == true || granted["viewDetails"] == true else { throw Reply(status: 403) }
-        guard let record = try c.repo.get(try pkOf(c.model, .string(c.arg!))) else { throw EruptFailure("record not found") }
-        return rows(c.model, [record])[0]
+        guard var record = try c.repo.get(try pkOf(c.model, .string(c.arg!))) else { throw EruptFailure("record not found") }
+        try c.model.hook { try $0.editBehavior(&record) }
+        return .object(rows(c.model, [record])[0])
     }
 
     private func add(_ c: Context) throws -> JSON {
         try requirePower(c.model, c, "add")
-        try c.repo.add(try record(c.model, try readObject(c)))
+        var rec = try record(c.model, try readObject(c))
+        try c.model.hook { try $0.validate(rec) }
+        try c.model.hook { try $0.beforeAdd(&rec) }
+        try c.repo.add(rec)
+        try c.model.hook { try $0.afterAdd(rec) }
         return r()
     }
 
@@ -354,21 +356,30 @@ public final class Node: @unchecked Sendable {
         let body = try readObject(c)
         let pk = try pkOf(c.model, body[c.model.pk!] ?? .null)
         guard try c.repo.get(pk) != nil else { throw EruptFailure("record not found") }
-        try c.repo.update(pk, try record(c.model, body))
+        var rec = try record(c.model, body)
+        try c.model.hook { try $0.validate(rec) }
+        try c.model.hook { try $0.beforeUpdate(&rec) }
+        try c.repo.update(pk, rec)
+        try c.model.hook { try $0.afterUpdate(rec) }
         return r()
     }
 
     private func delete(_ c: Context) throws -> JSON {
         try requirePower(c.model, c, "delete")
         guard let ids = try readJSON(c)?.array else { throw EruptFailure("a list of ids is required") }
-        try c.repo.delete(try ids.map { try pkOf(c.model, $0) })
+        let pks = try ids.map { try pkOf(c.model, $0) }
+        // the hooks see each record as it was; reading them costs nothing without a proxy
+        let records = c.model.proxies.isEmpty ? [] : try pks.compactMap { try c.repo.get($0) }
+        for rec in records { try c.model.hook { try $0.beforeDelete(rec) } }
+        try c.repo.delete(pks)
+        for rec in records { try c.model.hook { try $0.afterDelete(rec) } }
         return r()
     }
 
     /// Records to browser rows. A reference stays its key: the server resolves its label, the flattened
     /// <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
-    private func rows(_ model: Model, _ records: [Record]) -> [JSON] {
-        records.map { rec in .object(Dictionary(uniqueKeysWithValues: model.fieldNames.map { ($0, rec[$0] ?? .null) })) }
+    private func rows(_ model: Model, _ records: [Record]) -> [Record] {
+        records.map { rec in Record(uniqueKeysWithValues: model.fieldNames.map { ($0, rec[$0] ?? .null) }) }
     }
 
     private func action(_ c: Context) throws -> RowAction {

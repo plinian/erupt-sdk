@@ -2,7 +2,7 @@
 import datetime
 import os
 
-from erupt import Field, MemoryRepository, Node, erupt, operation
+from erupt import DataProxy, Fail, Field, MemoryRepository, Node, erupt, operation
 
 
 @erupt("Category")
@@ -44,7 +44,16 @@ class Article:
         pass
 
 
-@erupt("Note", power={"delete": False})
+class NoteProxy(DataProxy):
+    def add_behavior(self, record):
+        record["text"] = "new"
+
+    def validate(self, record):
+        if record.get("text") == "forbidden":
+            raise Fail("forbidden text")
+
+
+@erupt("Note", power={"delete": False}, data_proxy=NoteProxy)
 class Note:
     id: int = Field(pk=True)
     text: str = Field("Text")

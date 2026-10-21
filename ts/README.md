@@ -35,7 +35,7 @@ once it listens and `node.deregister()` on shutdown. `serve()` does all three (d
 `field.choice(title, { value: label })`, `field.ref(target, title)` and `field.of(editType, title)`.
 Options: `search`, `notNull`, `sortable`, `table` (column, default true), `form` (default true), and raw
 `view` / `edit` attributes. Model options: `power` (`{ delete: false }`), `orderBy` (`"views desc, id"`,
-applied by the node), raw `erupt` attributes (`{ layout: { pageSize: 30 } }`), `operations`.
+applied by the node), raw `erupt` attributes (`{ layout: { pageSize: 30 } }`), `operations`, `dataProxy`.
 
 Raw attributes are typed with the generated `View`, `Edit`, `Erupt`, `RowOperation` interfaces and checked
 against the erupt annotation schema when the model is declared, so a misspelt key or enum value throws
@@ -76,9 +76,66 @@ The key is the operation code. `mode`: `SINGLE` / `MULTI` (default) / `MULTI_ONL
 skips the dialog, a string replaces its text. `show: (user) => ...` hides the operation and refuses to run it.
 A returned string is executed as JavaScript in the browser, so return only code you wrote.
 
+## DataProxy
+
+Hooks around a model's reads and writes, as erupt's Java `DataProxy`. Implement what you need (each may be
+async); throw `Fail` to refuse with a message the user sees.
+
+```ts
+import { currentUser, type DataProxy, Fail } from "erupt-sdk";
+
+const articleProxy: DataProxy = {
+  addBehavior(record) {           // the new form's values
+    record.status = "draft";
+  },
+  validate(record) {              // before every add and update
+    if (String(record.title ?? "").includes("spam")) throw new Fail("no spam");
+  },
+  beforeFetch(conditions) {       // SQL ANDed to the table's WHERE, values bound
+    return ["owner = ?", [currentUser()!.uid]];
+  },
+  afterFetch(rows) {              // a table page, before it is sent
+    for (const row of rows) row.title = String(row.title).trim();
+  },
+};
+
+model("Article", { /* ... */ }, { dataProxy: articleProxy });   // one proxy or an array
+```
+
+| Hook | Runs |
+|------|------|
+| `searchCondition(condition)` | building the model: default values of the search bar |
+| `beforeFetch(conditions)` | before a table page is read: SQL ANDed to its WHERE as written, `"sql"` or `["sql with ?", [values]]` (with values, each `?` is one of them); SQL repositories only, `MemoryRepository` refuses it |
+| `afterFetch(rows)` | after a table page is read |
+| `addBehavior(record)` | for the new record form (`init-value`) |
+| `editBehavior(record)` | after a record is read by its key (edit form, detail view) |
+| `validate(record)` | before an add or an update |
+| `beforeAdd` / `afterAdd(record)` | around `repository.add` |
+| `beforeUpdate` / `afterUpdate(record)` | around `repository.update`, with the submitted values |
+| `beforeDelete` / `afterDelete(record)` | around `repository.delete`, once per record as stored |
+
+## Views
+
+`erupt.vis` declares the extra views of `@Erupt(vis = ...)`. A view's `filter` (one SQL string or an array, ANDed
+as written) and `orderBy` (as the model's) are SDK-only properties (`ModelVis`): the node applies them when the
+table is read for that view, and keeps them out of the build, as Java keeps them `@Transient`. A view without a
+`code` is addressed by its title. Like `beforeFetch`, a filter needs a SQL repository.
+
+```ts
+model("Task", { /* ... */ }, {
+  erupt: { vis: [
+    { title: "Board", type: "BOARD", boardView: { groupField: "status" }, filter: "archived = 0" },
+    { title: "Recent", type: "TABLE", orderBy: "created desc" },
+  ] },
+});
+```
+
+Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
+
 ## Storage
 
-A `Repository` implements `bind`, `page`, `get`, `add`, `update`, `delete` (sync or async).
+A `Repository` implements `bind`, `page`, `get`, `add`, `update`, `delete` (sync or async). `page` must apply
+`query.filters` (the SQL of a view filter and `beforeFetch`) or throw, never ignore them.
 `currentUser()` returns the acting user inside a repository or operation call. Shipped:
 
 - `MemoryRepository(seed?)`: in process, for tests and demos.

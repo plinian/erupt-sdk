@@ -16,6 +16,7 @@ test("rejects unknown annotation values at declaration", () => {
     [() => declare({}, { erupt: { orderBy: "id" } }), /Erupt has no attribute 'orderBy'/],
     [() => declare({}, { erupt: { layout: { pageSize: "10" } } }), /expected integer/],
     [() => declare({}, { orderBy: "missing desc" }), /illegal orderBy/],
+    [() => declare({}, { erupt: { vis: [{ title: "V", orderBy: "missing" }] } }), /illegal orderBy/],
     [() => operation("Go", { mode: "ALL" as never }, () => undefined), /is not a RowOperationMode/],
     [() => operation("Go", { raw: { colour: "red" } as never }, () => undefined), /RowOperation has no attribute 'colour'/],
     [() => declare({ c: field.ref(declare(), "C", { label: "title" }) }), /has no field 'title'/],

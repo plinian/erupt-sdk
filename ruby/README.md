@@ -95,6 +95,67 @@ end
 replaces its text. `show: ->(user) { ... }` hides the operation and refuses to run it. A returned string is
 executed as JavaScript in the browser, so return only code you wrote.
 
+## DataProxy
+
+Hooks around a model's reads and writes, as erupt's Java `DataProxy`. Override what you need; raise
+`Erupt::Fail` to refuse with a message the user sees.
+
+```ruby
+class ArticleProxy < Erupt::DataProxy
+  def add_behavior(record)               # the new form's values
+    record["status"] = "draft"
+  end
+
+  def validate(record)                   # before every add and update
+    raise Erupt::Fail, "no spam" if record["title"].to_s.include?("spam")
+  end
+
+  def before_fetch(conditions)           # SQL ANDed to the table's WHERE, values bound
+    ["owner = ?", [Erupt.current_user["uid"]]]
+  end
+
+  def after_fetch(rows)                  # a table page, before it is sent
+    rows.each { |row| row["title"] = row["title"].strip }
+  end
+end
+
+class Article
+  extend Erupt::Model
+  erupt "Article", data_proxy: ArticleProxy   # one proxy or an array, classes or instances
+end
+```
+
+| Hook | Runs |
+|------|------|
+| `search_condition(condition)` | building the model: default values of the search bar |
+| `before_fetch(conditions)` | before a table page is read: SQL ANDed to its WHERE as written, `"sql"` or `["sql with ?", [values]]` (with values, each `?` is one of them); SQL repositories only, `MemoryRepository` refuses it |
+| `after_fetch(rows)` | after a table page is read |
+| `add_behavior(record)` | for the new record form (`init-value`) |
+| `edit_behavior(record)` | after a record is read by its key (edit form, detail view) |
+| `validate(record)` | before an add or an update |
+| `before_add` / `after_add(record)` | around `repository.add` |
+| `before_update` / `after_update(record)` | around `repository.update`, with the submitted values |
+| `before_delete` / `after_delete(record)` | around `repository.delete`, once per record as stored |
+
+## Views
+
+`vis:` declares the extra views of `@Erupt(vis = ...)`. A view's `filter` (one SQL string or an array, ANDed as
+written) and `orderBy` (as `order_by`) are applied by the node when the table is read for that view, and kept
+out of the build, as Java keeps them `@Transient`. A view without a `code` is addressed by its title. Like
+`before_fetch`, a filter needs a SQL repository.
+
+```ruby
+class Task
+  extend Erupt::Model
+  erupt "Task", vis: [
+    { title: "Board", type: "BOARD", boardView: { groupField: "status" }, filter: "archived = 0" },
+    { title: "Recent", type: "TABLE", orderBy: "created desc" }
+  ]
+end
+```
+
+Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
+
 ## Storage
 
 Storage is any `Erupt::Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:

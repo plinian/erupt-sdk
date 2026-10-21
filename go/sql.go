@@ -83,9 +83,21 @@ func likeEscape(s string) string {
 
 var sqlOps = map[string]string{"EQ": "=", "NEQ": "<>", "GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="}
 
-func (r *SQLRepository) where(b *sqlBuilder, conds []Cond) string {
+func (r *SQLRepository) where(b *sqlBuilder, q Query) string {
 	var clauses []string
-	for _, c := range conds {
+	for _, f := range q.Filters {
+		// the developer's own SQL, as written; with params, each '?' is one of them, bound like every other value
+		pieces := []string{f.SQL}
+		if len(f.Params) > 0 {
+			pieces = strings.Split(f.SQL, "?")
+		}
+		clause := pieces[0]
+		for i, piece := range pieces[1:] {
+			clause += b.p(r.toDB(nil, f.Params[i])) + piece
+		}
+		clauses = append(clauses, "("+clause+")")
+	}
+	for _, c := range q.Conditions {
 		col := r.q(c.Field)
 		f := r.model.byName[c.Field]
 		switch c.Op {
@@ -141,9 +153,9 @@ func (r *SQLRepository) columns() string {
 // pageSQL builds the count and the page statements of a query.
 func (r *SQLRepository) pageSQL(q Query) (count string, countArgs []any, page string, pageArgs []any) {
 	cb := &sqlBuilder{dollar: r.Dollar}
-	count = "SELECT COUNT(*) FROM " + r.q(r.Table) + r.where(cb, q.Conditions)
+	count = "SELECT COUNT(*) FROM " + r.q(r.Table) + r.where(cb, q)
 	pb := &sqlBuilder{dollar: r.Dollar}
-	where := r.where(pb, q.Conditions)
+	where := r.where(pb, q)
 	orders := make([]string, len(q.Sort))
 	for i, o := range q.Sort {
 		orders[i] = r.q(o.Field) + " ASC"
@@ -161,6 +173,11 @@ func (r *SQLRepository) pageSQL(q Query) (count string, countArgs []any, page st
 }
 
 func (r *SQLRepository) Page(ctx context.Context, q Query) (int64, []Record, error) {
+	for _, f := range q.Filters {
+		if n := strings.Count(f.SQL, "?"); len(f.Params) > 0 && n != len(f.Params) {
+			return 0, nil, fmt.Errorf("filter: %d '?' for %d params in %q", n, len(f.Params), f.SQL)
+		}
+	}
 	count, countArgs, page, pageArgs := r.pageSQL(q)
 	var total int64
 	if err := r.DB.QueryRowContext(ctx, count, countArgs...).Scan(&total); err != nil {

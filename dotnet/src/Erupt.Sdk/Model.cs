@@ -30,6 +30,9 @@ public partial class EruptModel
 
     internal List<(string Field, bool Desc)> OrderBy { get; }
 
+    /// <summary>View code -> the filters and order the node applies to that <c>@Vis</c> view's table queries.</summary>
+    internal Dictionary<string, (List<SqlFilter> Filters, List<(string Field, bool Desc)> Sort)> Views { get; } = [];
+
     internal JsonObject PowerJson { get; private protected set; } = Schema.Defaults["power"]!.DeepClone().AsObject();
 
     internal JsonObject Raw { get; } = [];
@@ -61,7 +64,19 @@ public partial class EruptModel
         if (pks.Count > 1) throw new ArgumentException($"{Name}: at most one [Pk]");
         Pk = pks.FirstOrDefault()?.Name;
         OrderBy = ParseOrder(attribute.OrderBy);
+        Proxies = attribute.DataProxy.Select(t => typeof(IDataProxy).IsAssignableFrom(t)
+            ? (IDataProxy)Activator.CreateInstance(t)!
+            : throw new ArgumentException($"{Name}: DataProxy {t.Name} must implement IDataProxy")).ToList();
     }
+
+    internal List<IDataProxy> Proxies { get; }
+
+    /// <summary>Run one DataProxy hook on every proxy, in declaration order.</summary>
+    internal void Hook(Action<IDataProxy> hook) => Proxies.ForEach(hook);
+
+    /// <summary>The SQL every proxy's <see cref="IDataProxy.BeforeFetch"/> adds, in declaration order.</summary>
+    internal List<SqlFilter> Filters(IReadOnlyList<Cond> conditions) =>
+        Proxies.Select(p => p.BeforeFetch(conditions)).OfType<SqlFilter>().Where(f => f.Sql.Length > 0).ToList();
 
     /// <summary>Declare <typeparamref name="T"/>; the returned builder adds raw overrides and operations.</summary>
     public static EruptModel<T> Of<T>() => new();
@@ -81,7 +96,7 @@ public partial class EruptModel
     }
 
     /// <summary><c>"views desc, id"</c> -> <c>[("views", true), ("id", false)]</c>, fields checked against the model.</summary>
-    private List<(string, bool)> ParseOrder(string? orderBy)
+    private protected List<(string, bool)> ParseOrder(string? orderBy)
     {
         var sort = new List<(string, bool)>();
         foreach (var part in (orderBy ?? "").Split(',').Select(p => p.Trim()).Where(p => p.Length > 0))
@@ -106,10 +121,17 @@ public partial class EruptModel
             ["eruptName"] = Name,
             ["eruptJson"] = json,
             ["eruptFieldModels"] = new JsonArray(Fields.Select(f => (JsonNode)f.Build()).ToArray()),
-            ["searchCondition"] = new JsonObject(),
+            ["searchCondition"] = SearchCondition(),
             ["extraRow"] = false,
             ["tags"] = new JsonObject(),
         };
+    }
+
+    private JsonNode? SearchCondition()
+    {
+        var condition = new Record();
+        Hook(p => p.SearchCondition(condition));
+        return Values.ToJson(condition);
     }
 
     internal JsonObject BuildModel(JsonObject power, EruptUser? user)
@@ -155,11 +177,38 @@ public sealed class EruptModel<T> : EruptModel
         return this;
     }
 
-    /// <summary>Raw <c>@Erupt</c> attributes (<c>new EruptOptions { Layout = new Layout { PageSize = 30 } }</c>).</summary>
+    /// <summary>
+    /// Raw <c>@Erupt</c> attributes (<c>new EruptOptions { Layout = new Layout { PageSize = 30 } }</c>). A <c>Vis</c>
+    /// here replaces the views; declare a view with a filter or an order through <c>Vis(...)</c>.
+    /// </summary>
     public EruptModel<T> Options(EruptOptions options)
     {
         Json.Merge(Raw, Schema.Override("Erupt", options, $"[EruptModel] {Name}"));
+        if (options.Vis is null) return this;
+        Views.Clear();
+        foreach (var entry in Raw["vis"]!.AsArray()) View(entry!.AsObject(), [], []);
         return this;
+    }
+
+    /// <summary>
+    /// One <c>@Vis</c> view, appended to <c>vis</c>. <paramref name="filter"/> (SQL ANDed as written, SQL repositories
+    /// only) and <paramref name="orderBy"/> (as <see cref="EruptModelAttribute.OrderBy"/>) are applied by the node when
+    /// the table is read for this view and kept out of the build, as Java keeps them <c>@Transient</c>. A view
+    /// without a <c>Code</c> is addressed by its title.
+    /// </summary>
+    public EruptModel<T> Vis(Vis vis, string? orderBy = null, params string[] filter)
+    {
+        var entry = Schema.Override("Vis", vis, $"[EruptModel] {Name}.vis");
+        View(entry, [.. filter.Select(f => new SqlFilter(f))], ParseOrder(orderBy));
+        ((Raw["vis"] ??= new JsonArray()) as JsonArray)!.Add(entry);
+        return this;
+    }
+
+    private void View(JsonObject entry, List<SqlFilter> filters, List<(string, bool)> sort)
+    {
+        entry["code"] ??= entry["title"]?.DeepClone() ?? "";
+        if (!Views.TryAdd(entry["code"]!.GetValue<string>(), (filters, sort)))
+            throw new ArgumentException($"{Name}: vis code '{entry["code"]}' declared twice");
     }
 
     /// <summary>Switch features off; the server narrows them further per user.</summary>

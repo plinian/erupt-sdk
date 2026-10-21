@@ -337,11 +337,17 @@ def crud(n):
 
 
 @check
+def data_proxy(n):
+    status, init = n.call("GET", "/erupt-api/data/init-value/Note", erupt="Note")
+    eq((200, "new"), (status, init.get("text")), "add_behavior fills the new form")
+    status, r = n.call("POST", "/erupt-api/data/modify/Note", {"text": "forbidden"}, erupt="Note")
+    eq((200, False, "forbidden text"), (status, r.get("success"), r.get("message")), "validate refuses with its message")
+    ok_r(n.call("POST", "/erupt-api/data/modify/Note", {"text": "fine"}, erupt="Note"), "validate lets a record through")
+
+
+@check
 def references(n):
     clear_articles(n)
-    status, b = n.call("GET", "/erupt-api/build/Article/category")
-    eq((200, "Category"), (status, b["eruptModel"]["eruptName"]), "build by field")
-    eq(404, n.call("GET", "/erupt-api/build/Article/title")[0], "build by a non-reference field")
     status, page = n.call("POST", "/erupt-api/data/Article/reference-table/category?tabRef=false",
                           {"pageIndex": 1, "pageSize": 10, "condition": [{"key": "name", "expression": "LIKE", "value": "py"}]})
     eq((200, [{"id": 2, "name": "Python", "parent": 1}]), (status, page["list"]), "picker")

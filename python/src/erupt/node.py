@@ -59,8 +59,8 @@ class _Reply(Exception):
         self.status, self.body = status, body
 
 
-class _Fail(Exception):
-    """A business error shown to the user as an R message."""
+class Fail(Exception):
+    """A business error shown to the user as a message: raise it from a DataProxy hook or an operation."""
 
 
 def _r(success=True, message=None, data=None):
@@ -84,7 +84,6 @@ class Node:
         self._stop = threading.Event()
         self._routes = [
             ("GET", re.compile(r"^/erupt-api/build/([^/]+)$"), self._build),
-            ("GET", re.compile(r"^/erupt-api/build/([^/]+)/([^/]+)$"), self._build_by_field),
             ("POST", re.compile(r"^/erupt-api/data/table/([^/]+)$"), self._table),
             ("POST", re.compile(r"^/erupt-api/data/([^/]+)/reference-table/([^/]+)$"), self._reference_table),
             ("POST", re.compile(r"^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$"), self._operation_form_value),
@@ -121,7 +120,7 @@ class Node:
             status, body = self._dispatch(environ)
         except _Reply as reply:
             status, body = reply.status, reply.body
-        except _Fail as e:
+        except Fail as e:
             status, body = 200, _r(False, str(e))
         except Exception as e:  # never leak internals: message only, stack stays in the node log
             log.error("erupt node error\n%s", traceback.format_exc())
@@ -187,11 +186,6 @@ class Node:
     def _build(self, model, repo, environ):
         return model.build_model(self._power(model, environ), current_user())
 
-    def _build_by_field(self, model, repo, environ, field):
-        # the reference picker: build of the referenced model, requested under the host model's name
-        f = self._reference_field(model, field)
-        return f.target.build_model(self._power(f.target, environ), current_user())
-
     def _table(self, model, repo, environ):
         self._require(model, environ, "query")
         return self._page(model, repo, _read_json(environ) or {})
@@ -216,28 +210,33 @@ class Node:
         for s in body.get("sort") or []:
             f = model.fields.get(s.get("field"))
             if f is None or not (f.sortable or f.pk):
-                raise _Fail(f"illegal sort field '{s.get('field')}'")
+                raise Fail(f"illegal sort field '{s.get('field')}'")
             query.sort.append((f.name, str(s.get("direction", "ASC")).upper() == "DESC"))
+        # a @Vis view's own filter and order, then the DataProxy's
+        filters, sort = model.vis.get(body.get("vis"), ([], []))
         if not query.sort:
-            query.sort = list(model.order_by)
+            query.sort = list(sort or model.order_by)
+        query.filters = filters + model.filters(query.conditions)
         total, records = repo.page(query)
+        rows = self._rows(model, records)
+        model.hook("after_fetch", rows)
         return {"pageIndex": page_index, "pageSize": page_size, "total": total,
-                "totalPage": math.ceil(total / page_size), "list": self._rows(model, records),
+                "totalPage": math.ceil(total / page_size), "list": rows,
                 "sort": None, "alert": None, "extraContent": None}
 
     @staticmethod
     def _conditions(model, c):
         f = model.fields.get(c.get("key"))
         if f is None or f.pk or not f.search:
-            raise _Fail(f"illegal search field '{c.get('key')}'")
+            raise Fail(f"illegal search field '{c.get('key')}'")
         op = c.get("expression") or "EQ"
         if op not in _OPS:
-            raise _Fail(f"illegal operator '{op}'")
+            raise Fail(f"illegal operator '{op}'")
         value = c.get("value")
         if f.json:
             # a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
             if op not in ("EQ", "IN", "NEQ", "NOT_IN"):
-                raise _Fail(f"illegal operator '{op}' for {f.title}")
+                raise Fail(f"illegal operator '{op}' for {f.title}")
             like = "LIKE" if op in ("EQ", "IN") else "NOT_LIKE"
             return [Cond(f.name, like, json.dumps(str(v))) for v in (value if isinstance(value, list) else [value])]
         return [Node._condition(f, op, value)]
@@ -247,7 +246,7 @@ class Node:
         if op in ("NULL", "NOT_NULL"):
             return Cond(f.name, op)
         if f.type in ("REFERENCE_TABLE", "REFERENCE_TREE") and op not in ("EQ", "NEQ", "IN", "NOT_IN"):
-            raise _Fail(f"illegal operator '{op}' for a reference")
+            raise Fail(f"illegal operator '{op}' for a reference")
         if op in ("LIKE", "NOT_LIKE"):
             return Cond(f.name, op, str(value))
         try:
@@ -259,11 +258,13 @@ class Node:
                 return Cond(f.name, op, [f.coerce(v) for v in (value if isinstance(value, list) else [value])])
             return Cond(f.name, op, f.coerce(value))
         except (TypeError, ValueError) as e:
-            raise _Fail(str(e))
+            raise Fail(str(e))
 
     def _init_value(self, model, repo, environ):
         self._require(model, environ, "add")
-        return {name: None for name in model.fields}
+        record = {name: None for name in model.fields}
+        model.hook("add_behavior", record)
+        return self._rows(model, [record])[0]
 
     def _get(self, model, repo, environ, pk):
         power = self._power(model, environ)
@@ -271,12 +272,17 @@ class Node:
             raise _Reply(403, "")
         record = repo.get(self._pk(model, pk))
         if record is None:
-            raise _Fail("record not found")
+            raise Fail("record not found")
+        model.hook("edit_behavior", record)
         return self._rows(model, [record])[0]
 
     def _add(self, model, repo, environ):
         self._require(model, environ, "add")
-        repo.add(self._record(model, _read_json(environ) or {}))
+        record = self._record(model, _read_json(environ) or {})
+        model.hook("validate", record)
+        model.hook("before_add", record)
+        repo.add(record)
+        model.hook("after_add", record)
         return _r()
 
     def _update(self, model, repo, environ):
@@ -284,16 +290,27 @@ class Node:
         body = _read_json(environ) or {}
         pk = self._pk(model, body.get(model.pk))
         if repo.get(pk) is None:
-            raise _Fail("record not found")
-        repo.update(pk, self._record(model, body))
+            raise Fail("record not found")
+        record = self._record(model, body)
+        model.hook("validate", record)
+        model.hook("before_update", record)
+        repo.update(pk, record)
+        model.hook("after_update", record)
         return _r()
 
     def _delete(self, model, repo, environ):
         self._require(model, environ, "delete")
         body = _read_json(environ)
         if not isinstance(body, list):
-            raise _Fail("a list of ids is required")
-        repo.delete([self._pk(model, pk) for pk in body])
+            raise Fail("a list of ids is required")
+        pks = [self._pk(model, pk) for pk in body]
+        # the hooks see each record as it was; reading them costs nothing without a proxy
+        records = [r for r in (repo.get(pk) for pk in pks) if r is not None] if model.proxies else []
+        for record in records:
+            model.hook("before_delete", record)
+        repo.delete(pks)
+        for record in records:
+            model.hook("after_delete", record)
         return _r()
 
     @staticmethod
@@ -325,13 +342,13 @@ class Node:
         if op.mode != "BUTTON":
             ids = body.get("ids")
             if not isinstance(ids, list) or not ids:
-                raise _Fail("select at least one row")
+                raise Fail("select at least one row")
             if op.mode == "SINGLE" and len(ids) != 1:
-                raise _Fail("select exactly one row")
+                raise Fail("select exactly one row")
             for pk in ids:
                 record = repo.get(self._pk(model, pk))
                 if record is None:
-                    raise _Fail(f"record '{pk}' not found")
+                    raise Fail(f"record '{pk}' not found")
                 rows.append(record)
         result = op.fn(OperationContext(rows, param, repo, model, current_user()))
         if isinstance(result, str) and result:
@@ -343,7 +360,7 @@ class Node:
         try:
             return model.fields[model.pk].coerce(value)
         except (TypeError, ValueError):
-            raise _Fail(f"illegal id '{value}'")
+            raise Fail(f"illegal id '{value}'")
 
     @staticmethod
     def _record(model, body):
@@ -354,9 +371,9 @@ class Node:
             try:
                 value = f.coerce(body.get(f.name))
             except (TypeError, ValueError) as e:
-                raise _Fail(f"{f.title}: {e}")
+                raise Fail(f"{f.title}: {e}")
             if f.not_null and value is None:
-                raise _Fail(f"{f.title} cannot be empty")
+                raise Fail(f"{f.title} cannot be empty")
             record[f.name] = value
         return record
 
@@ -466,7 +483,7 @@ def _read_json(environ):
     try:
         return json.loads(environ["wsgi.input"].read(length))
     except ValueError:
-        raise _Fail("malformed JSON body")
+        raise Fail("malformed JSON body")
 
 
 def _path_and_query(environ):

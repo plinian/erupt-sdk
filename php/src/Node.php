@@ -23,7 +23,6 @@ final class Node
 
     private const ROUTES = [
         ['GET', '#^/erupt-api/build/([^/]+)$#', 'build'],
-        ['GET', '#^/erupt-api/build/([^/]+)/([^/]+)$#', 'buildByField'],
         ['POST', '#^/erupt-api/data/table/([^/]+)$#', 'table'],
         ['POST', '#^/erupt-api/data/([^/]+)/reference-table/([^/]+)$#', 'referenceTable'],
         ['POST', '#^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$#', 'operationFormValue'],
@@ -208,13 +207,6 @@ final class Node
         return $model->buildModel($this->power($model, $request), self::$user);
     }
 
-    private function buildByField(Model $model, Repository $repo, Request $request, string $field): array
-    {
-        // the reference picker: build of the referenced model, requested under the host model's name
-        $target = $this->referenceField($model, $field)->target();
-        return $target->buildModel($this->power($target, $request), self::$user);
-    }
-
     private function table(Model $model, Repository $repo, Request $request): array
     {
         $this->requirePower($model, $request, 'query');
@@ -251,12 +243,17 @@ final class Node
             }
             $query->sort[] = [$f->name, strtoupper((string) ($s['direction'] ?? 'ASC')) === 'DESC'];
         }
+        // a @Vis view's own filter and order, then the DataProxy's
+        [$filters, $sort] = is_string($body['vis'] ?? null) ? ($model->vis[$body['vis']] ?? [[], []]) : [[], []];
         if (!$query->sort) {
-            $query->sort = $model->orderBy;
+            $query->sort = $sort ?: $model->orderBy;
         }
+        $query->filters = [...$filters, ...$model->filters($query->conditions)];
         [$total, $records] = $repo->page($query);
+        $rows = $this->rows($model, $records);
+        $model->hook('afterFetch', $rows);
         return ['pageIndex' => $pageIndex, 'pageSize' => $pageSize, 'total' => $total,
-            'totalPage' => (int) ceil($total / $pageSize), 'list' => $this->rows($model, $records),
+            'totalPage' => (int) ceil($total / $pageSize), 'list' => $rows,
             'sort' => null, 'alert' => null, 'extraContent' => null];
     }
 
@@ -316,7 +313,9 @@ final class Node
     private function initValue(Model $model, Repository $repo, Request $request): array
     {
         $this->requirePower($model, $request, 'add');
-        return array_fill_keys(array_keys($model->fields), null);
+        $record = array_fill_keys(array_keys($model->fields), null);
+        $model->hook('addBehavior', $record);
+        return $this->rows($model, [$record])[0];
     }
 
     private function get(Model $model, Repository $repo, Request $request, string $pk): array
@@ -326,13 +325,18 @@ final class Node
             throw new Reply(403);
         }
         $record = $repo->get(self::pk($model, $pk)) ?? throw new Fail('record not found');
+        $model->hook('editBehavior', $record);
         return $this->rows($model, [$record])[0];
     }
 
     private function add(Model $model, Repository $repo, Request $request): array
     {
         $this->requirePower($model, $request, 'add');
-        $repo->add(self::record($model, $request->object()));
+        $record = self::record($model, $request->object());
+        $model->hook('validate', $record);
+        $model->hook('beforeAdd', $record);
+        $repo->add($record);
+        $model->hook('afterAdd', $record);
         return self::r();
     }
 
@@ -344,7 +348,11 @@ final class Node
         if ($repo->get($pk) === null) {
             throw new Fail('record not found');
         }
-        $repo->update($pk, self::record($model, $body));
+        $record = self::record($model, $body);
+        $model->hook('validate', $record);
+        $model->hook('beforeUpdate', $record);
+        $repo->update($pk, $record);
+        $model->hook('afterUpdate', $record);
         return self::r();
     }
 
@@ -355,7 +363,16 @@ final class Node
         if (!is_array($body) || !array_is_list($body)) {
             throw new Fail('a list of ids is required');
         }
-        $repo->delete(array_map(fn($pk) => self::pk($model, $pk), $body));
+        $pks = array_map(fn($pk) => self::pk($model, $pk), $body);
+        // the hooks see each record as it was; reading them costs nothing without a proxy
+        $records = $model->proxies ? array_values(array_filter(array_map([$repo, 'get'], $pks), fn($r) => $r !== null)) : [];
+        foreach ($records as &$record) {
+            $model->hook('beforeDelete', $record);
+        }
+        $repo->delete($pks);
+        foreach ($records as &$record) {
+            $model->hook('afterDelete', $record);
+        }
         return self::r();
     }
 

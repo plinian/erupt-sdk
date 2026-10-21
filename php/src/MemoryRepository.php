@@ -27,6 +27,9 @@ final class MemoryRepository implements Repository
 
     public function page(Query $query): array
     {
+        if ($query->filters) {
+            throw new \LogicException('MemoryRepository cannot apply SQL filters (a view filter, beforeFetch)');
+        }
         $rows = array_values(array_filter($this->rows, function (array $row) use ($query) {
             foreach ($query->conditions as $c) {
                 if (!self::match($row[$c->field] ?? null, $c)) {

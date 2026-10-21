@@ -60,6 +60,74 @@ node.serve("0.0.0.0", 9090)?;   // blocks; SIGINT / SIGTERM deregister and exit
 - Records are `serde_json::Map` (`erupt::Record`); dates are wall-clock strings `YYYY-MM-DD` and
   `YYYY-MM-DDTHH:MM:SS.mmm`.
 
+## DataProxy
+
+Hooks around a model's reads and writes, as erupt's Java `DataProxy`. Implement what you need; return
+`Err(Error::fail(msg))` to refuse with a message the user sees.
+
+```rust
+use erupt::{current_user, Cond, DataProxy, Error, Filter, Record};
+use serde_json::json;
+
+struct ArticleProxy;
+
+impl DataProxy for ArticleProxy {
+    fn add_behavior(&self, record: &mut Record) -> erupt::Result<()> {   // the new form's values
+        record.insert("status".into(), json!("draft"));
+        Ok(())
+    }
+
+    fn validate(&self, record: &Record) -> erupt::Result<()> {          // before every add and update
+        match record.get("title").and_then(|t| t.as_str()) {
+            Some(t) if t.contains("spam") => Err(Error::fail("no spam")),
+            _ => Ok(()),
+        }
+    }
+
+    fn before_fetch(&self, conditions: &[Cond]) -> erupt::Result<Option<Filter>> {  // SQL ANDed to the table's WHERE, values bound
+        let uid = current_user().map(|u| u["uid"].clone()).unwrap_or_default();
+        Ok(Some(Filter::new("owner = ?", vec![uid])))
+    }
+}
+
+let article = Model::new("Article", "Article")
+    .data_proxy(ArticleProxy)   // call again to add more; they run in that order
+    // .field(...)
+    .build()?;
+```
+
+| Hook | Runs |
+|------|------|
+| `search_condition(condition)` | building the model: default values of the search bar |
+| `before_fetch(conditions)` | before a table page is read: SQL ANDed to its WHERE as written, `"sql".into()` or `Filter::new("sql with ?", values)` (with values, each `?` is one of them); SQL repositories only, `MemoryRepository` refuses it |
+| `after_fetch(rows)` | after a table page is read |
+| `add_behavior(record)` | for the new record form (`init-value`) |
+| `edit_behavior(record)` | after a record is read by its key (edit form, detail view) |
+| `validate(record)` | before an add or an update |
+| `before_add` / `after_add(record)` | around `repository.add` |
+| `before_update` / `after_update(record)` | around `repository.update`, with the submitted values |
+| `before_delete` / `after_delete(record)` | around `repository.delete`, once per record as stored |
+
+## Views
+
+`vis` in `.raw(...)` declares the extra views of `@Erupt(vis = ...)`. A view's `filter` (one SQL string or a
+list, ANDed as written) and `orderBy` (as `.order_by`) are applied by the node when the table is read for that
+view, and kept out of the build, as Java keeps them `@Transient`; they are SDK-only keys, so give them with
+`json!` (the generated `types::Vis` has no such fields). A view without a `code` is addressed by its title.
+Like `before_fetch`, a filter needs a SQL repository.
+
+```rust
+let task = Model::new("Task", "Task")
+    .raw(json!({"vis": [
+        {"title": "Board", "type": "BOARD", "boardView": {"groupField": "status"}, "filter": "archived = 0"},
+        {"title": "Recent", "type": "TABLE", "orderBy": "created desc"},
+    ]}))
+    // .field(...)
+    .build()?;
+```
+
+Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
+
 ## Storage
 
 `Repository` (`bind`, `page`, `get`, `add`, `update`, `delete`) puts a model on anything; without a sort it

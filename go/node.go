@@ -170,7 +170,6 @@ type route struct {
 
 var routes = []route{
 	{"GET", regexp.MustCompile(`^/erupt-api/build/([^/]+)$`), (*Node).build},
-	{"GET", regexp.MustCompile(`^/erupt-api/build/([^/]+)/([^/]+)$`), (*Node).buildByField},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/table/([^/]+)$`), (*Node).table},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/reference-table/([^/]+)$`), (*Node).referenceTable},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$`), (*Node).operationFormValue},
@@ -355,16 +354,13 @@ func (q *request) object() (map[string]any, error) {
 // ---------------------------------------------------------------- endpoints
 
 func (n *Node) build(q *request) (any, error) {
-	return q.model.buildModel(n.power(q, q.model), UserFrom(q.ctx)), nil
-}
-
-func (n *Node) buildByField(q *request) (any, error) {
-	// the reference picker: build of the referenced model, requested under the host model's name
-	f, err := referenceField(q.model, q.args[0], "")
-	if err != nil {
+	build := q.model.buildModel(n.power(q, q.model), UserFrom(q.ctx))
+	condition := M{}
+	if err := hook(q.ctx, q.model, DataProxy.SearchCondition, condition); err != nil {
 		return nil, err
 	}
-	return f.target.buildModel(n.power(q, f.target), UserFrom(q.ctx)), nil
+	build["eruptModel"].(M)["searchCondition"] = condition
+	return build, nil
 }
 
 func (n *Node) table(q *request) (any, error) {
@@ -379,7 +375,7 @@ func (n *Node) table(q *request) (any, error) {
 }
 
 func (n *Node) referenceTable(q *request) (any, error) {
-	f, err := referenceField(q.model, q.args[0], typeReferenceTable)
+	f, err := referenceField(q.model, q.args[0])
 	if err != nil {
 		return nil, err
 	}
@@ -394,9 +390,9 @@ func (n *Node) referenceTable(q *request) (any, error) {
 	return n.page(q.ctx, f.target, repo, body)
 }
 
-func referenceField(m *Model, name, editType string) (*field, error) {
+func referenceField(m *Model, name string) (*field, error) {
 	f := m.byName[name]
-	if f == nil || !f.isReference() || (editType != "" && f.typ != editType) {
+	if f == nil || f.typ != typeReferenceTable {
 		return nil, reply{404}
 	}
 	return f, nil
@@ -438,8 +434,24 @@ func (n *Node) page(ctx context.Context, m *Model, repo Repository, body map[str
 		}
 		q.Sort = append(q.Sort, Order{Field: f.name, Desc: strings.EqualFold(str(obj["direction"]), "DESC")})
 	}
+	// a @Vis view's own filter and order, then the DataProxy's
+	code, _ := body["vis"].(string)
+	v := m.vis[code]
+	if len(q.Sort) == 0 {
+		q.Sort = append([]Order{}, v.orderBy...)
+	}
 	if len(q.Sort) == 0 {
 		q.Sort = append([]Order{}, m.orderBy...)
+	}
+	q.Filters = append(q.Filters, v.filters...)
+	for _, p := range m.proxies {
+		f, err := p.BeforeFetch(ctx, q.Conditions)
+		if err != nil {
+			return nil, err
+		}
+		if f.SQL != "" {
+			q.Filters = append(q.Filters, f)
+		}
 	}
 	total, records, err := repo.Page(ctx, q)
 	if err != nil {
@@ -447,6 +459,9 @@ func (n *Node) page(ctx context.Context, m *Model, repo Repository, body map[str
 	}
 	rows, err := n.rows(ctx, m, records)
 	if err != nil {
+		return nil, err
+	}
+	if err := hook(ctx, m, DataProxy.AfterFetch, rows); err != nil {
 		return nil, err
 	}
 	return M{"pageIndex": pageIndex, "pageSize": pageSize, "total": total,
@@ -513,7 +528,15 @@ func (n *Node) initValue(q *request) (any, error) {
 	if err := n.require(q, "add"); err != nil {
 		return nil, err
 	}
-	return emptyRow(q.model), nil
+	record := emptyRow(q.model)
+	if err := hook(q.ctx, q.model, DataProxy.AddBehavior, record); err != nil {
+		return nil, err
+	}
+	rows, err := n.rows(q.ctx, q.model, []Record{record})
+	if err != nil {
+		return nil, err
+	}
+	return rows[0], nil
 }
 
 func emptyRow(m *Model) M {
@@ -540,6 +563,9 @@ func (n *Node) get(q *request) (any, error) {
 	if record == nil {
 		return nil, Fail("record not found")
 	}
+	if err := hook(q.ctx, q.model, DataProxy.EditBehavior, record); err != nil {
+		return nil, err
+	}
 	rows, err := n.rows(q.ctx, q.model, []Record{record})
 	if err != nil {
 		return nil, err
@@ -559,7 +585,16 @@ func (n *Node) add(q *request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := hook(q.ctx, q.model, DataProxy.Validate, record); err != nil {
+		return nil, err
+	}
+	if err := hook(q.ctx, q.model, DataProxy.BeforeAdd, record); err != nil {
+		return nil, err
+	}
 	if err := q.repo.Add(q.ctx, record); err != nil {
+		return nil, err
+	}
+	if err := hook(q.ctx, q.model, DataProxy.AfterAdd, record); err != nil {
 		return nil, err
 	}
 	return r(true, nil, nil), nil
@@ -588,7 +623,16 @@ func (n *Node) update(q *request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := hook(q.ctx, q.model, DataProxy.Validate, record); err != nil {
+		return nil, err
+	}
+	if err := hook(q.ctx, q.model, DataProxy.BeforeUpdate, record); err != nil {
+		return nil, err
+	}
 	if err := q.repo.Update(q.ctx, pk, record); err != nil {
+		return nil, err
+	}
+	if err := hook(q.ctx, q.model, DataProxy.AfterUpdate, record); err != nil {
 		return nil, err
 	}
 	return r(true, nil, nil), nil
@@ -612,8 +656,29 @@ func (n *Node) delete(q *request) (any, error) {
 			return nil, err
 		}
 	}
+	// the hooks see each record as it was; reading them costs nothing without a proxy
+	var records []Record
+	for i := 0; i < len(pks) && len(q.model.proxies) > 0; i++ {
+		record, err := q.repo.Get(q.ctx, pks[i])
+		if err != nil {
+			return nil, err
+		}
+		if record != nil {
+			records = append(records, record)
+		}
+	}
+	for _, record := range records {
+		if err := hook(q.ctx, q.model, DataProxy.BeforeDelete, record); err != nil {
+			return nil, err
+		}
+	}
 	if err := q.repo.Delete(q.ctx, pks); err != nil {
 		return nil, err
+	}
+	for _, record := range records {
+		if err := hook(q.ctx, q.model, DataProxy.AfterDelete, record); err != nil {
+			return nil, err
+		}
 	}
 	return r(true, nil, nil), nil
 }

@@ -73,6 +73,63 @@ erupt.WithOperations(erupt.Operation{
 executed as JavaScript in the browser, so return only code you wrote. Return `erupt.Fail("...")` from a
 handler or a repository to show the user a message; any other error answers 500.
 
+## DataProxy
+
+Hooks around a model's reads and writes, as erupt's Java `DataProxy`. Embed `erupt.BaseDataProxy` and
+override what you need; return `erupt.Fail("...")` to refuse with a message the user sees.
+
+```go
+type ArticleProxy struct{ erupt.BaseDataProxy }
+
+func (ArticleProxy) AddBehavior(ctx context.Context, record erupt.Record) error { // the new form's values
+	record["status"] = "draft"
+	return nil
+}
+
+func (ArticleProxy) Validate(ctx context.Context, record erupt.Record) error { // before every add and update
+	if title, _ := record["title"].(string); strings.Contains(title, "spam") {
+		return erupt.Fail("no spam")
+	}
+	return nil
+}
+
+// SQL ANDed to the table's WHERE, values bound
+func (ArticleProxy) BeforeFetch(ctx context.Context, conditions []erupt.Cond) (erupt.Filter, error) {
+	return erupt.Filter{SQL: "owner = ?", Params: []any{erupt.UserFrom(ctx).Account}}, nil
+}
+
+article, err := erupt.NewModel(Article{}, "Article", erupt.WithDataProxy(ArticleProxy{})) // one or several
+```
+
+| Hook | Runs |
+|------|------|
+| `SearchCondition(ctx, condition)` | building the model: default values of the search bar |
+| `BeforeFetch(ctx, conditions)` | before a table page is read: `Filter{SQL, Params}` ANDed to its WHERE as written (with `Params`, each `?` is one of them); SQL repositories only, `MemoryRepository` refuses it |
+| `AfterFetch(ctx, rows)` | after a table page is read |
+| `AddBehavior(ctx, record)` | for the new record form (`init-value`) |
+| `EditBehavior(ctx, record)` | after a record is read by its key (edit form, detail view) |
+| `Validate(ctx, record)` | before an add or an update |
+| `BeforeAdd` / `AfterAdd(ctx, record)` | around `Repository.Add` |
+| `BeforeUpdate` / `AfterUpdate(ctx, record)` | around `Repository.Update`, with the submitted values |
+| `BeforeDelete` / `AfterDelete(ctx, record)` | around `Repository.Delete`, once per record as stored |
+
+## Views
+
+`vis` declares the extra views of `@Erupt(vis = ...)`. A view's `filter` (one SQL string or a list, ANDed as
+written) and `orderBy` (as `WithOrderBy`) are applied by the node when the table is read for that view, and
+kept out of the build, as Java keeps them `@Transient`. They are not in the generated `Vis`: give them in an
+`M`, or wrap a `Vis` in `erupt.NodeVis`. A view without a `code` is addressed by its title. Like
+`BeforeFetch`, a filter needs a SQL repository.
+
+```go
+erupt.WithRaw(erupt.M{"vis": []any{
+	erupt.M{"title": "Board", "type": "BOARD", "boardView": erupt.M{"groupField": "status"}, "filter": "archived = 0"},
+	erupt.NodeVis{Vis: erupt.Vis{Title: erupt.Ptr("Recent"), Type: erupt.VisTypeTable}, OrderBy: "created desc"},
+}})
+```
+
+Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `Get` and `Update`.
+
 ## Storage
 
 Any `erupt.Repository` (`Page`, `Get`, `Add`, `Update`, `Delete`, each with a `context.Context`; the

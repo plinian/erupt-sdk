@@ -107,6 +107,65 @@ replaces its text. `show: { user in ... }` hides the operation and refuses to ru
 to show a message; a returned string is executed as JavaScript in the browser, so return only code you wrote.
 `User.current` is the acting user anywhere a request is served, repositories included.
 
+## DataProxy
+
+Hooks around a model's reads and writes, as erupt's Java `DataProxy`. Implement what you need (the rest default to
+no-ops); throw `EruptFailure` to refuse with a message the user sees.
+
+```swift
+struct ArticleProxy: DataProxy {
+    func addBehavior(_ record: inout Record) {             // the new form's values
+        record["status"] = "draft"
+    }
+
+    func validate(_ record: Record) throws {               // before every add and update
+        if record["title"]?.text.contains("spam") == true { throw EruptFailure("no spam") }
+    }
+
+    func beforeFetch(_ conditions: [Cond]) -> SQLFilter? {  // SQL ANDed to the table's WHERE, values bound
+        SQLFilter("owner = ?", [.string(User.current?.account ?? "")])
+    }
+
+    func afterFetch(_ rows: inout [Record]) {              // a table page, before it is sent
+        for i in rows.indices { rows[i]["title"] = .string(rows[i]["title"]!.text.trimmingCharacters(in: .whitespaces)) }
+    }
+}
+
+let article = try Model("Article", dataProxy: [ArticleProxy()]) { ... }   // run in order
+```
+
+| Hook | Runs |
+|------|------|
+| `searchCondition(&condition)` | building the model: default values of the search bar |
+| `beforeFetch(conditions)` | before a table page is read: SQL ANDed to its WHERE as written, `"sql"` or `SQLFilter("sql with ?", [values])` (with values, each `?` is one of them); SQL repositories only, `MemoryRepository` refuses it |
+| `afterFetch(&rows)` | after a table page is read |
+| `addBehavior(&record)` | for the new record form (`init-value`) |
+| `editBehavior(&record)` | after a record is read by its key (edit form, detail view) |
+| `validate(record)` | before an add or an update |
+| `beforeAdd(&record)` / `afterAdd(record)` | around `repository.add` |
+| `beforeUpdate(&record)` / `afterUpdate(record)` | around `repository.update`, with the submitted values |
+| `beforeDelete` / `afterDelete(record)` | around `repository.delete`, once per record as stored |
+
+## Views
+
+`Erupt(vis: [...])` declares the extra views of `@Erupt(vis = ...)`. A view's `filter` (one SQL string or a list,
+ANDed as written) and `orderBy` are not `Vis` attributes, as Java keeps them `@Transient`: give them as
+`visQuery`, keyed by the view's code, and the node applies them when the table is read for that view. A view
+without a `code` is addressed by its title. Like `beforeFetch`, a filter needs a SQL repository.
+
+```swift
+let task = try Model(
+    "Task",
+    erupt: Erupt(vis: [
+        Vis(boardView: BoardView(groupField: "status"), title: "Board", type: .board),
+        Vis(title: "Recent", type: .table),
+    ]),
+    visQuery: ["Board": VisQuery(filter: "archived = 0"), "Recent": VisQuery(orderBy: "created desc")]
+) { ... }
+```
+
+Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
+
 ## Storage
 
 Storage is any `Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:

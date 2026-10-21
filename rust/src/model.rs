@@ -1,13 +1,13 @@
 //! Model declaration, compiled into erupt build JSON. Nothing here re-implements annotation semantics: every
 //! field and operation starts from the template the Java proxies emit (`erupt-node-defaults.json`, generated
 //! by erupt-test `NodeDefaultsTest`); a declaration only overrides values on top of it.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::repo::Repository;
+use crate::repo::{Cond, Filter, Repository};
 use crate::schema::{check, defaults};
 use crate::types::{EditType, RowOperationMode};
 use crate::values::{as_f64, number, parse_date_time, text};
@@ -463,6 +463,54 @@ impl Operation {
     }
 }
 
+/// Hooks around a model's data, as erupt's Java `DataProxy`: implement what you need and add it with
+/// [`ModelBuilder::data_proxy`]. A record is what the repository stores, a row what the browser reads; change
+/// them in place. `Err(Error::fail(msg))` refuses with `msg`.
+#[allow(unused_variables)]
+pub trait DataProxy: Send + Sync {
+    /// Default values of the search bar, `condition[field] = value`.
+    fn search_condition(&self, condition: &mut Record) {}
+    /// SQL ANDed to a table page's WHERE, as written: `Filter::new("owner = ?", vec![uid])`, or
+    /// `"status <> 'deleted'".into()`. `conditions` are the search bar's. Only SQL repositories apply it.
+    fn before_fetch(&self, conditions: &[Cond]) -> Result<Option<Filter>> {
+        Ok(None)
+    }
+    /// The rows of a table page, before they are sent.
+    fn after_fetch(&self, rows: &mut [Record]) -> Result<()> {
+        Ok(())
+    }
+    /// The values a new record's form opens with.
+    fn add_behavior(&self, record: &mut Record) -> Result<()> {
+        Ok(())
+    }
+    /// A record read by its key, for the edit form or the detail view.
+    fn edit_behavior(&self, record: &mut Record) -> Result<()> {
+        Ok(())
+    }
+    /// A record about to be added or updated.
+    fn validate(&self, record: &Record) -> Result<()> {
+        Ok(())
+    }
+    fn before_add(&self, record: &mut Record) -> Result<()> {
+        Ok(())
+    }
+    fn after_add(&self, record: &Record) -> Result<()> {
+        Ok(())
+    }
+    fn before_update(&self, record: &mut Record) -> Result<()> {
+        Ok(())
+    }
+    fn after_update(&self, record: &Record) -> Result<()> {
+        Ok(())
+    }
+    fn before_delete(&self, record: &Record) -> Result<()> {
+        Ok(())
+    }
+    fn after_delete(&self, record: &Record) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A declared erupt model. Built with [`Model::new`]; shared as `Arc<Model>`.
 pub struct Model {
     pub(crate) name: String,
@@ -472,8 +520,11 @@ pub struct Model {
     pub(crate) fields: Vec<Field>,
     pub(crate) power: Map<String, Value>,
     pub(crate) order_by: Vec<(String, bool)>,
+    /// view code -> the filters and order the node applies to that view's table pages
+    pub(crate) vis: HashMap<String, (Vec<Filter>, Order)>,
     raw: Value,
     pub(crate) operations: Vec<Operation>,
+    pub(crate) proxies: Vec<Arc<dyn DataProxy>>,
 }
 
 /// Collects a model's declaration; [`ModelBuilder::build`] validates it.
@@ -485,6 +536,7 @@ pub struct ModelBuilder {
     order_by: String,
     raw: Value,
     operations: Vec<Operation>,
+    proxies: Vec<Arc<dyn DataProxy>>,
 }
 
 impl Model {
@@ -499,6 +551,7 @@ impl Model {
             order_by: String::new(),
             raw: json!({}),
             operations: Vec::new(),
+            proxies: Vec::new(),
         }
     }
 
@@ -520,6 +573,19 @@ impl Model {
         self.fields.iter().filter(|f| !f.transient)
     }
 
+    /// Run one DataProxy hook on every proxy, in declaration order.
+    pub(crate) fn hook(&self, mut hook: impl FnMut(&dyn DataProxy) -> Result<()>) -> Result<()> {
+        self.proxies.iter().try_for_each(|p| hook(p.as_ref()))
+    }
+
+    /// The SQL every proxy's `before_fetch` adds, in declaration order.
+    pub(crate) fn filters(&self, conditions: &[Cond]) -> Result<Vec<Filter>> {
+        self.proxies
+            .iter()
+            .filter_map(|p| p.before_fetch(conditions).transpose())
+            .collect()
+    }
+
     pub(crate) fn build_erupt(&self, operations: &[&Operation]) -> Value {
         let mut erupt = defaults()["erupt"].clone();
         merge(
@@ -528,11 +594,15 @@ impl Model {
         );
         erupt["rowOperation"] = Value::Array(operations.iter().map(|o| o.build()).collect());
         merge(&mut erupt, &self.raw);
+        let mut condition = Record::new();
+        for p in &self.proxies {
+            p.search_condition(&mut condition);
+        }
         json!({
             "eruptName": self.name,
             "eruptJson": erupt,
             "eruptFieldModels": self.fields.iter().map(Field::build).collect::<Vec<_>>(),
-            "searchCondition": {},
+            "searchCondition": condition,
             "extraRow": false,
             "tags": {},
         })
@@ -574,13 +644,21 @@ impl ModelBuilder {
         self.order_by = order_by.to_string();
         self
     }
-    /// Raw `@Erupt` attributes merged onto the defaults, e.g. `json!({"layout": {"pageSize": 30}})`.
+    /// Raw `@Erupt` attributes merged onto the defaults, e.g. `json!({"layout": {"pageSize": 30}})`. A `vis`
+    /// entry may also carry `filter` (one SQL string or a list, ANDed as written) and `orderBy` (as
+    /// [`order_by`](Self::order_by)): the node applies them to that view's table pages, and they stay out of
+    /// the build, as Java keeps them `@Transient`. A view without a `code` is addressed by its title.
     pub fn raw(mut self, raw: impl Serialize) -> Self {
         merge(&mut self.raw, &to_json(raw, "erupt"));
         self
     }
     pub fn operation(mut self, operation: Operation) -> Self {
         self.operations.push(operation);
+        self
+    }
+    /// Hooks run around every read and write of the model; several run in the order added.
+    pub fn data_proxy(mut self, proxy: impl DataProxy + 'static) -> Self {
+        self.proxies.push(Arc::new(proxy));
         self
     }
 
@@ -590,7 +668,9 @@ impl ModelBuilder {
         if !identifier(name) {
             return fail(format!("erupt name '{name}' must be an identifier"));
         }
-        check("Erupt", &self.raw, &format!("model {name}"), true).map_err(Error::Declaration)?;
+        let (raw, vis) =
+            pull_vis(self.raw).map_err(|m| Error::Declaration(format!("{name}: {m}")))?;
+        check("Erupt", &raw, &format!("model {name}"), true).map_err(Error::Declaration)?;
         let default_power = defaults()["power"].as_object().expect("power");
         let mut power = default_power.clone();
         for (key, value) in self.power.as_object().into_iter().flatten() {
@@ -644,25 +724,11 @@ impl ModelBuilder {
             return fail(format!("{name}: at most one Field::pk()"));
         }
         let pk = pks.first().map(|f| f.name.clone());
-        let mut order_by = Vec::new();
-        for part in self
-            .order_by
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            let words: Vec<&str> = part.split_whitespace().collect();
-            let desc = match words.get(1).map(|w| w.to_ascii_lowercase()) {
-                None => false,
-                Some(w) if w == "asc" => false,
-                Some(w) if w == "desc" => true,
-                Some(_) => return fail(format!("{name}: illegal order_by '{part}'")),
-            };
-            if words.len() > 2 || !fields.iter().any(|f| f.name == words[0]) {
-                return fail(format!("{name}: illegal order_by '{part}'"));
-            }
-            order_by.push((words[0].to_string(), desc));
-        }
+        let order_by = parse_order(name, &fields, &self.order_by)?;
+        let vis = vis
+            .into_iter()
+            .map(|(code, filters, sort)| Ok((code, (filters, parse_order(name, &fields, &sort)?))))
+            .collect::<Result<_>>()?;
         let mut codes = HashSet::new();
         for op in &self.operations {
             let path = format!("{name}.{}", op.code);
@@ -684,10 +750,74 @@ impl ModelBuilder {
             fields,
             power,
             order_by,
-            raw: self.raw,
+            vis,
+            raw,
             operations: self.operations,
+            proxies: self.proxies,
         }))
     }
+}
+
+/// `(field, descending)`, in order
+type Order = Vec<(String, bool)>;
+/// a `vis` entry's code, filters and `orderBy`, as declared
+type RawView = (String, Vec<Filter>, String);
+
+/// `"views desc, id"` -> `[("views", true), ("id", false)]`, fields checked against the model.
+fn parse_order(name: &str, fields: &[Field], order: &str) -> Result<Order> {
+    let fail = |m: String| Err(Error::Declaration(m));
+    let mut parsed = Vec::new();
+    for part in order.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let words: Vec<&str> = part.split_whitespace().collect();
+        let desc = match words.get(1).map(|w| w.to_ascii_lowercase()) {
+            None => false,
+            Some(w) if w == "asc" => false,
+            Some(w) if w == "desc" => true,
+            Some(_) => return fail(format!("{name}: illegal order_by '{part}'")),
+        };
+        if words.len() > 2 || !fields.iter().any(|f| f.name == words[0]) {
+            return fail(format!("{name}: illegal order_by '{part}'"));
+        }
+        parsed.push((words[0].to_string(), desc));
+    }
+    Ok(parsed)
+}
+
+/// `filter` and `orderBy` of a `vis` entry run on the node, as Java keeps them off the build (`@Transient`):
+/// taken out before the schema check. A view without a `code` gets its title.
+fn pull_vis(mut raw: Value) -> std::result::Result<(Value, Vec<RawView>), String> {
+    let mut vis = Vec::new();
+    for entry in raw
+        .get_mut("vis")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(entry) = entry.as_object_mut() else {
+            continue; // the schema check reports it
+        };
+        if !entry.contains_key("code") {
+            let title = entry.get("title").cloned().unwrap_or(json!(""));
+            entry.insert("code".to_string(), title);
+        }
+        let filters = match entry.remove("filter") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(sql)) => vec![sql.as_str().into()],
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|f| f.as_str().map(Filter::from))
+                .collect::<Option<_>>()
+                .ok_or("a vis filter must be SQL text or a list of it")?,
+            Some(_) => return Err("a vis filter must be SQL text or a list of it".into()),
+        };
+        let sort = match entry.remove("orderBy") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(order)) => order,
+            Some(_) => return Err("a vis orderBy must be text".into()),
+        };
+        vis.push((text(&entry["code"]), filters, sort));
+    }
+    Ok((raw, vis))
 }
 
 /// Records to JSON rows: every declared field present (null when missing).

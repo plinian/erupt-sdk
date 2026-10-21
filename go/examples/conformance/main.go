@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"time"
@@ -37,6 +38,20 @@ type Note struct {
 	Text string `json:"text" erupt:"title=Text"`
 }
 
+type NoteProxy struct{ erupt.BaseDataProxy }
+
+func (NoteProxy) AddBehavior(_ context.Context, record erupt.Record) error {
+	record["text"] = "new"
+	return nil
+}
+
+func (NoteProxy) Validate(_ context.Context, record erupt.Record) error {
+	if record["text"] == "forbidden" {
+		return erupt.Fail("forbidden text")
+	}
+	return nil
+}
+
 func main() {
 	category := must(erupt.NewModel(Category{}, "Category"))
 	form := must(erupt.NewModel(PublishForm{}, "Publish Options"))
@@ -60,7 +75,7 @@ func main() {
 				Show:    func(u *erupt.User) bool { return u != nil && u.Account == "root" },
 				Handler: func(*erupt.OpContext) (string, error) { return "", nil }},
 		)))
-	note := must(erupt.NewModel(Note{}, "Note", erupt.WithPower(map[string]bool{"delete": false})))
+	note := must(erupt.NewModel(Note{}, "Note", erupt.WithPower(map[string]bool{"delete": false}), erupt.WithDataProxy(NoteProxy{})))
 
 	port := os.Getenv("PORT")
 	node := must(erupt.NewNode(erupt.Config{Name: "conformance", AccessToken: os.Getenv("ERUPT_ACCESS_TOKEN"),

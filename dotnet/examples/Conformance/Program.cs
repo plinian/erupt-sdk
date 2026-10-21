@@ -62,9 +62,19 @@ internal sealed class Article
     [Field("Topic", Tree = "parent")] public Category? Topic { get; set; }
 }
 
-[EruptModel("Note")]
+[EruptModel("Note", DataProxy = [typeof(NoteProxy)])]
 internal sealed class Note
 {
     [Pk] public long Id { get; set; }
     [Field("Text")] public string? Text { get; set; }
+}
+
+internal sealed class NoteProxy : IDataProxy
+{
+    public void AddBehavior(Record record) => record["text"] = "new";
+
+    public void Validate(Record record)
+    {
+        if (record["text"] as string == "forbidden") throw new EruptFailure("forbidden text");
+    }
 }

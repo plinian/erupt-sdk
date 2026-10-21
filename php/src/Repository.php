@@ -2,7 +2,10 @@
 
 namespace Erupt;
 
-/** Implement these methods to put an erupt model on any storage. A record is an associative array keyed by field name. */
+/**
+ * Implement these methods to put an erupt model on any storage. A record is an associative array keyed by field name.
+ * `page` must apply the query's filters (SQL of a @Vis view and DataProxy::beforeFetch) or throw; ignoring them would show rows they hide.
+ */
 interface Repository
 {
     public function bind(Model $model): void;

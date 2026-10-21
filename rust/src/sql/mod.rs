@@ -124,8 +124,30 @@ impl SqlRepository {
         format!("{open}{escaped}{close}")
     }
 
-    pub(crate) fn where_clause(&self, query: &Query, sql: &mut Sql) -> String {
+    pub(crate) fn where_clause(&self, query: &Query, sql: &mut Sql) -> Result<String> {
         let mut clauses = Vec::new();
+        for f in &query.filters {
+            // the developer's own SQL, as written; with params, each '?' is one of them, bound like every other value
+            let pieces: Vec<&str> = if f.params.is_empty() {
+                vec![&f.sql]
+            } else {
+                f.sql.split('?').collect()
+            };
+            if pieces.len() - 1 != f.params.len() {
+                return Err(Error::Other(format!(
+                    "filter: {} '?' for {} params in {:?}",
+                    pieces.len() - 1,
+                    f.params.len(),
+                    f.sql
+                )));
+            }
+            let mut text = pieces[0].to_string();
+            for (v, piece) in f.params.iter().zip(&pieces[1..]) {
+                text += &sql.p(v.clone());
+                text += piece;
+            }
+            clauses.push(format!("({text})"));
+        }
         for c in &query.conditions {
             let col = self.q(&c.field);
             let list = c.value.as_array().cloned().unwrap_or_default();
@@ -168,17 +190,17 @@ impl SqlRepository {
                 _ => clauses.push("1=0".to_string()),
             }
         }
-        if clauses.is_empty() {
+        Ok(if clauses.is_empty() {
             String::new()
         } else {
             format!(" WHERE {}", clauses.join(" AND "))
-        }
+        })
     }
 
     /// The SELECT of one page, exposed for tests of the generated SQL.
-    pub(crate) fn page_sql(&self, query: &Query) -> (String, Vec<Value>) {
+    pub(crate) fn page_sql(&self, query: &Query) -> Result<(String, Vec<Value>)> {
         let mut sql = Sql::new(self.dialect);
-        let where_clause = self.where_clause(query, &mut sql);
+        let where_clause = self.where_clause(query, &mut sql)?;
         let order = if query.sort.is_empty() {
             format!("{} ASC", self.q(self.pk()))
         } else {
@@ -205,13 +227,13 @@ impl SqlRepository {
                 format!("LIMIT {l} OFFSET {o}")
             }
         };
-        (
+        Ok((
             format!(
                 "SELECT * FROM {}{where_clause} ORDER BY {order} {paging}",
                 self.q(&self.table)
             ),
             sql.params,
-        )
+        ))
     }
 
     /// Values read back, normalized by field type: drivers disagree on booleans, integer widths and dates.
@@ -320,7 +342,7 @@ impl Repository for SqlRepository {
 
     fn page(&self, query: &Query) -> Result<(u64, Vec<Record>)> {
         let mut sql = Sql::new(self.dialect);
-        let where_clause = self.where_clause(query, &mut sql);
+        let where_clause = self.where_clause(query, &mut sql)?;
         let count = self.executor.query(
             &format!(
                 "SELECT COUNT(*) AS n FROM {}{where_clause}",
@@ -333,7 +355,7 @@ impl Repository for SqlRepository {
             .and_then(|r| r.values().next())
             .and_then(as_f64)
             .unwrap_or(0.0) as u64;
-        let (text, params) = self.page_sql(query);
+        let (text, params) = self.page_sql(query)?;
         let rows = self.executor.query(&text, &params)?;
         Ok((total, rows.into_iter().map(|r| self.record(r)).collect()))
     }
@@ -440,6 +462,7 @@ mod tests {
                 Cond::new("views", QueryExpression::In, json!([1, 2])),
             ],
             sort: vec![],
+            filters: vec![],
             offset: 0,
             limit: 10,
         };
@@ -450,11 +473,43 @@ mod tests {
             (Dialect::Mssql, "SELECT * FROM [post] WHERE [title] LIKE @p0 ESCAPE '!' AND [views] IN (@p1, @p2) ORDER BY [id] ASC OFFSET @p3 ROWS FETCH NEXT @p4 ROWS ONLY", "%a!%!!!_![%"),
         ];
         for (dialect, text, pattern) in cases {
-            let (sql, params) = repo(dialect).page_sql(&query);
+            let (sql, params) = repo(dialect).page_sql(&query).unwrap();
             assert_eq!(text, sql, "{dialect:?}");
             assert_eq!(json!(pattern), params[0], "{dialect:?}");
         }
         assert_eq!("`we``ird`", repo(Dialect::Mysql).q("we`ird"));
         assert_eq!("[we]]ird]", repo(Dialect::Mssql).q("we]ird"));
+    }
+
+    #[test]
+    fn filters() {
+        let query = Query {
+            conditions: vec![Cond::new("views", QueryExpression::Gt, json!(1))],
+            filters: vec![
+                "views < 9".into(),
+                crate::Filter::new("title = ? OR title = ?", vec![json!("a"), json!("b")]),
+            ],
+            ..Query::default()
+        };
+        let (sql, params) = repo(Dialect::Postgres).page_sql(&query).unwrap();
+        assert_eq!("SELECT * FROM \"post\" WHERE (views < 9) AND (title = $1 OR title = $2) AND \"views\" > $3 ORDER BY \"id\" ASC LIMIT $4 OFFSET $5", sql);
+        assert_eq!(
+            vec![json!("a"), json!("b"), json!(1), json!(10), json!(0)],
+            params
+        );
+        let query = Query {
+            filters: vec!["title = 'a?'".into()],
+            ..Query::default()
+        };
+        let (sql, _) = repo(Dialect::Sqlite).page_sql(&query).unwrap();
+        assert!(sql.contains("WHERE (title = 'a?')"), "{sql}");
+        let query = Query {
+            filters: vec![crate::Filter::new(
+                "title = ?",
+                vec![json!("a"), json!("b")],
+            )],
+            ..Query::default()
+        };
+        assert!(repo(Dialect::Sqlite).page_sql(&query).is_err());
     }
 }

@@ -3,10 +3,26 @@ namespace Erupt;
 /// <summary>One search condition. <see cref="Op"/>: EQ NEQ GT GTE LT LTE LIKE NOT_LIKE RANGE IN NOT_IN NULL NOT_NULL.</summary>
 public sealed record Cond(string Field, string Op, object? Value = null);
 
-/// <summary>What a repository is asked for. Field names are already checked against the model.</summary>
+/// <summary>
+/// SQL ANDed to a query's WHERE as written; with <see cref="Params"/>, each <c>?</c> in <see cref="Sql"/> is one of
+/// them, bound. Without, <see cref="Sql"/> is taken whole (<c>title = 'a?'</c> holds no parameter).
+/// </summary>
+public sealed record SqlFilter(string Sql, params object?[] Params)
+{
+    public static implicit operator SqlFilter(string sql) => new(sql);
+}
+
+/// <summary>
+/// What a repository is asked for. Field names are already checked against the model. <see cref="Filters"/> come
+/// from a <c>@Vis</c> view and <see cref="IDataProxy.BeforeFetch"/>: a repository must apply them or refuse the
+/// query, never ignore them.
+/// </summary>
 public sealed class Query
 {
     public List<Cond> Conditions { get; init; } = [];
+
+    /// <summary>The SQL of a <c>@Vis</c> view and every DataProxy's <see cref="IDataProxy.BeforeFetch"/>, ANDed to the conditions.</summary>
+    public List<SqlFilter> Filters { get; init; } = [];
 
     /// <summary>(field, descending), most significant first.</summary>
     public List<(string Field, bool Desc)> Sort { get; set; } = [];
@@ -19,7 +35,8 @@ public sealed class Query
 /// <summary>
 /// Storage of one model. Implement these methods to put an erupt model on any storage. A repository only sees
 /// field names the node has already checked against the model, so it may use them as identifiers; values must
-/// always travel as parameters.
+/// always travel as parameters. A repository that cannot apply <see cref="Query.Filters"/> must throw rather than
+/// ignore them.
 /// </summary>
 public interface IRepository
 {
@@ -39,7 +56,7 @@ public interface IRepository
     Task DeleteAsync(IReadOnlyList<object> pks, CancellationToken ct = default);
 }
 
-/// <summary>Records kept in process memory; the primary key is a sequence starting at 1.</summary>
+/// <summary>Records kept in process memory; the primary key is a sequence starting at 1. Refuses <see cref="Query.Filters"/>.</summary>
 public sealed class MemoryRepository(params Record[] seed) : IRepository
 {
     private readonly object _lock = new();
@@ -55,6 +72,7 @@ public sealed class MemoryRepository(params Record[] seed) : IRepository
 
     public Task<(long Total, IReadOnlyList<Record> Records)> PageAsync(Query query, CancellationToken ct = default)
     {
+        if (query.Filters.Count > 0) throw new NotSupportedException("MemoryRepository cannot apply SQL filters (a view filter, BeforeFetch)");
         List<Record> rows;
         lock (_lock) rows = _rows.Values.Where(r => query.Conditions.All(c => Match(r.GetValueOrDefault(c.Field), c))).Select(Copy).ToList();
         IEnumerable<Record> sorted = rows;

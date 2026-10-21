@@ -2,7 +2,9 @@ package xyz.erupt.sdk.example;
 
 import xyz.erupt.annotation.Erupt;
 import xyz.erupt.annotation.EruptField;
+import xyz.erupt.annotation.exception.EruptException;
 import xyz.erupt.annotation.expr.ExprBool;
+import xyz.erupt.annotation.fun.DataProxy;
 import xyz.erupt.annotation.fun.OperationHandler;
 import xyz.erupt.annotation.sub_erupt.Power;
 import xyz.erupt.annotation.sub_erupt.RowOperation;
@@ -80,12 +82,24 @@ public final class Conformance {
         Category topic;
     }
 
-    @Erupt(name = "Note", power = @Power(delete = false))
+    @Erupt(name = "Note", power = @Power(delete = false), dataProxy = NoteProxy.class)
     public static class Note {
         @EruptField
         Long id;
         @EruptField(views = @View(title = "Text"), edit = @Edit(title = "Text"))
         String text;
+    }
+
+    public static class NoteProxy implements DataProxy<Note> {
+        @Override
+        public void addBehavior(Note note) {
+            note.text = "new";
+        }
+
+        @Override
+        public void validate(Note note) {
+            if ("forbidden".equals(note.text)) throw new EruptException("forbidden text");
+        }
     }
 
     public static class Publish implements OperationHandler<Article, PublishForm> {

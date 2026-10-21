@@ -28,8 +28,8 @@ Server calls are checked both ways: with the plain `Access-Token`, and signed (`
 the way erupt 2.3.x servers call. A node verifies the signature with the algorithm of
 [`signature-vectors.json`](signature-vectors.json) (computed by the Java reference; every SDK unit-tests
 against it), trusts `Erupt-Enforced` only under a valid signature, and skips the `erupt-power` callback when it
-lists `power`. A reference travels as its key: the server resolves labels, flattened columns and trees, so a
-node answers 404 for `reference-tree`.
+lists `power`. A reference travels as its key: the server resolves labels, flattened columns and trees, and
+answers `reference-tree`, `build/{erupt}/{field}` and `drag-sort` itself, so a node serves none of them.
 
 ## Fixture
 
@@ -64,4 +64,5 @@ Operations, in this order:
 | `feature` | Feature | SINGLE | no confirm dialog | returns the script `alert('featured')` |
 | `rebuild` | Rebuild | BUTTON | shown only when the user's account is `root` | none |
 
-**Note**, power `delete` off: `id` pk; `text` Text (INPUT).
+**Note**, power `delete` off: `id` pk; `text` Text (INPUT). Its DataProxy opens a new form with `text` `new`
+(`addBehavior`) and refuses a record whose `text` is `forbidden` with the message `forbidden text` (`validate`).

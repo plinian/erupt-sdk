@@ -111,18 +111,18 @@ func TestSQLGeneration(t *testing.T) {
 	_, article := testModels(t)
 	repo := &SQLRepository{Table: "article", Dollar: true, Quote: `"`}
 	repo.model = article
-	_, countArgs, page, args := repo.pageSQL(Query{Conditions: []Cond{
+	_, countArgs, page, args := repo.pageSQL(Query{Filters: []Filter{{SQL: "owner = ? OR shared", Params: []any{"admin"}}}, Conditions: []Cond{
 		{"title", "LIKE", `50%_off!`}, {"views", "IN", []any{int64(1), int64(2)}}, {"publish_date", "RANGE", []any{time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)}},
 	}, Sort: []Order{{Field: "title", Desc: true}}, Offset: 20, Limit: 10})
 	want := `SELECT "id", "title", "status", "views", "featured", "publish_date", "review_at", "body", "category", "topic" FROM "article"` +
-		` WHERE "title" LIKE $1 ESCAPE '!' AND "views" IN ($2, $3) AND "publish_date" BETWEEN $4 AND $5 ORDER BY "title" DESC LIMIT $6 OFFSET $7`
+		` WHERE (owner = $1 OR shared) AND "title" LIKE $2 ESCAPE '!' AND "views" IN ($3, $4) AND "publish_date" BETWEEN $5 AND $6 ORDER BY "title" DESC LIMIT $7 OFFSET $8`
 	if page != want {
 		t.Errorf("page SQL\n got %s\nwant %s", page, want)
 	}
-	if !reflect.DeepEqual(args, []any{"%50!%!_off!!%", int64(1), int64(2), "2026-01-01", "2026-02-01", 10, 20}) {
+	if !reflect.DeepEqual(args, []any{"admin", "%50!%!_off!!%", int64(1), int64(2), "2026-01-01", "2026-02-01", 10, 20}) {
 		t.Errorf("args %#v", args)
 	}
-	if len(countArgs) != 5 {
+	if len(countArgs) != 6 {
 		t.Errorf("count args %#v", countArgs)
 	}
 	if got := (&SQLRepository{Quote: "`"}).q("a`b"); got != "`a``b`" {
@@ -191,6 +191,231 @@ func TestNodeOverSQLite(t *testing.T) {
 	// a reference travels as its key; the server adds the label and the flattened column
 	if _, ok := row["category_name"]; ok {
 		t.Errorf("category_name is the server's to add: %v", row)
+	}
+}
+
+type memo struct {
+	ID   int64  `json:"id" erupt:"pk"`
+	Text string `json:"text" erupt:"title=Text"`
+}
+
+type memoProxy struct {
+	BaseDataProxy
+	calls []string
+}
+
+func (p *memoProxy) SearchCondition(_ context.Context, condition M) error {
+	condition["text"] = "hi"
+	return nil
+}
+
+func (p *memoProxy) AfterFetch(_ context.Context, rows []M) error {
+	for _, row := range rows {
+		row["text"] = strings.ToUpper(row["text"].(string))
+	}
+	return nil
+}
+
+func (p *memoProxy) AddBehavior(_ context.Context, record Record) error {
+	record["text"] = "new"
+	return nil
+}
+
+func (p *memoProxy) EditBehavior(_ context.Context, record Record) error {
+	record["text"] = record["text"].(string) + "?"
+	return nil
+}
+
+func (p *memoProxy) Validate(_ context.Context, record Record) error {
+	if record["text"] == "forbidden" {
+		return Fail("forbidden text")
+	}
+	return nil
+}
+
+// the write hooks only record that they ran, with the text they saw
+func (p *memoProxy) call(name string, record Record) error {
+	p.calls = append(p.calls, name+" "+record["text"].(string))
+	return nil
+}
+
+func (p *memoProxy) BeforeAdd(_ context.Context, r Record) error    { return p.call("BeforeAdd", r) }
+func (p *memoProxy) AfterAdd(_ context.Context, r Record) error     { return p.call("AfterAdd", r) }
+func (p *memoProxy) BeforeUpdate(_ context.Context, r Record) error { return p.call("BeforeUpdate", r) }
+func (p *memoProxy) AfterUpdate(_ context.Context, r Record) error  { return p.call("AfterUpdate", r) }
+func (p *memoProxy) BeforeDelete(_ context.Context, r Record) error { return p.call("BeforeDelete", r) }
+func (p *memoProxy) AfterDelete(_ context.Context, r Record) error  { return p.call("AfterDelete", r) }
+
+func TestDataProxy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
+	}))
+	defer server.Close()
+	proxy := &memoProxy{}
+	m, err := NewModel(memo{}, "Memo", WithName("Memo"), WithDataProxy(proxy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Register(m, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
+	}
+	call := func(method, path, body string) map[string]any {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", "Memo")
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var v map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		return v
+	}
+	if got := call("GET", "/erupt-api/build/Memo", "")["eruptModel"].(map[string]any)["searchCondition"]; !reflect.DeepEqual(got, map[string]any{"text": "hi"}) {
+		t.Errorf("searchCondition %v", got)
+	}
+	if got := call("GET", "/erupt-api/data/init-value/Memo", "")["text"]; got != "new" {
+		t.Errorf("init-value %v", got)
+	}
+	if r := call("POST", "/erupt-api/data/modify/Memo", `{"text":"forbidden"}`); r["success"] != false || r["message"] != "forbidden text" {
+		t.Errorf("validate %v", r)
+	}
+	if r := call("POST", "/erupt-api/data/modify/Memo", `{"text":"a"}`); r["success"] != true {
+		t.Fatalf("add %v", r)
+	}
+	list := call("POST", "/erupt-api/data/table/Memo", `{}`)["list"].([]any)
+	if len(list) != 1 || list[0].(map[string]any)["text"] != "A" {
+		t.Fatalf("afterFetch %v", list)
+	}
+	row := list[0].(map[string]any)
+	pk := str(row["id"])
+	if got := call("GET", "/erupt-api/data/Memo/"+pk, "")["text"]; got != "a?" {
+		t.Errorf("editBehavior %v", got)
+	}
+	if r := call("POST", "/erupt-api/data/modify/Memo/update", `{"id":`+pk+`,"text":"b"}`); r["success"] != true {
+		t.Fatalf("update %v", r)
+	}
+	if r := call("POST", "/erupt-api/data/modify/Memo/delete", `[`+pk+`]`); r["success"] != true {
+		t.Fatalf("delete %v", r)
+	}
+	want := []string{"BeforeAdd a", "AfterAdd a", "BeforeUpdate b", "AfterUpdate b", "BeforeDelete b", "AfterDelete b"}
+	if !reflect.DeepEqual(proxy.calls, want) {
+		t.Errorf("calls %v", proxy.calls)
+	}
+}
+
+type task struct {
+	ID    int64  `json:"id" erupt:"pk"`
+	Title string `json:"title" erupt:"title=Title;search"`
+	Owner string `json:"owner" erupt:"title=Owner"`
+	Done  bool   `json:"done" erupt:"title=Done"`
+}
+
+type taskProxy struct{ BaseDataProxy }
+
+func (taskProxy) BeforeFetch(ctx context.Context, _ []Cond) (Filter, error) {
+	return Filter{SQL: "owner = ?", Params: []any{UserFrom(ctx).Account}}, nil
+}
+
+type openProxy struct{ BaseDataProxy }
+
+func (openProxy) BeforeFetch(context.Context, []Cond) (Filter, error) {
+	return Filter{SQL: "done = 0"}, nil
+}
+
+func TestBeforeFetch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
+	}))
+	defer server.Close()
+	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := func(name string, repo Repository) {
+		m, err := NewModel(task{}, "Task", WithName(name), WithDataProxy(taskProxy{}, openProxy{}), WithRaw(M{"vis": []any{
+			M{"code": "q", "title": "Question", "type": "TABLE", "filter": "title = 'a?'"},
+			NodeVis{Vis: Vis{Title: Ptr("Reversed"), Type: VisTypeTable}, Filter: []string{"1 = 1", "2 = 2"}, OrderBy: "title desc"},
+		}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := node.Register(m, repo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	register("Task", &SQLRepository{DB: newSQLite(t), Table: "task", AutoCreate: true})
+	register("MemoryTask", NewMemoryRepository())
+	call := func(path, erupt, account, body string) (int, map[string]any) {
+		req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", erupt)
+		req.Header.Set("user", base64.StdEncoding.EncodeToString([]byte(`{"uid":1,"account":"`+account+`"}`)))
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var v map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		return w.Code, v
+	}
+	for _, body := range []string{`{"title":"a","owner":"admin","done":false}`, `{"title":"b","owner":"admin","done":true}`,
+		`{"title":"c","owner":"root","done":false}`, `{"title":"a?","owner":"admin","done":false}`} {
+		if _, r := call("/erupt-api/data/modify/Task", "Task", "admin", body); r["success"] != true {
+			t.Fatalf("add %v", r)
+		}
+	}
+	titles := func(page map[string]any) []string {
+		out := []string{}
+		for _, row := range page["list"].([]any) {
+			out = append(out, row.(map[string]any)["title"].(string))
+		}
+		return out
+	}
+	if _, page := call("/erupt-api/data/table/Task", "Task", "admin", `{}`); !reflect.DeepEqual(titles(page), []string{"a", "a?"}) || page["total"] != 2.0 {
+		t.Errorf("admin %v", page)
+	}
+	if _, page := call("/erupt-api/data/table/Task", "Task", "root", `{"condition":[{"key":"title","expression":"EQ","value":"a"}]}`); !reflect.DeepEqual(titles(page), []string{}) {
+		t.Errorf("root %v", page)
+	}
+	// a view's own filter and order run on the node, and stay out of the build
+	if _, page := call("/erupt-api/data/table/Task", "Task", "admin", `{"vis":"q"}`); !reflect.DeepEqual(titles(page), []string{"a?"}) {
+		t.Errorf("vis q %v", page)
+	}
+	if _, page := call("/erupt-api/data/table/Task", "Task", "admin", `{"vis":"Reversed"}`); !reflect.DeepEqual(titles(page), []string{"a?", "a"}) {
+		t.Errorf("vis Reversed %v", page)
+	}
+	req := httptest.NewRequest("GET", "/erupt-api/build/Task", nil)
+	req.Header.Set("Access-Token", "secret")
+	req.Header.Set("erupt", "Task")
+	w := httptest.NewRecorder()
+	node.ServeHTTP(w, req)
+	var build struct {
+		EruptModel struct {
+			EruptJSON struct{ Vis []map[string]any }
+		}
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &build); err != nil {
+		t.Fatal(err)
+	}
+	var codes []string
+	for _, v := range build.EruptModel.EruptJSON.Vis {
+		codes = append(codes, str(v["code"]))
+		if _, ok := v["filter"]; ok {
+			t.Errorf("filter in the build %v", v)
+		}
+		if _, ok := v["orderBy"]; ok {
+			t.Errorf("orderBy in the build %v", v)
+		}
+	}
+	if !reflect.DeepEqual(codes, []string{"q", "Reversed"}) {
+		t.Errorf("vis codes %v", codes)
+	}
+	if code, _ := call("/erupt-api/data/table/MemoryTask", "MemoryTask", "admin", `{}`); code != 500 {
+		t.Errorf("memory repository answered %d, want 500", code)
+	}
+	if _, _, err := (&SQLRepository{DB: newSQLite(t), Table: "task"}).Page(context.Background(), Query{Filters: []Filter{{SQL: "owner = ? AND done = ?", Params: []any{"admin"}}}}); err == nil {
+		t.Error("a '?' without its param was accepted")
 	}
 }
 

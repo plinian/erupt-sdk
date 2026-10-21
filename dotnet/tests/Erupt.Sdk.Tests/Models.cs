@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+
 namespace Erupt.Tests;
 
 [EruptModel("Category")]
@@ -27,6 +29,66 @@ public sealed class Article
     [Field("Body", Type = EditType.TEXTAREA, Table = false)] public string? Body { get; set; }
     [Field("Category", Search = true)] public Category? Category { get; set; }
     [Field("Topic", Tree = "parent")] public Category? Topic { get; set; }
+}
+
+[EruptModel("Memo", DataProxy = [typeof(MemoProxy)])]
+public sealed class Memo
+{
+    [Pk] public long Id { get; set; }
+    [Field("Text")] public string? Text { get; set; }
+}
+
+public sealed class MemoProxy : IDataProxy
+{
+    public static readonly List<(string Hook, object? Text)> Calls = [];
+
+    public void SearchCondition(Record condition) => condition["text"] = "hi";
+
+    public void AfterFetch(IReadOnlyList<JsonObject> rows)
+    {
+        foreach (var row in rows) row["text"] = row["text"]!.GetValue<string>().ToUpperInvariant();
+    }
+
+    public void AddBehavior(Record record) => record["text"] = "new";
+
+    public void EditBehavior(Record record) => record["text"] += "?";
+
+    public void Validate(Record record)
+    {
+        if (record["text"] as string == "forbidden") throw new EruptFailure("forbidden text");
+    }
+
+    // the write hooks only record that they ran, with the text they saw
+    public void BeforeAdd(Record record) => Calls.Add(("BeforeAdd", record["text"]));
+
+    public void AfterAdd(Record record) => Calls.Add(("AfterAdd", record["text"]));
+
+    public void BeforeUpdate(Record record) => Calls.Add(("BeforeUpdate", record["text"]));
+
+    public void AfterUpdate(Record record) => Calls.Add(("AfterUpdate", record["text"]));
+
+    public void BeforeDelete(Record record) => Calls.Add(("BeforeDelete", record["text"]));
+
+    public void AfterDelete(Record record) => Calls.Add(("AfterDelete", record["text"]));
+}
+
+[EruptModel("Task", Name = "Task", DataProxy = [typeof(TaskProxy), typeof(OpenProxy)])]
+public sealed class TaskItem
+{
+    [Pk] public long Id { get; set; }
+    [Field("Title", Search = true)] public string? Title { get; set; }
+    [Field("Owner")] public string? Owner { get; set; }
+    [Field("Done")] public bool Done { get; set; }
+}
+
+public sealed class TaskProxy : IDataProxy
+{
+    public SqlFilter BeforeFetch(IReadOnlyList<Cond> conditions) => new("owner = ?", EruptNode.CurrentUser!.Account);
+}
+
+public sealed class OpenProxy : IDataProxy
+{
+    public SqlFilter BeforeFetch(IReadOnlyList<Cond> conditions) => "done = 0";
 }
 
 [EruptModel("Bad")]

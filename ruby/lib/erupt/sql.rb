@@ -119,9 +119,9 @@ module Erupt
 
     def page(query)
       p = Params.new(@dialect)
-      total = @executor.call("SELECT COUNT(*) AS n FROM #{q(@table)}#{where(query.conditions, p)}", p.values).first
+      total = @executor.call("SELECT COUNT(*) AS n FROM #{q(@table)}#{where(query, p)}", p.values).first
       p = Params.new(@dialect)
-      sql = "SELECT * FROM #{q(@table)}#{where(query.conditions, p)}"
+      sql = "SELECT * FROM #{q(@table)}#{where(query, p)}"
       order = (query.sort.empty? ? [[model.pk, false]] : query.sort).map { |name, desc| "#{q(name)} #{desc ? "DESC" : "ASC"}" }
       sql += " ORDER BY #{order.join(", ")} LIMIT #{p << query.limit} OFFSET #{p << query.offset}"
       [Integer(total.values.first.to_s, 10), @executor.call(sql, p.values).map { |row| record(row) }]
@@ -170,8 +170,15 @@ module Erupt
       keys(record).except(model.pk).to_h { |k, v| [k, model.fields[k]&.json? && !v.nil? ? JSON.generate(v) : v] }
     end
 
-    def where(conditions, p)
-      clauses = conditions.map do |c|
+    def where(query, p)
+      clauses = query.filters.map do |sql, params|
+        # the developer's own SQL, as written; with params, each '?' is one of them, bound like every other value
+        pieces = params.empty? ? [sql] : sql.split("?", -1)
+        raise ArgumentError, "filter: #{pieces.size - 1} '?' for #{params.size} params in #{sql.inspect}" if pieces.size - 1 != params.size
+
+        "(#{pieces.first}#{params.zip(pieces.drop(1)).map { |v, piece| (p << v) + piece }.join})"
+      end
+      clauses += query.conditions.map do |c|
         col = q(c.field)
         values = Array(c.value)
         case c.op

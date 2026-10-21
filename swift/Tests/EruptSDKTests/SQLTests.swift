@@ -91,6 +91,21 @@ func sqlModel() throws -> Model {
         #expect(throws: DeclarationError.self) { try SQLRepository(SQLClosureExecutor(.mysql) { _, _ in [] }, table: "x", autoCreate: true) }
         #expect(throws: DeclarationError.self) { try SQLRepository(SQLClosureExecutor(.sqlite) { _, _ in [] }, table: "x;drop") }
     }
+
+    @Test func filters() throws {
+        var statements: [(String, [JSON])] = []
+        let repo = try SQLRepository(SQLClosureExecutor(.postgres) { sql, params in
+            statements.append((sql, params))
+            return [["n": 0]]
+        }, table: "item")
+        try repo.bind(try sqlModel())
+        _ = try repo.page(Query(conditions: [Cond("name", "EQ", "x")], filters: [SQLFilter("price > ? OR price < ?", [1, 9]), "active"]))
+        #expect(statements[0].0 == #"SELECT COUNT(*) AS n FROM "item" WHERE (price > $1 OR price < $2) AND (active) AND "name" = $3"#)
+        #expect(statements[1].1 == [1, 9, "x", 10, 0])
+        _ = try repo.page(Query(filters: ["name = 'a?'"]))  // without params, '?' is plain SQL
+        #expect(statements[2].0 == #"SELECT COUNT(*) AS n FROM "item" WHERE (name = 'a?')"#)
+        #expect(throws: DeclarationError.self) { try repo.page(Query(filters: [SQLFilter("price > ?", [1, 2])])) }
+    }
 }
 
 @Suite struct MemoryRepositoryTests {

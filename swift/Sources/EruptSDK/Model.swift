@@ -289,6 +289,62 @@ public struct RowAction {
     }
 }
 
+/// Hooks around a model's data, as erupt's Java `DataProxy`: implement what you need and pass it as
+/// `Model(..., dataProxy: [...])`. A record is what the repository stores, a row what the browser reads; change
+/// them in place. Throw an `EruptFailure` to refuse with a message.
+public protocol DataProxy {
+    /// Default values of the search bar, `condition[field] = value`.
+    func searchCondition(_ condition: inout [String: JSON])
+    /// SQL ANDed to a table page's WHERE, as written: `"status <> 'deleted'"`, or with its values bound,
+    /// `SQLFilter("owner = ?", [uid])`. `conditions` are the search bar's. Only SQL repositories apply it.
+    func beforeFetch(_ conditions: [Cond]) throws -> SQLFilter?
+    /// The rows of a table page, before they are sent.
+    func afterFetch(_ rows: inout [Record]) throws
+    /// The values a new record's form opens with.
+    func addBehavior(_ record: inout Record) throws
+    /// A record read by its key, for the edit form or the detail view.
+    func editBehavior(_ record: inout Record) throws
+    /// A record about to be added or updated.
+    func validate(_ record: Record) throws
+    func beforeAdd(_ record: inout Record) throws
+    func afterAdd(_ record: Record) throws
+    func beforeUpdate(_ record: inout Record) throws
+    func afterUpdate(_ record: Record) throws
+    func beforeDelete(_ record: Record) throws
+    func afterDelete(_ record: Record) throws
+}
+
+extension DataProxy {
+    public func searchCondition(_ condition: inout [String: JSON]) {}
+    public func beforeFetch(_ conditions: [Cond]) throws -> SQLFilter? { nil }
+    public func afterFetch(_ rows: inout [Record]) throws {}
+    public func addBehavior(_ record: inout Record) throws {}
+    public func editBehavior(_ record: inout Record) throws {}
+    public func validate(_ record: Record) throws {}
+    public func beforeAdd(_ record: inout Record) throws {}
+    public func afterAdd(_ record: Record) throws {}
+    public func beforeUpdate(_ record: inout Record) throws {}
+    public func afterUpdate(_ record: Record) throws {}
+    public func beforeDelete(_ record: Record) throws {}
+    public func afterDelete(_ record: Record) throws {}
+}
+
+/// What the node applies when a table is read for one `@Vis` view, given as `Model(..., visQuery:)` under the
+/// view's code: `filter` is SQL ANDed to the WHERE as written (SQL repositories only, like `beforeFetch`), `orderBy`
+/// the view's order when the request has none (`"title desc, id"`). Java keeps both `@Transient`: they are not in
+/// `Vis` and never in the build.
+public struct VisQuery {
+    let filter: [String]
+    let orderBy: String?
+
+    public init(filter: [String] = [], orderBy: String? = nil) {
+        self.filter = filter
+        self.orderBy = orderBy
+    }
+
+    public init(filter: String, orderBy: String? = nil) { self.init(filter: [filter], orderBy: orderBy) }
+}
+
 /// One element of a model declaration.
 public enum ModelPart {
     case field(Field)
@@ -337,15 +393,20 @@ public final class Model {
     let declared: [Field]
     let fields: [String: Field]
     let actions: [RowAction]
+    let proxies: [DataProxy]
     /// the default table order, applied by the node
     let order: [(field: String, descending: Bool)]
+    /// view code -> the filters and order the node applies to that view's table queries
+    let vis: [String: (filters: [SQLFilter], order: [(field: String, descending: Bool)])]
 
     /// `name` is what the server addresses; `power` switches features off (`["delete": false]`); `orderBy` is
     /// the default table order (`"views desc, id"`); `erupt` carries other `@Erupt` attributes
-    /// (`Erupt(layout: Layout(pageSize: 30))`). An unknown attribute or value fails here, not in the browser.
+    /// (`Erupt(layout: Layout(pageSize: 30))`); `dataProxy` runs around every read and write of the model, in
+    /// order; `visQuery` gives a `@Vis` view (by its code, or its title when it has none) a filter and an order.
+    /// An unknown attribute or value fails here, not in the browser.
     public init(
         _ name: String, title: String? = nil, power: [String: Bool] = [:], orderBy: String? = nil, erupt: Erupt? = nil,
-        @ModelBuilder _ body: () -> [ModelPart]
+        dataProxy: [DataProxy] = [], visQuery: [String: VisQuery] = [:], @ModelBuilder _ body: () -> [ModelPart]
     ) throws {
         guard isIdentifier(name) else { throw DeclarationError("erupt name '\(name)' must be an identifier") }
         self.name = name
@@ -356,7 +417,16 @@ public final class Model {
             granted[right] = value
         }
         self.power = granted
+        var erupt = erupt
+        // a view without a code is addressed by its title
+        let views = erupt?.vis?.map { v in
+            var v = v
+            if v.code == nil { v.code = v.title ?? "" }
+            return v
+        }
+        erupt?.vis = views
         self.raw = erupt
+        self.proxies = dataProxy
         if let erupt { try Schema.check("Erupt", erupt.json, path: "erupt \(name)") }
 
         var declared: [Field] = [], fields: [String: Field] = [:], names: [String] = [], actions: [RowAction] = []
@@ -390,20 +460,33 @@ public final class Model {
         self.fieldNames = names
         self.actions = actions
         self.pk = pk
-        let orderText: String = orderBy ?? ""
-        self.order = try orderText.split(separator: ",").map { String($0).trimmingSpaces }.filter { !$0.isEmpty }.map { part in
-            let words = part.split(separator: " ").map(String.init)
-            let dir = words.count > 1 ? words[1].lowercased() : "asc"
-            guard fields[words[0]] != nil, words.count <= 2, dir == "asc" || dir == "desc" else {
-                throw DeclarationError("\(name): illegal orderBy '\(part)'")
+        func parseOrder(_ text: String?) throws -> [(field: String, descending: Bool)] {
+            try (text ?? "").split(separator: ",").map { String($0).trimmingSpaces }.filter { !$0.isEmpty }.map { part in
+                let words = part.split(separator: " ").map(String.init)
+                let dir = words.count > 1 ? words[1].lowercased() : "asc"
+                guard fields[words[0]] != nil, words.count <= 2, dir == "asc" || dir == "desc" else {
+                    throw DeclarationError("\(name): illegal orderBy '\(part)'")
+                }
+                return (words[0], dir == "desc")
             }
-            return (words[0], dir == "desc")
+        }
+        self.order = try parseOrder(orderBy)
+        let codes = Set(erupt?.vis?.compactMap(\.code) ?? [])
+        self.vis = try visQuery.mapValues { q in (q.filter.map { SQLFilter($0) }, try parseOrder(q.orderBy)) }
+        if let code = visQuery.keys.sorted().first(where: { !codes.contains($0) }) {
+            throw DeclarationError("\(name): visQuery '\(code)' is not a declared vis")
         }
     }
 
     func field(_ name: String) -> Field? { fields[name] }
 
     func action(_ code: String) -> RowAction? { actions.first { $0.code == code } }
+
+    /// Runs one DataProxy hook on every proxy, in declaration order.
+    func hook(_ run: (DataProxy) throws -> Void) rethrows { for p in proxies { try run(p) } }
+
+    /// The SQL every proxy's `beforeFetch` adds.
+    func filters(_ conditions: [Cond]) throws -> [SQLFilter] { try proxies.compactMap { try $0.beforeFetch(conditions) } }
 
     /// Values as the fields hold them, where they can be read so: lets seeds be written loosely
     /// (`"2026-10-02 10:00"`, `"9.9"`); anything else is kept as given.
@@ -420,9 +503,11 @@ public final class Model {
         erupt["primaryKeyCol"] = .string(pk ?? "id")
         erupt["rowOperation"] = .array(actions.map { $0.build() })
         if let raw { merge(&erupt, raw.json) }
+        var condition: [String: JSON] = [:]
+        hook { $0.searchCondition(&condition) }
         return [
             "eruptName": .string(name), "eruptJson": erupt, "eruptFieldModels": .array(declared.map { $0.build() }),
-            "searchCondition": [:], "extraRow": false, "tags": [:],
+            "searchCondition": .object(condition), "extraRow": false, "tags": [:],
         ]
     }
 

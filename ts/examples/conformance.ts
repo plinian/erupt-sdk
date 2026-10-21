@@ -1,5 +1,5 @@
 // The conformance fixture (conformance/README.md) in TypeScript.
-import { field, MemoryRepository, model, Node, operation } from "../src/index.js";
+import { Fail, field, MemoryRepository, model, Node, operation } from "../src/index.js";
 
 const Category = model("Category", {
   id: field.pk(),
@@ -37,7 +37,17 @@ const Article = model("Article", {
 const Note = model("Note", {
   id: field.pk(),
   text: field.input("Text"),
-}, { power: { delete: false } });
+}, {
+  power: { delete: false },
+  dataProxy: {
+    addBehavior(record) {
+      record.text = "new";
+    },
+    validate(record) {
+      if (record.text === "forbidden") throw new Fail("forbidden text");
+    },
+  },
+});
 
 const env = process.env;
 const node = new Node("conformance", env.ERUPT_ACCESS_TOKEN!, env.ERUPT_SERVER!, { address: `http://127.0.0.1:${env.PORT}` });

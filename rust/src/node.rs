@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::http::{self, base64_decode, decode, encode, Request, Response};
-use crate::model::{json_value, Field, Model, OpContext, REFERENCES};
+use crate::model::{json_value, Field, Model, OpContext};
 use crate::repo::{Cond, Query, Repository};
 use crate::signature;
 use crate::types::{QueryExpression, RowOperationMode};
@@ -225,7 +225,6 @@ impl Node {
         let m = req.method.as_str();
         let route = match (m, segments.as_slice()) {
             ("GET", ["build", e]) => Some((*e, Route::Build)),
-            ("GET", ["build", e, f]) => Some((*e, Route::BuildByField(decode(f)))),
             ("POST", ["data", "table", e]) => Some((*e, Route::Table)),
             ("POST", ["data", e, "reference-table", f]) => {
                 Some((*e, Route::ReferenceTable(decode(f))))
@@ -269,17 +268,12 @@ impl Node {
         let (model, repo) = (model.as_ref(), repo.as_ref());
         match route {
             Route::Build => Ok(model.build_model(&self.power(model, req), current_user().as_ref())),
-            Route::BuildByField(field) => {
-                // the reference picker: build of the referenced model, requested under the host model's name
-                let target = reference_field(model, &field, None)?.target();
-                Ok(target.build_model(&self.power(target, req), current_user().as_ref()))
-            }
             Route::Table => {
                 self.require(model, req, "query")?;
                 self.page(model, repo, &body_object(req)?)
             }
             Route::ReferenceTable(field) => {
-                let target = reference_field(model, &field, Some("REFERENCE_TABLE"))?.target();
+                let target = reference_field(model, &field)?.target();
                 self.page(target, self.repo_of(target)?, &body_object(req)?)
             }
             Route::FormValue(code) => {
@@ -295,12 +289,12 @@ impl Node {
             Route::Operation(code) => self.operation(model, repo, req, &code),
             Route::InitValue => {
                 self.require(model, req, "add")?;
-                Ok(Value::Object(
-                    model
-                        .stored()
-                        .map(|f| (f.name.clone(), Value::Null))
-                        .collect(),
-                ))
+                let mut record: Record = model
+                    .stored()
+                    .map(|f| (f.name.clone(), Value::Null))
+                    .collect();
+                model.hook(|p| p.add_behavior(&mut record))?;
+                Ok(Value::Object(self.rows(model, vec![record]).remove(0)))
             }
             Route::Get(id) => {
                 let power = self.power(model, req);
@@ -308,14 +302,19 @@ impl Node {
                     return Err(Reply::Status(403));
                 }
                 let pk = primary_key(model, &Value::String(id))?;
-                let record = repo
+                let mut record = repo
                     .get(&pk)?
                     .ok_or(Reply::Fail("record not found".into()))?;
-                Ok(self.rows(model, vec![record])?.remove(0))
+                model.hook(|p| p.edit_behavior(&mut record))?;
+                Ok(Value::Object(self.rows(model, vec![record]).remove(0)))
             }
             Route::Add => {
                 self.require(model, req, "add")?;
-                repo.add(record(model, &body_object(req)?)?)?;
+                let mut record = record(model, &body_object(req)?)?;
+                model.hook(|p| p.validate(&record))?;
+                model.hook(|p| p.before_add(&mut record))?;
+                repo.add(record.clone())?;
+                model.hook(|p| p.after_add(&record))?;
                 Ok(r_ok())
             }
             Route::Update => {
@@ -328,7 +327,11 @@ impl Node {
                 if repo.get(&pk)?.is_none() {
                     return fail("record not found");
                 }
-                repo.update(&pk, record(model, &body)?)?;
+                let mut record = record(model, &body)?;
+                model.hook(|p| p.validate(&record))?;
+                model.hook(|p| p.before_update(&mut record))?;
+                repo.update(&pk, record.clone())?;
+                model.hook(|p| p.after_update(&record))?;
                 Ok(r_ok())
             }
             Route::Delete => {
@@ -340,7 +343,20 @@ impl Node {
                     .iter()
                     .map(|id| primary_key(model, id))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
+                // the hooks see each record as it was; reading them costs nothing without a proxy
+                let mut records = Vec::new();
+                if !model.proxies.is_empty() {
+                    for pk in &pks {
+                        records.extend(repo.get(pk)?);
+                    }
+                }
+                for record in &records {
+                    model.hook(|p| p.before_delete(record))?;
+                }
                 repo.delete(&pks)?;
+                for record in &records {
+                    model.hook(|p| p.after_delete(record))?;
+                }
                 Ok(r_ok())
             }
         }
@@ -358,6 +374,7 @@ impl Node {
         let mut query = Query {
             conditions: Vec::new(),
             sort: Vec::new(),
+            filters: Vec::new(),
             offset: (page_index - 1) * page_size,
             limit: page_size,
         };
@@ -385,30 +402,43 @@ impl Node {
                 .unwrap_or(false);
             query.sort.push((f.name.clone(), desc));
         }
+        // a @Vis view's own filter and order, then the DataProxy's
+        let (filters, sort) = body
+            .get("vis")
+            .and_then(Value::as_str)
+            .and_then(|code| model.vis.get(code))
+            .cloned()
+            .unwrap_or_default();
         if query.sort.is_empty() {
-            query.sort = model.order_by.clone();
+            query.sort = if sort.is_empty() {
+                model.order_by.clone()
+            } else {
+                sort
+            };
         }
+        query.filters = filters;
+        query.filters.extend(model.filters(&query.conditions)?);
         let (total, records) = repo.page(&query)?;
+        let mut rows = self.rows(model, records);
+        model.hook(|p| p.after_fetch(&mut rows))?;
         Ok(json!({
             "pageIndex": page_index, "pageSize": page_size, "total": total, "totalPage": total.div_ceil(page_size),
-            "list": self.rows(model, records)?, "sort": null, "alert": null, "extraContent": null,
+            "list": rows, "sort": null, "alert": null, "extraContent": null,
         }))
     }
 
     /// Records to browser rows. A reference stays its key: the server resolves its label, the flattened
     /// `<field>_<label>` column and the tree (erupt-cloud/PROTOCOL.md §7.3).
-    fn rows(&self, model: &Model, records: Vec<Record>) -> std::result::Result<Vec<Value>, Reply> {
-        Ok(records
+    fn rows(&self, model: &Model, records: Vec<Record>) -> Vec<Record> {
+        records
             .into_iter()
             .map(|record| {
-                Value::Object(
-                    model
-                        .stored()
-                        .map(|f| (f.name.clone(), json_value(record.get(&f.name))))
-                        .collect(),
-                )
+                model
+                    .stored()
+                    .map(|f| (f.name.clone(), json_value(record.get(&f.name))))
+                    .collect()
             })
-            .collect())
+            .collect()
     }
 
     fn operation(&self, model: &Model, repo: &dyn Repository, req: &Request, code: &str) -> Out {
@@ -714,7 +744,6 @@ impl Node {
 
 enum Route {
     Build,
-    BuildByField(String),
     Table,
     ReferenceTable(String),
     FormValue(String),
@@ -730,16 +759,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn reference_field<'a>(
-    model: &'a Model,
-    name: &str,
-    kind: Option<&str>,
-) -> std::result::Result<&'a Field, Reply> {
+fn reference_field<'a>(model: &'a Model, name: &str) -> std::result::Result<&'a Field, Reply> {
     model
         .field(name)
-        .filter(|f| {
-            REFERENCES.contains(&f.kind.as_str()) && kind.map(|k| f.kind == k).unwrap_or(true)
-        })
+        .filter(|f| f.kind == "REFERENCE_TABLE")
         .ok_or(Reply::Status(404))
 }
 
