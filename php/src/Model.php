@@ -38,6 +38,10 @@ final class Model
     public readonly array $proxies;
     /** @var array<string, array{0: list<array{0: string, 1: list<mixed>}>, 1: list<array{0: string, 1: bool}>}> view code -> [filters, sort] */
     public readonly array $vis;
+    /** @var array{0: string, 1: bool}|null [field, dependNode] of a @LinkTree: the reference the tree beside the table filters */
+    public readonly ?array $linkTree;
+    /** @var array<string, array{erupt: string, column: string, join: string, condition: string}> drill code -> its link, applied by the node */
+    public readonly array $drills;
     private readonly array $raw;
 
     /** The compiled model of an #[Erupt] class; cached, so declarations are checked once. */
@@ -79,6 +83,7 @@ final class Model
         }
         $this->proxies = $proxies;
         [$raw, $vis] = self::pullVis($decl->raw);
+        [$raw, $this->drills] = self::pullDrills($raw);
         Schema::check('Erupt', $raw, "#[Erupt] $this->name");
         $this->raw = $raw;
         $defaults = Schema::defaults()['power'];
@@ -105,6 +110,11 @@ final class Model
         }
         $this->pk = $pks[0] ?? null;
         $this->orderBy = $this->parseOrder($decl->orderBy);
+        $link = $raw['linkTree'] ?? [];
+        $this->linkTree = isset($link['field']) ? [$link['field'], (bool) ($link['dependNode'] ?? false)] : null;
+        if ($this->linkTree && !($fields[$this->linkTree[0]] ?? null)?->isReference()) {
+            throw new \InvalidArgumentException("$this->name: linkTree.field '{$this->linkTree[0]}' must be a reference field");
+        }
         // view code -> [filters, sort] the node applies to that view's table queries
         $this->vis = array_map(fn($v) => [array_map(fn($f) => [$f, []], $v[0]), $this->parseOrder($v[1])], $vis);
 
@@ -143,7 +153,12 @@ final class Model
                 . implode(', ', array_column(EditType::cases(), 'value')));
         }
         Schema::check('View', $decl->view, "$path.view");
-        Schema::check('Edit', $decl->edit, "$path.edit");
+        // referenceTableType.dependColumn is @Transient in Java: kept out of the schema check, the build carries it
+        $edit = $decl->edit;
+        if (is_array($edit['referenceTableType'] ?? null)) {
+            unset($edit['referenceTableType']['dependColumn']);
+        }
+        Schema::check('Edit', $edit, "$path.edit");
         if ($decl->pk) {
             return new FieldSpec($name, $decl, null);
         }
@@ -151,10 +166,12 @@ final class Model
         if ($decl->ref === null && $hint !== null && class_exists($hint) && (new \ReflectionClass($hint))->getAttributes(Erupt::class)) {
             $decl->ref = $hint;
         }
+        $collection = in_array($decl->type, FieldSpec::COLLECTIONS, true);
         $type = match (true) {
+            $collection => $decl->type,
             $decl->ref !== null => $decl->tree !== null ? 'REFERENCE_TREE' : 'REFERENCE_TABLE',
             $decl->type !== null => $decl->type,
-            $decl->choices !== null && $hint !== 'array' => 'CHOICE',
+            $decl->choices !== null || $decl->fetch !== null => $hint === 'array' ? 'MULTI_CHOICE' : 'CHOICE',
             $hint === 'bool' => 'BOOLEAN',
             $hint === 'int', $hint === 'float' => 'NUMBER',
             $hint !== null && is_a($hint, \DateTimeInterface::class, true) => 'DATE_TIME',
@@ -163,13 +180,31 @@ final class Model
         if (!isset(Schema::defaults()['fields'][$type])) {
             throw new \InvalidArgumentException("$path: edit type $type is not supported yet");
         }
-        $json = $decl->ref === null ? match ($hint) {
+        if ($collection && $decl->ref === null) {
+            throw new \InvalidArgumentException("$path: $type needs ref");
+        }
+        $decl->virtual = $decl->virtual || $type === 'BUTTON';
+        $json = $collection ? FieldSpec::JSON_ARRAY : ($decl->ref === null ? match ($hint) {
             'array' => FieldSpec::JSON_ARRAY,
             'object', \stdClass::class => FieldSpec::JSON_OBJECT,
             default => null,
-        } : null;
-        $spec = new FieldSpec($name, $decl, $type, $json);
-        if ($spec->isReference()) {
+        } : null);
+        $code = [];
+        foreach (FieldSpec::INVOKED as $kind => $attr) {
+            if ($decl->$attr !== null) {
+                $class = $property->getDeclaringClass();
+                if (!$class->hasMethod($decl->$attr) || !$class->getMethod($decl->$attr)->isStatic()) {
+                    throw new \InvalidArgumentException("$path: $attr must name a static method of $this->name");
+                }
+                $code[$kind] = $class->getMethod($decl->$attr)->getClosure();
+            }
+        }
+        if ((isset($code['options']) && !isset(FieldSpec::FETCHED[$type])) || (isset($code['autocomplete']) && $type !== 'AUTO_COMPLETE')
+            || (isset($code['button']) && $type !== 'BUTTON')) {
+            throw new \InvalidArgumentException("$path: fetch, complete and click belong to CHOICE / MULTI_CHOICE / TAGS, AUTO_COMPLETE and BUTTON");
+        }
+        $spec = new FieldSpec($name, $decl, $type, $json, $code);
+        if ($spec->isReference() || $collection) {
             $target = Model::of($decl->ref);
             if ($target->pk === null) {
                 throw new \InvalidArgumentException("$path: $target->name has no primary key");
@@ -207,6 +242,38 @@ final class Model
             $raw['vis'] = $entries;
         }
         return [$raw, $vis];
+    }
+
+    /**
+     * `link.column` / `link.joinColumn` of a drill: the source row's column (`id` by default) and the linked
+     * model's field holding it (its first path segment), applied by the node and kept out of the build, as Java
+     * keeps them `@Transient`. The rest is filled from the schema defaults; a drill without a `code` is
+     * addressed by its title.
+     */
+    private static function pullDrills(array $raw): array
+    {
+        $drills = $entries = [];
+        foreach (is_array($raw['drills'] ?? null) ? $raw['drills'] : [] as $entry) {
+            if (!is_array($entry) || !is_array($entry['link'] ?? [])) {
+                return [$raw, []]; // left to the schema check
+            }
+            $link = $entry['link'] ?? [];
+            $column = $link['column'] ?? 'id';
+            $join = $link['joinColumn'] ?? null;
+            if (!is_string($join) || $join === '' || !is_string($link['linkErupt'] ?? null) || $link['linkErupt'] === '' || !is_string($column)) {
+                throw new \InvalidArgumentException("drill '" . (is_string($entry['title'] ?? null) ? $entry['title'] : '') . "' needs link.linkErupt and link.joinColumn");
+            }
+            unset($link['column'], $link['joinColumn']);
+            $entry = array_merge(Schema::declaredDefaults('Drill'), ['code' => $entry['title'] ?? ''], $entry,
+                ['link' => array_merge(Schema::declaredDefaults('Link'), $link)]);
+            $drills[$entry['code']] = ['erupt' => $link['linkErupt'], 'column' => $column, 'join' => explode('.', $join)[0],
+                'condition' => is_string($link['linkCondition'] ?? null) ? $link['linkCondition'] : ''];
+            $entries[] = $entry;
+        }
+        if (is_array($raw['drills'] ?? null)) {
+            $raw['drills'] = $entries;
+        }
+        return [$raw, $drills];
     }
 
     /** Run one DataProxy hook on every proxy, in declaration order. */

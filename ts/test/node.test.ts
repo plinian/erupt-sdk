@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, test } from "node:test";
-import { type EruptRecord, Fail, field, MemoryRepository, model, Node, type Repository } from "../src/index.js";
+import { type EruptRecord, Fail, field, MemoryRepository, model, Node, operation, type Repository } from "../src/index.js";
 
 const listen = (server: Server) => new Promise<string>((resolve) =>
   server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${(server.address() as AddressInfo).port}`)));
@@ -123,6 +123,106 @@ test("data proxy", async () => {
     ["beforeDelete", "b"], ["afterDelete", "b"]]);
 });
 
+test("link tree", async () => {
+  const erupt = createServer((_req, res) => res.end(JSON.stringify({ add: true, edit: true, delete: true, viewDetails: true })));
+  servers.push(erupt);
+  const node = new Node("t", "secret", await listen(erupt));
+  const category = model("Category", { id: field.pk(), name: field.input("Name"), parent: field.number("Parent") });
+  node.register(model("Doc", { id: field.pk(), title: field.input("Title"), topic: field.ref(category, "Topic", { tree: "parent" }) }, {
+    erupt: { linkTree: { field: "topic", dependNode: true } },
+  }), new MemoryRepository([{ title: "a", topic: 1 }, { title: "b", topic: 2 }, { title: "c", topic: 3 }]));
+  const app = createServer(node.listener);
+  servers.push(app);
+  const base = await listen(app);
+  const titles = async (body: unknown) => {
+    const res = await fetch(base + "/erupt-api/data/table/Doc", {
+      method: "POST", body: JSON.stringify(body), headers: { "access-token": "secret", erupt: "Doc", token: "t" },
+    });
+    return ((await res.json()) as any).list.map((r: any) => r.title);
+  };
+  assert.deepEqual(await titles({}), [], "dependNode: nothing until a tree node is picked");
+  assert.deepEqual(await titles({ linkTreeVal: [2] }), ["b"]);
+  assert.deepEqual(await titles({ linkTreeVal: ["1", "2"] }), ["a", "b"]);
+});
+
+test("field types and invoke", async () => {
+  const erupt = createServer((_req, res) => res.end(JSON.stringify({ add: true, edit: true, delete: true, viewDetails: true })));
+  servers.push(erupt);
+  const node = new Node("t", "secret", await listen(erupt));
+  const category = model("Category", { id: field.pk(), name: field.input("Name"), parent: field.number("Parent") });
+  node.register(category, new MemoryRepository());
+  node.register(model("Order", {
+    id: field.pk(),
+    status: field.choice("Status", {}, { fetch: (form) => ({ new: "New", [form.note ?? "x"]: "From form" }) }),
+    tags: field.of("TAGS", "Tags", { fetch: () => ["red", "blue"] }),
+    qty: field.number("Qty", { onchange: (form) => ({ formData: { note: `${form.qty} items` } }) }),
+    note: field.input("Note"),
+    city: field.of("AUTO_COMPLETE", "City", { complete: async (_form, typed) => ["Paris", "Tokyo"].filter((c) => c.toLowerCase().includes(typed.toLowerCase())) }),
+    body: field.of("MARKDOWN", "Body"),
+    files: field.of("ATTACHMENT", "Files"),
+    cats: field.checkbox(category, "Categories"),
+    sections: field.tabTree(category, "Sections"),
+    calc: field.button("Calc", () => ({ eval: "alert(1)", formData: { qty: 2 } })),
+    stop: field.button("Stop", () => {
+      throw new Fail("not now");
+    }),
+  }, {
+    operations: {
+      approve: operation("Approve", { form: model("ApproveForm", { reason: field.input("Reason") }) }, (op) => `approved:${op.param?.reason}`),
+      archive: operation("Archive", { mode: "BUTTON" }, () => undefined),
+      hidden: operation("Hidden", { mode: "BUTTON", show: () => false }, () => undefined),
+    },
+  }), new MemoryRepository());
+  const app = createServer(node.listener);
+  servers.push(app);
+  const base = await listen(app);
+  const call = async (path: string, body?: unknown) => {
+    const res = await fetch(base + path, {
+      method: body === undefined ? "GET" : "POST", body: body === undefined ? undefined : JSON.stringify(body),
+      headers: { "access-token": "secret", erupt: "Order", token: "t" },
+    });
+    return [res.status, (await res.json().catch(() => null)) as any] as const;
+  };
+  const [, build] = await call("/erupt-api/build/Order");
+  const fields = Object.fromEntries(build.eruptModel.eruptFieldModels.map((f: any) => [f.fieldName, f]));
+  const edit = (name: string) => fields[name].eruptFieldJson.edit;
+  assert.deepEqual(edit("status").choiceType.fetchHandler, ["invoke"]);
+  assert.deepEqual(edit("tags").tagsType.fetchHandler, ["invoke"]);
+  assert.equal(edit("qty").onchange, "invoke");
+  assert.deepEqual([edit("body").type, edit("files").type, edit("calc").type], ["MARKDOWN", "ATTACHMENT", "BUTTON"]);
+  assert.deepEqual([fields.cats.fieldReturnName, fields.sections.fieldReturnName], ["Category", "Category"]);
+
+  const invoke = async (kind: string, field: string, form: object = {}, value?: string) =>
+    call(`/erupt-api/invoke/Order/${kind}/${field}`, { form, value });
+  assert.deepEqual((await invoke("options", "status", { note: "n" }))[1].data, [{ value: "new", label: "New" }, { value: "n", label: "From form" }]);
+  assert.deepEqual((await invoke("options", "tags"))[1].data, ["red", "blue"]);
+  assert.deepEqual((await invoke("onchange", "qty", { qty: 3 }))[1].data, { formData: { note: "3 items" } });
+  assert.deepEqual((await invoke("autocomplete", "city", {}, "pa"))[1].data, ["Paris"]);
+  assert.equal((await invoke("button", "calc"))[1].data.eval, "alert(1)");
+  const [, refused] = await invoke("button", "stop");
+  assert.deepEqual([refused.success, refused.message], [false, "not now"]);
+  assert.equal((await invoke("button", "qty"))[0], 404, "a field without that code");
+  assert.equal((await invoke("options", "missing"))[0], 404);
+
+  // a row operation and its form values run through invoke too, under the operation code
+  const op = "/erupt-api/invoke/Order/operation/";
+  assert.deepEqual((await call(op + "archive", { ids: null, param: null }))[1].message, "Executed successfully");
+  assert.equal((await call(op + "hidden", {}))[0], 403);
+  assert.equal((await call(op + "missing", {}))[0], 404);
+  const form = "/erupt-api/invoke/Order/operation-form/";
+  assert.deepEqual((await call(form + "approve", {}))[1].data, { reason: null });
+  assert.equal((await call(form + "archive", {}))[1].data, null, "an operation without a form");
+  assert.equal((await call("/erupt-api/data/Order/operator/archive", {}))[0], 404);
+  assert.equal((await call("/erupt-api/data/Order/operator/approve/form-value", {}))[0], 404);
+  assert.equal((await call("/erupt-api/data/Order/reference-table/cats", {}))[0], 404);
+
+  // picked records arrive as [{id: key}] and are stored as their keys
+  assert.equal((await call("/erupt-api/data/modify/Order", { cats: [{ id: 1 }, { id: "2" }], sections: [{ id: 3 }], tags: "[\"red\"]" }))[1].success, true);
+  const [, page] = await call("/erupt-api/data/table/Order", {});
+  assert.deepEqual([page.list[0].cats, page.list[0].sections], [[1, 2], [3]]);
+  assert.ok(!("calc" in page.list[0]));
+});
+
 test("before fetch", async () => {
   const { mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -170,4 +270,75 @@ test("before fetch", async () => {
   assert.ok(!vis.some((v: any) => "filter" in v || "orderBy" in v));
   // the memory repository cannot run SQL: it refuses rather than shows every row
   assert.equal((await (await serve(new MemoryRepository()))("/erupt-api/data/table/Task", {}))[0], 500);
+});
+
+const serveAuthorBook = async () => {
+  const erupt = createServer((_req, res) => res.end(JSON.stringify({ add: true, edit: true, delete: true, viewDetails: true })));
+  servers.push(erupt);
+  const node = new Node("blog", "secret", await listen(erupt));
+  const category = model("Category", { id: field.pk(), name: field.input("Name"), parent: field.number("Parent") });
+  const author = model("Author", { id: field.pk(), name: field.input("Name") }, {
+    erupt: { drills: [{ title: "Books", link: { linkErupt: "Book", joinColumn: "author.id" } }] },
+  });
+  node.register(category, new MemoryRepository());
+  node.register(author, new MemoryRepository([{ name: "Ann" }, { name: "Bob" }]));
+  node.register(model("Book", {
+    id: field.pk(),
+    title: field.input("Title"),
+    author: field.ref(author, "Author"),
+    colour: field.of("COLOR", "Colour"),
+    stars: field.of("RATE", "Stars"),
+    secret: field.of("HIDDEN", "Secret"),
+    readers: field.transfer(category, "Readers"),
+    shelf: field.ref(category, "Shelf", { edit: { referenceTableType: { dependField: "author", dependColumn: "parent" } } }),
+  }), new MemoryRepository([{ title: "a", author: 1 }, { title: "b", author: 2 }, { title: "c", author: 1 }]));
+  const app = createServer(node.listener);
+  servers.push(app);
+  const base = await listen(app);
+  const call = async (erupt: string, path: string, body?: unknown, headers: Record<string, string> = {}) => {
+    const res = await fetch(base + path, {
+      method: body === undefined ? "GET" : "POST", body: body === undefined ? undefined : JSON.stringify(body),
+      headers: { "access-token": "secret", erupt, token: "t", ...headers },
+    });
+    return [res.status, (await res.json().catch(() => null)) as any] as const;
+  };
+  return [node, call] as const;
+};
+
+test("drill", async () => {
+  const [, call] = await serveAuthorBook();
+  const drill = { drill: "Books", drillsourceerupt: "Author", drillvalue: "1" };
+  const [, page] = await call("Book", "/erupt-api/data/table/Book", {}, drill);
+  assert.deepEqual(page.list.map((r: any) => r.title), ["a", "c"]);
+  assert.equal((await call("Book", "/erupt-api/data/table/Book", {}, { ...drill, drill: "x" }))[0], 403);
+  const [, build] = await call("Author", "/erupt-api/build/Author");
+  const drills = build.eruptModel.eruptJson.drills;
+  assert.deepEqual(drills.map((d: any) => [d.code, d.title, d.link.linkErupt]), [["Books", "Books", "Book"]]);
+  assert.ok(!("joinColumn" in drills[0].link));
+});
+
+test("simple types and dependColumn", async () => {
+  const [, call] = await serveAuthorBook();
+  const [, build] = await call("Book", "/erupt-api/build/Book");
+  const edit = Object.fromEntries(build.eruptModel.eruptFieldModels.map((f: any) => [f.fieldName, f.eruptFieldJson.edit]));
+  assert.deepEqual(["colour", "stars", "secret", "readers"].map((n) => edit[n].type), ["COLOR", "RATE", "HIDDEN", "TRANSFER"]);
+  assert.equal(edit.shelf.referenceTableType.dependColumn, "parent", "the server reads it off the build");
+  assert.equal((await call("Book", "/erupt-api/data/modify/Book", { title: "d", stars: "4", readers: [{ id: 2 }] }))[1].success, true);
+  const [, page] = await call("Book", "/erupt-api/data/table/Book", {});
+  const row = page.list.at(-1);
+  assert.deepEqual([row.stars, row.readers], [4, [2]]);
+});
+
+test("node config and user info", async () => {
+  const [node] = await serveAuthorBook();
+  const seen: [string, string | undefined][] = [];
+  (node as any).serverText = async (path: string, headers: Record<string, string>) => {
+    seen.push([path, headers.token]);
+    return path.includes("userinfo") ? '{"account": "admin", "roles": ["r"]}' : "cfg";
+  };
+  assert.equal(await node.config(), "cfg");
+  assert.equal(await node.groupConfig(), "cfg");
+  assert.deepEqual(await node.userInfo(), { account: "admin", roles: ["r"] });
+  assert.deepEqual(seen.map(([p]) => p), ["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog",
+    "/erupt-cloud-api/userinfo/blog"]);
 });

@@ -20,6 +20,8 @@ test("rejects unknown annotation values at declaration", () => {
     [() => operation("Go", { mode: "ALL" as never }, () => undefined), /is not a RowOperationMode/],
     [() => operation("Go", { raw: { colour: "red" } as never }, () => undefined), /RowOperation has no attribute 'colour'/],
     [() => declare({ c: field.ref(declare(), "C", { label: "title" }) }), /has no field 'title'/],
+    [() => declare({ t: field.input("T", { fetch: () => ({}) }) }), /fetch, complete and click belong to/],
+    [() => declare({ t: field.input("T", { click: () => ({}) }) }), /fetch, complete and click belong to/],
     [() => model("bad name", {}), /must be an identifier/],
     [() => model("Two", { a: field.pk(), b: field.pk() }), /at most one/],
   ];

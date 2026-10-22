@@ -78,6 +78,22 @@ fn rejects_unknown_annotation_values() {
             "without a handler",
         ),
         (Model::new("not a name", "X"), "identifier"),
+        (
+            base().field("t", Field::input("T").fetch(|_| Ok(vec![]))),
+            "fetch, fetch_tags, complete and click belong to",
+        ),
+        (
+            base().field("t", Field::choice("T", &[]).fetch_tags(|_| Ok(vec![]))),
+            "belong to",
+        ),
+        (
+            base().field("t", Field::input("T").click(|_| Ok(json!({})))),
+            "belong to",
+        ),
+        (
+            base().field("t", Field::input("T").complete(|_, _| Ok(vec![]))),
+            "belong to",
+        ),
     ];
     for (builder, message) in cases {
         let error = declaration_error(builder);
@@ -111,6 +127,12 @@ fn references_are_checked() {
         declaration_error(base().field("c", Field::reference(&form, "C")))
             .contains("has no primary key")
     );
+    assert!(declaration_error(
+        base()
+            .field("c", Field::input("C"))
+            .raw(json!({"linkTree": {"field": "c"}}))
+    )
+    .contains("linkTree.field 'c' must be a reference field"));
 }
 
 #[test]

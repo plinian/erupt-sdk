@@ -8,11 +8,21 @@ use Erupt\Attribute\Field;
 final class FieldSpec
 {
     public const REFERENCES = ['REFERENCE_TABLE', 'REFERENCE_TREE'];
+    /** many records of another model, stored as the JSON list of their keys */
+    public const COLLECTIONS = ['CHECKBOX', 'TAB_TREE', 'TRANSFER'];
+    /** the edit attribute that names a fetchHandler, by the type that fetches options */
+    public const FETCHED = ['CHOICE' => 'choiceType', 'MULTI_CHOICE' => 'multiChoiceType', 'TAGS' => 'tagsType'];
+    /** invoke kind -> the #[Field] attribute naming its code */
+    public const INVOKED = ['options' => 'fetch', 'onchange' => 'onchange', 'autocomplete' => 'complete', 'button' => 'click'];
 
     /** edit type -> python-equivalent value kind */
     private const KINDS = [
         'INPUT' => 'string', 'TEXTAREA' => 'string', 'CHOICE' => 'string', 'NUMBER' => 'number',
         'BOOLEAN' => 'bool', 'DATE' => 'date', 'DATE_TIME' => 'datetime',
+        'TAGS' => 'string', 'AUTO_COMPLETE' => 'string', 'ATTACHMENT' => 'string', 'HTML_EDITOR' => 'string',
+        'MARKDOWN' => 'string', 'CODE_EDITOR' => 'string',
+        'COLOR' => 'string', 'ICON' => 'string', 'SIGNATURE' => 'string', 'MAP' => 'string', 'HIDDEN' => 'string',
+        'RATE' => 'number', 'SLIDER' => 'number',
     ];
 
     /** what a JSON field holds: an `array` property a list, an `object` property an object */
@@ -21,8 +31,9 @@ final class FieldSpec
 
     public readonly ?string $type;
 
+    /** @param array<string, \Closure> $code invoke kind -> the field's own code */
     public function __construct(public readonly string $name, public readonly Field $decl, ?string $type,
-                                public readonly ?string $json = null)
+                                public readonly ?string $json = null, public readonly array $code = [])
     {
         $this->type = $type;
     }
@@ -37,7 +48,12 @@ final class FieldSpec
         return in_array($this->type, self::REFERENCES, true);
     }
 
-    /** The referenced model, for a reference field. */
+    public function isCollection(): bool
+    {
+        return in_array($this->type, self::COLLECTIONS, true);
+    }
+
+    /** The referenced model, for a reference or collection field. */
     public function target(): Model
     {
         return Model::of($this->decl->ref);
@@ -53,7 +69,8 @@ final class FieldSpec
             return $tpl;
         }
         $edit = $tpl['eruptFieldJson']['edit'];
-        $view = $tpl['eruptFieldJson']['views'][0];
+        // a BUTTON is a form element only: its template has no table column
+        $view = $tpl['eruptFieldJson']['views'][0] ?? [];
         $edit['title'] = $d->title;
         $edit['notNull'] = $d->notNull;
         $edit['show'] = $d->form;
@@ -72,9 +89,19 @@ final class FieldSpec
                 $edit[$key]['pid'] = $d->tree;
             }
             $view['column'] = $d->label;
+        } elseif ($this->isCollection()) {
+            // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+            $tpl['fieldReturnName'] = $this->target()->name;
+            $view['column'] = $d->label;
+        }
+        if (isset($this->code['options'], self::FETCHED[$this->type])) {
+            $edit[self::FETCHED[$this->type]]['fetchHandler'] = ['invoke'];
+        }
+        if (isset($this->code['onchange'])) {
+            $edit['onchange'] = 'invoke';
         }
         $tpl['eruptFieldJson']['edit'] = Model::merge($edit, $d->edit);
-        $tpl['eruptFieldJson']['views'] = $d->table ? [Model::merge($view, $d->view)] : [];
+        $tpl['eruptFieldJson']['views'] = $d->table && $tpl['eruptFieldJson']['views'] ? [Model::merge($view, $d->view)] : [];
         if ($d->choices !== null) { // CHOICE, or MULTI_CHOICE over an array
             $tpl['componentValue'] = [];
             foreach ($d->choices ?? [] as $value => $label) {
@@ -98,6 +125,12 @@ final class FieldSpec
                 $value = $value[$target->pk] ?? null;
             }
             return $target->fields[$target->pk]->coerce($value);
+        }
+        if ($this->isCollection()) {
+            // picked records arrive as [{id: key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), and are stored as keys
+            $items = is_string($value) && $value !== '' ? json_decode($value, true, 512, JSON_THROW_ON_ERROR) : ($value ?: []);
+            $pk = $this->target()->fields[$this->target()->pk];
+            return array_map(fn($v) => $pk->coerce(is_array($v) ? ($v ? reset($v) : null) : $v), array_values((array) $items));
         }
         if ($value === null || $value === '') {
             return null;

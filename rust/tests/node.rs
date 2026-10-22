@@ -1,6 +1,7 @@
 use erupt::http::{Request, Response};
 use std::sync::{Arc, Mutex};
 
+use erupt::types::EditType;
 use erupt::{
     current_user, Cond, DataProxy, Error, Field, Filter, MemoryRepository, Model, Node, Operation,
     Record,
@@ -10,12 +11,21 @@ use serde_json::{json, Map, Value};
 const TOKEN: &str = "node-secret";
 
 fn node() -> Node {
+    let form = Model::new("PublishForm", "Publish")
+        .field("note", Field::input("Note"))
+        .build()
+        .unwrap();
     let post = Model::new("Post", "Post")
         .field("id", Field::pk())
         .field("title", Field::input("Title").search().not_null())
         .operation(
             Operation::new("ping", "Ping")
                 .handler(|op| Ok(Some(format!("alert({})", op.rows.len())))),
+        )
+        .operation(
+            Operation::new("publish", "Publish")
+                .form(&form)
+                .handler(|_| Ok(None)),
         )
         .build()
         .unwrap();
@@ -153,11 +163,32 @@ fn crud_and_operations() {
     let (_, r) = call(
         &n,
         "POST",
-        "/erupt-api/data/Post/operator/ping",
+        "/erupt-api/invoke/Post/operation/ping",
         Some(json!({"ids": [1], "param": null})),
         &[],
     );
     assert_eq!(json!("alert(1)"), r["data"]);
+    let invoke = |path: &str| call(&n, "POST", path, Some(json!({})), &[]);
+    assert_eq!(404, invoke("/erupt-api/invoke/Post/operation/missing").0);
+    let form = "/erupt-api/invoke/Post/operation-form/";
+    assert_eq!(
+        json!({"note": null}),
+        invoke(&format!("{form}publish")).1["data"]
+    );
+    // an operation without a form
+    let (status, r) = invoke(&format!("{form}ping"));
+    assert_eq!(
+        (200, json!(true), Value::Null),
+        (status, r["success"].clone(), r["data"].clone())
+    );
+    assert_eq!(404, invoke(&format!("{form}missing")).0);
+    // the picker and the operations are the server's and invoke's
+    assert_eq!(404, invoke("/erupt-api/data/Post/operator/ping").0);
+    assert_eq!(
+        404,
+        invoke("/erupt-api/data/Post/operator/publish/form-value").0
+    );
+    assert_eq!(404, invoke("/erupt-api/data/Post/reference-table/title").0);
     let (_, r) = call(
         &n,
         "POST",
@@ -453,4 +484,395 @@ fn before_fetch_needs_sql() {
         &[("erupt", "Task"), ("user", ADMIN)],
     );
     assert_eq!(500, status);
+}
+
+#[test]
+fn link_tree() {
+    let category = Model::new("Category", "Category")
+        .field("id", Field::pk())
+        .field("name", Field::input("Name"))
+        .field("parent", Field::number("Parent Id"))
+        .build()
+        .unwrap();
+    let doc = Model::new("Doc", "Doc")
+        .raw(json!({"linkTree": {"field": "topic", "dependNode": true}}))
+        .field("id", Field::pk())
+        .field("title", Field::input("Title"))
+        .field("topic", Field::reference(&category, "Topic").tree("parent"))
+        .build()
+        .unwrap();
+    let mut n = node();
+    let docs = [("a", 1), ("b", 2), ("c", 3)].map(|(title, topic)| {
+        json!({"title": title, "topic": topic})
+            .as_object()
+            .cloned()
+            .unwrap()
+    });
+    n.register(&doc, MemoryRepository::seeded(docs.to_vec()))
+        .unwrap();
+    let titles = |body: Value| {
+        let (_, page) = call(
+            &n,
+            "POST",
+            "/erupt-api/data/table/Doc",
+            Some(body),
+            &[("erupt", "Doc")],
+        );
+        page["list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["title"].clone())
+            .collect::<Vec<_>>()
+    };
+    // dependNode: nothing until a tree node is picked
+    assert_eq!(Vec::<Value>::new(), titles(json!({})));
+    assert_eq!(vec![json!("b")], titles(json!({"linkTreeVal": [2]})));
+    assert_eq!(
+        vec![json!("a"), json!("b")],
+        titles(json!({"linkTreeVal": ["1", "2"]}))
+    );
+}
+
+#[test]
+fn field_types_and_invoke() {
+    let category = Model::new("Category", "Category")
+        .field("id", Field::pk())
+        .field("name", Field::input("Name"))
+        .build()
+        .unwrap();
+    let order = Model::new("Order", "Order")
+        .field("id", Field::pk())
+        .field(
+            "status",
+            Field::choice("Status", &[]).fetch(|form| {
+                let note = form.get("note").and_then(Value::as_str).unwrap_or("x");
+                Ok(vec![
+                    ("new".into(), "New".into()),
+                    (note.into(), "From form".into()),
+                ])
+            }),
+        )
+        .field(
+            "tags",
+            Field::of(EditType::Tags, "Tags").fetch_tags(|_| Ok(vec!["red".into(), "blue".into()])),
+        )
+        .field(
+            "qty",
+            Field::number("Qty").onchange(|form| {
+                Ok(json!({"formData": {"note": format!("{} items", form["qty"])}}))
+            }),
+        )
+        .field("note", Field::input("Note"))
+        .field(
+            "city",
+            Field::of(EditType::AutoComplete, "City").complete(|_, typed| {
+                Ok(["Paris", "Tokyo"]
+                    .iter()
+                    .filter(|c| c.to_lowercase().contains(&typed.to_lowercase()))
+                    .map(|c| c.to_string())
+                    .collect())
+            }),
+        )
+        .field("body", Field::of(EditType::Markdown, "Body"))
+        .field("files", Field::of(EditType::Attachment, "Files"))
+        .field(
+            "roles",
+            Field::multi_choice("Roles", &[]).fetch(|_| Ok(vec![("a".into(), "A".into())])),
+        )
+        .field("cats", Field::checkbox(&category, "Categories"))
+        .field("sections", Field::tab_tree(&category, "Sections"))
+        .field(
+            "calc",
+            Field::of(EditType::Button, "Calc")
+                .click(|_| Ok(json!({"eval": "alert(1)", "formData": {"qty": 2}}))),
+        )
+        .field(
+            "stop",
+            Field::of(EditType::Button, "Stop").click(|_| Err(Error::fail("not now"))),
+        )
+        .build()
+        .unwrap();
+    let mut n = node();
+    n.register(&order, MemoryRepository::new()).unwrap();
+    let call = |method: &str, path: &str, body: Value| {
+        call(&n, method, path, Some(body), &[("erupt", "Order")])
+    };
+
+    let (_, build) = call("GET", "/erupt-api/build/Order", Value::Null);
+    let fields: Map<String, Value> = build["eruptModel"]["eruptFieldModels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["fieldName"].as_str().unwrap().to_string(), f.clone()))
+        .collect();
+    let edit = |name: &str| fields[name]["eruptFieldJson"]["edit"].clone();
+    assert_eq!(
+        json!(["invoke"]),
+        edit("status")["choiceType"]["fetchHandler"]
+    );
+    assert_eq!(json!(["invoke"]), edit("tags")["tagsType"]["fetchHandler"]);
+    assert_eq!(
+        json!(["invoke"]),
+        edit("roles")["multiChoiceType"]["fetchHandler"]
+    );
+    assert_eq!(json!("invoke"), edit("qty")["onchange"]);
+    assert_eq!(
+        ("MARKDOWN", "ATTACHMENT", "BUTTON"),
+        (
+            edit("body")["type"].as_str().unwrap(),
+            edit("files")["type"].as_str().unwrap(),
+            edit("calc")["type"].as_str().unwrap()
+        )
+    );
+    assert_eq!(json!([]), fields["calc"]["eruptFieldJson"]["views"]);
+    assert_eq!(
+        (json!("Category"), json!("Category")),
+        (
+            fields["cats"]["fieldReturnName"].clone(),
+            fields["sections"]["fieldReturnName"].clone()
+        )
+    );
+
+    let invoke = |kind: &str, field: &str, form: Value, value: Value| {
+        call(
+            "POST",
+            &format!("/erupt-api/invoke/Order/{kind}/{field}"),
+            json!({"form": form, "value": value}),
+        )
+    };
+    assert_eq!(
+        json!([{"value": "new", "label": "New"}, {"value": "n", "label": "From form"}]),
+        invoke("options", "status", json!({"note": "n"}), Value::Null).1["data"]
+    );
+    assert_eq!(
+        json!(["red", "blue"]),
+        invoke("options", "tags", json!({}), Value::Null).1["data"]
+    );
+    assert_eq!(
+        json!({"formData": {"note": "3 items"}}),
+        invoke("onchange", "qty", json!({"qty": 3}), Value::Null).1["data"]
+    );
+    assert_eq!(
+        json!(["Paris"]),
+        invoke("autocomplete", "city", json!({}), json!("pa")).1["data"]
+    );
+    assert_eq!(
+        json!("alert(1)"),
+        invoke("button", "calc", json!({}), Value::Null).1["data"]["eval"]
+    );
+    let (_, refused) = invoke("button", "stop", json!({}), Value::Null);
+    assert_eq!(
+        (json!(false), json!("not now")),
+        (refused["success"].clone(), refused["message"].clone())
+    );
+    // a field without that code, an unknown field
+    assert_eq!(404, invoke("button", "qty", json!({}), Value::Null).0);
+    assert_eq!(404, invoke("options", "missing", json!({}), Value::Null).0);
+
+    // picked records arrive as [{id: key}] and are stored as their keys
+    let (_, added) = call(
+        "POST",
+        "/erupt-api/data/modify/Order",
+        json!({"cats": [{"id": 1}, {"id": "2"}], "sections": "[{\"id\": 3}]", "tags": "red"}),
+    );
+    assert_eq!(json!(true), added["success"]);
+    let (_, page) = call("POST", "/erupt-api/data/table/Order", json!({}));
+    let row = &page["list"][0];
+    assert_eq!(
+        (json!([1, 2]), json!([3])),
+        (row["cats"].clone(), row["sections"].clone())
+    );
+    assert!(row.get("calc").is_none());
+}
+
+fn author_and_book() -> (Arc<Model>, Arc<Model>) {
+    let author = Model::new("Author", "Author")
+        .raw(json!({"drills": [{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author.id"}}]}))
+        .field("id", Field::pk())
+        .field("name", Field::input("Name"))
+        .build()
+        .unwrap();
+    let category = Model::new("Category", "Category")
+        .field("id", Field::pk())
+        .field("name", Field::input("Name"))
+        .field("parent", Field::number("Parent"))
+        .build()
+        .unwrap();
+    let book = Model::new("Book", "Book")
+        .field("id", Field::pk())
+        .field("title", Field::input("Title"))
+        .field("author", Field::reference(&author, "Author"))
+        .field("colour", Field::of(EditType::Color, "Colour"))
+        .field("stars", Field::of(EditType::Rate, "Stars"))
+        .field("secret", Field::of(EditType::Hidden, "Secret"))
+        .field("readers", Field::transfer(&category, "Readers"))
+        .field(
+            "shelf",
+            Field::reference(&category, "Shelf").edit(
+                json!({"referenceTableType": {"dependField": "author", "dependColumn": "parent"}}),
+            ),
+        )
+        .build()
+        .unwrap();
+    (author, book)
+}
+
+fn records(rows: Value) -> Vec<Record> {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_object().cloned().unwrap())
+        .collect()
+}
+
+fn library() -> Node {
+    let (author, book) = author_and_book();
+    let mut n = node();
+    n.register(
+        &author,
+        MemoryRepository::seeded(records(json!([{"name": "Ann"}, {"name": "Bob"}]))),
+    )
+    .unwrap();
+    n.register(
+        &book,
+        MemoryRepository::seeded(records(json!([
+            {"title": "a", "author": 1}, {"title": "b", "author": 2}, {"title": "c", "author": 1}
+        ]))),
+    )
+    .unwrap();
+    n
+}
+
+#[test]
+fn drill() {
+    let n = library();
+    let drill = [
+        ("erupt", "Book"),
+        ("Drill", "Books"),
+        ("DrillSourceErupt", "Author"),
+        ("DrillValue", "1"),
+    ];
+    let table = |headers: &[(&str, &str)]| {
+        call(
+            &n,
+            "POST",
+            "/erupt-api/data/table/Book",
+            Some(json!({})),
+            headers,
+        )
+    };
+    let (_, page) = table(&drill);
+    let titles: Vec<&Value> = page["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| &r["title"])
+        .collect();
+    assert_eq!(vec![&json!("a"), &json!("c")], titles);
+    let mut undeclared = drill;
+    undeclared[1] = ("Drill", "x");
+    assert_eq!(403, table(&undeclared).0);
+
+    let (_, build) = call(
+        &n,
+        "GET",
+        "/erupt-api/build/Author",
+        None,
+        &[("erupt", "Author")],
+    );
+    let drills = &build["eruptModel"]["eruptJson"]["drills"];
+    assert_eq!(
+        json!([{"code": "Books", "fold": false, "icon": "fa fa-sitemap", "title": "Books",
+                "link": {"linkCondition": "", "linkErupt": "Book"}}]),
+        *drills
+    );
+}
+
+#[test]
+fn simple_types_and_depend_column() {
+    let n = library();
+    let call = |method: &str, path: &str, body: Option<Value>| {
+        call(&n, method, path, body, &[("erupt", "Book")])
+    };
+    let (_, build) = call("GET", "/erupt-api/build/Book", None);
+    let edit: Map<String, Value> = build["eruptModel"]["eruptFieldModels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["fieldName"].as_str().unwrap().to_string(),
+                f["eruptFieldJson"]["edit"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ["COLOR", "RATE", "HIDDEN", "TRANSFER"],
+        ["colour", "stars", "secret", "readers"].map(|n| edit[n]["type"].as_str().unwrap())
+    );
+    // the server reads it off the build
+    assert_eq!(
+        json!("parent"),
+        edit["shelf"]["referenceTableType"]["dependColumn"]
+    );
+    let (_, added) = call(
+        "POST",
+        "/erupt-api/data/modify/Book",
+        Some(json!({"title": "d", "stars": "4", "readers": [{"id": 2}]})),
+    );
+    assert_eq!(json!(true), added["success"]);
+    let (_, page) = call("POST", "/erupt-api/data/table/Book", Some(json!({})));
+    let row = page["list"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        (json!(4), json!([2])),
+        (row["stars"].clone(), row["readers"].clone())
+    );
+}
+
+#[test]
+fn node_config_and_user_info() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        erupt::http::serve_listener(
+            listener,
+            1,
+            Arc::new(move |req: &Request| {
+                log.lock().unwrap().push((
+                    req.path.clone(),
+                    req.get_header("access-token").unwrap_or("").to_string(),
+                ));
+                if req.path.contains("userinfo") {
+                    Response::text(200, r#"{"account": "admin", "roles": ["r"]}"#)
+                } else {
+                    Response::text(200, "cfg")
+                }
+            }),
+        )
+    });
+    let n = Node::new("blog", TOKEN, [server]);
+    assert_eq!("cfg", n.config().unwrap());
+    assert_eq!("cfg", n.group_config().unwrap());
+    assert_eq!(
+        Some(json!({"account": "admin", "roles": ["r"]})),
+        n.user_info().unwrap()
+    );
+    assert_eq!(
+        vec![
+            "/erupt-cloud-api/node-config/blog",
+            "/erupt-cloud-api/node-group-config/blog",
+            "/erupt-cloud-api/userinfo/blog"
+        ],
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|(path, token)| {
+                assert_eq!(TOKEN, token);
+                path.as_str()
+            })
+            .collect::<Vec<_>>()
+    );
 }

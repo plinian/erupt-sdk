@@ -156,6 +156,59 @@ end
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`tree: { id: "id", label: "name", pid: "parent" }` shows the model as a tree, and
+`linkTree: { field: "category" }` puts the tree of a reference field beside the table: the erupt server builds
+both trees from the node's table, and the node keeps the rows under the picked tree node (`dependNode: true`
+shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the inferred types, `type:` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores the
+upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR` (all text), `BUTTON` (form only),
+and `CHECKBOX` / `TAB_TREE` with `ref:`: the picked records, stored as the JSON list of their keys. An `Array`
+field with `choices:` is a `MULTI_CHOICE`.
+
+A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
+values:
+
+```ruby
+class Order
+  extend Erupt::Model
+  erupt "Order"
+  field :id, pk: true
+  field :status, "Status", fetch: ->(form) { { new: "New", paid: "Paid" } }   # options, also TAGS: [...]
+  field :qty, "Qty", Integer, onchange: ->(form) { { formData: { total: form["qty"] * 9 }, editExpr: {} } }
+  field :city, "City", type: Erupt::EditType::AUTO_COMPLETE, complete: ->(form, typed) { lookup(typed) }
+  field :total, "Total", Float
+  field :recalc, "Recalc", type: Erupt::EditType::BUTTON, click: ->(form) { { eval: "alert('done')", formData: {} } }
+  field :tags, "Tags", Array, type: Erupt::EditType::CHECKBOX, ref: Tag
+end
+```
+
+`fetch` belongs to `CHOICE` / `MULTI_CHOICE` (`{ value => label }` or pairs) and `TAGS` (an array), `complete`
+to `AUTO_COMPLETE`, `click` to `BUTTON`; `onchange` to any field. Raise `Erupt::Fail` to refuse with a message.
+
+Also: `COLOR`, `ICON`, `SIGNATURE`, `MAP`, `HIDDEN` (text), `RATE`, `SLIDER` (numbers) and `TRANSFER` (like
+`CHECKBOX`). A reference table depending on another field takes
+`edit: { referenceTableType: { dependField: "province", dependColumn: "province" } }`: the erupt server keeps the
+picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```ruby
+erupt "Author", drills: [{ title: "Books", link: { linkErupt: "Book", joinColumn: "author" } }]
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.config` and `node.group_config` return the config text set for the node and its group on the erupt
+server; `node.user_info` the acting user's full info (roles, org, post), while a request is served.
+
 ## Storage
 
 Storage is any `Erupt::Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:
@@ -187,7 +240,8 @@ end
 A single connection is used by one thread at a time. Without a sort, every repository returns rows by primary
 key ascending. `Erupt.current_user` returns the acting user inside a repository call.
 
-Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload, Excel, i18n of messages.
+Not yet: sub-tables (TAB_TABLE_*), TPL operations, i18n of messages. Trees, file
+upload and Excel are done by the erupt server.
 
 ## Without a registry
 

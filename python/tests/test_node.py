@@ -136,6 +136,55 @@ class Task:
     done: bool = Field("Done")
 
 
+@erupt("Doc", linkTree={"field": "topic", "dependNode": True})
+class Doc:
+    id: int = Field(pk=True)
+    title: str = Field("Title")
+    topic: Category = Field("Topic", tree="parent")
+
+
+def _city(form, typed):
+    return [c for c in ("Paris", "Tokyo") if typed.lower() in c.lower()]
+
+
+def _refuse(form):
+    raise Fail("not now")
+
+
+@erupt("Order")
+class Order:
+    id: int = Field(pk=True)
+    status: str = Field("Status", fetch=lambda form: {"new": "New", form.get("note") or "x": "From form"})
+    tags: str = Field("Tags", type="TAGS", fetch=lambda form: ["red", "blue"])
+    qty: int = Field("Qty", onchange=lambda form: {"formData": {"note": f"{form.get('qty')} items"}})
+    note: str = Field("Note")
+    city: str = Field("City", type="AUTO_COMPLETE", complete=_city)
+    body: str = Field("Body", type="MARKDOWN")
+    files: str = Field("Files", type="ATTACHMENT")
+    cats: list = Field("Categories", type="CHECKBOX", ref=Category)
+    sections: list = Field("Sections", type="TAB_TREE", ref=Category)
+    calc = Field("Calc", type="BUTTON", click=lambda form: {"eval": "alert(1)", "formData": {"qty": 2}})
+    stop = Field("Stop", type="BUTTON", click=_refuse)
+
+
+@erupt("Author", drills=[{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author.id"}}])
+class Author:
+    id: int = Field(pk=True)
+    name: str = Field("Name")
+
+
+@erupt("Book")
+class Book:
+    id: int = Field(pk=True)
+    title: str = Field("Title")
+    author: Author = Field("Author")
+    colour: str = Field("Colour", type="COLOR")
+    stars: int = Field("Stars", type="RATE")
+    secret: str = Field("Secret", type="HIDDEN")
+    readers: list = Field("Readers", type="TRANSFER", ref=Category)
+    shelf: Category = Field("Shelf", edit={"referenceTableType": {"dependField": "author", "dependColumn": "parent"}})
+
+
 class NodeTest(unittest.TestCase):
     repo_factory = staticmethod(lambda: MemoryRepository())
     widget_factory = staticmethod(lambda: MemoryRepository())
@@ -150,6 +199,10 @@ class NodeTest(unittest.TestCase):
         self.node.register(Note, MemoryRepository())
         self.node.register(Widget, self.widget_factory())
         self.node.register(Memo, MemoryRepository())
+        self.node.register(Order, MemoryRepository())
+        self.node.register(Author, MemoryRepository([{"name": "Ann"}, {"name": "Bob"}]))
+        self.node.register(Book, MemoryRepository([{"title": "a", "author": 1}, {"title": "b", "author": 2}, {"title": "c", "author": 1}]))
+        self.node.register(Doc, MemoryRepository([{"title": "a", "topic": 1}, {"title": "b", "topic": 2}, {"title": "c", "topic": 3}]))
         CALLS.clear()
         MemoProxy.calls.clear()
 
@@ -297,15 +350,82 @@ class NodeTest(unittest.TestCase):
         self.assertEqual([("before_add", "a"), ("after_add", "a"), ("before_update", "b"), ("after_update", "b"),
                           ("before_delete", "b"), ("after_delete", "b")], MemoProxy.calls)
 
+    def test_link_tree(self):
+        def titles(body):
+            return [r["title"] for r in self.call("POST", "/erupt-api/data/table/Doc", body, erupt="Doc")[1]["list"]]
+        self.assertEqual([], titles({}), "dependNode: nothing until a tree node is picked")
+        self.assertEqual(["b"], titles({"linkTreeVal": [2]}))
+        self.assertEqual(["a", "b"], titles({"linkTreeVal": ["1", "2"]}))
+
+    def test_field_types_and_invoke(self):
+        _, build = self.call("GET", "/erupt-api/build/Order", erupt="Order")
+        fields = {f["fieldName"]: f for f in build["eruptModel"]["eruptFieldModels"]}
+        edit = {name: f["eruptFieldJson"]["edit"] for name, f in fields.items()}
+        self.assertEqual(["invoke"], edit["status"]["choiceType"]["fetchHandler"])
+        self.assertEqual(["invoke"], edit["tags"]["tagsType"]["fetchHandler"])
+        self.assertEqual("invoke", edit["qty"]["onchange"])
+        self.assertEqual(("MARKDOWN", "ATTACHMENT", "BUTTON"), (edit["body"]["type"], edit["files"]["type"], edit["calc"]["type"]))
+        self.assertEqual(("Category", "Category"), (fields["cats"]["fieldReturnName"], fields["sections"]["fieldReturnName"]))
+
+        def invoke(kind, field, form=None, value=None):
+            return self.call("POST", f"/erupt-api/invoke/Order/{kind}/{field}", {"form": form or {}, "value": value}, erupt="Order")
+
+        self.assertEqual([{"value": "new", "label": "New"}, {"value": "n", "label": "From form"}],
+                         invoke("options", "status", {"note": "n"})[1]["data"])
+        self.assertEqual(["red", "blue"], invoke("options", "tags")[1]["data"])
+        self.assertEqual({"formData": {"note": "3 items"}}, invoke("onchange", "qty", {"qty": 3})[1]["data"])
+        self.assertEqual(["Paris"], invoke("autocomplete", "city", value="pa")[1]["data"])
+        self.assertEqual("alert(1)", invoke("button", "calc")[1]["data"]["eval"])
+        self.assertEqual((False, "not now"), (invoke("button", "stop")[1]["success"], invoke("button", "stop")[1]["message"]))
+        self.assertEqual(404, invoke("button", "qty")[0], "a field without that code")
+        self.assertEqual(404, invoke("options", "missing")[0])
+
+        # picked records arrive as [{id: key}] and are stored as their keys
+        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Order",
+                                  {"cats": [{"id": 1}, {"id": "2"}], "sections": [{"id": 3}], "tags": "[\"red\"]"}, erupt="Order")[1]["success"])
+        row = self.call("POST", "/erupt-api/data/table/Order", {}, erupt="Order")[1]["list"][0]
+        self.assertEqual(([1, 2], [3]), (row["cats"], row["sections"]))
+        self.assertNotIn("calc", row)
+
+    def test_drill(self):
+        drill = {"HTTP_DRILL": "Books", "HTTP_DRILLSOURCEERUPT": "Author", "HTTP_DRILLVALUE": "1"}
+        _, page = self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book", headers=drill)
+        self.assertEqual(["a", "c"], [r["title"] for r in page["list"]])
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book", headers={**drill, "HTTP_DRILL": "x"})[0])
+        _, build = self.call("GET", "/erupt-api/build/Author", erupt="Author")
+        self.assertEqual([{"code": "Books", "title": "Books", "link": {"linkErupt": "Book"}}],
+                         [{k: d[k] for k in ("code", "title")} | {"link": {"linkErupt": d["link"]["linkErupt"]}}
+                          for d in build["eruptModel"]["eruptJson"]["drills"]])
+        self.assertNotIn("joinColumn", build["eruptModel"]["eruptJson"]["drills"][0]["link"])
+
+    def test_simple_types_and_depend_column(self):
+        _, build = self.call("GET", "/erupt-api/build/Book", erupt="Book")
+        edit = {f["fieldName"]: f["eruptFieldJson"]["edit"] for f in build["eruptModel"]["eruptFieldModels"]}
+        self.assertEqual(("COLOR", "RATE", "HIDDEN", "TRANSFER"), tuple(edit[n]["type"] for n in ("colour", "stars", "secret", "readers")))
+        self.assertEqual("parent", edit["shelf"]["referenceTableType"]["dependColumn"], "the server reads it off the build")
+        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Book", {"title": "d", "stars": "4", "readers": [{"id": 2}]}, erupt="Book")[1]["success"])
+        row = self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book")[1]["list"][-1]
+        self.assertEqual((4, [2]), (row["stars"], row["readers"]))
+
+    def test_node_config_and_user_info(self):
+        seen = []
+        def server_text(path, headers):
+            seen.append((path, headers.get("token")))
+            return '{"account": "admin", "roles": ["r"]}' if "userinfo" in path else "cfg"
+        self.node._server_text = server_text
+        self.assertEqual("cfg", self.node.config())
+        self.assertEqual("cfg", self.node.group_config())
+        self.assertEqual({"account": "admin", "roles": ["r"]}, self.node.user_info())
+        self.assertEqual(["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog",
+                          "/erupt-cloud-api/userinfo/blog"], [p for p, _ in seen])
+
     def test_before_fetch_needs_sql(self):
         self.node.register(Task, MemoryRepository())
         self.assertEqual(500, self.call("POST", "/erupt-api/data/table/Task", {}, erupt="Task")[0])
 
     def test_reference(self):
-        _, page = self.call("POST", "/erupt-api/data/Article/reference-table/category",
-                            {"pageIndex": 1, "pageSize": 10, "condition": [{"key": "name", "expression": "LIKE", "value": "py"}]})
-        self.assertEqual([{"id": 2, "name": "Python", "parent": 1}], page["list"])
-        self.assertEqual(404, self.call("POST", "/erupt-api/data/Article/reference-table/topic", {})[0])
+        # the picker is the server's: it reads the referenced model's own table
+        self.assertEqual(404, self.call("POST", "/erupt-api/data/Article/reference-table/category", {})[0])
 
         self.add(title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
         row = self.table()["list"][0]
@@ -328,7 +448,7 @@ class NodeTest(unittest.TestCase):
         self.add(title="A")
         self.add(title="B")
         ids = [r["id"] for r in self.table()["list"]]
-        path = "/erupt-api/data/Article/operator/"
+        path = "/erupt-api/invoke/Article/operation/"
         _, r = self.call("POST", path + "publish", {"ids": ids, "param": {}})
         self.assertFalse(r["success"])  # the form's required note is missing
         _, r = self.call("POST", path + "publish", {"ids": ids, "param": {"note": "go"}})
@@ -347,9 +467,10 @@ class NodeTest(unittest.TestCase):
         self.assertTrue(r["success"])
         self.assertEqual(("rebuild", [], None), CALLS[-1])
         self.assertEqual(404, self.call("POST", path + "missing", {})[0])
-        status, form = self.call("POST", path + "publish/form-value")
-        self.assertEqual((200, {"note": None}), (status, form))
-        self.assertEqual(404, self.call("POST", path + "feature/form-value")[0])
+        form = "/erupt-api/invoke/Article/operation-form/"
+        self.assertEqual({"note": None}, self.call("POST", form + "publish", {})[1]["data"])
+        self.assertIsNone(self.call("POST", form + "feature", {})[1]["data"], "an operation without a form")
+        self.assertEqual(404, self.call("POST", "/erupt-api/data/Article/operator/publish", {"ids": ids})[0])
 
     def test_default_order(self):
         self.add(title="first")

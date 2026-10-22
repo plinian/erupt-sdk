@@ -6,7 +6,7 @@ require "erupt"
 
 class Category
   extend Erupt::Model
-  erupt "Category"
+  erupt "Category", drills: [{ title: "Articles", link: { linkErupt: "Article", joinColumn: "category" } }]
   field :id, pk: true
   field :name, "Name", search: true
   field :parent, "Parent", Integer
@@ -60,6 +60,7 @@ class Note
   erupt "Note", power: { delete: false }, data_proxy: NoteProxy
   field :id, pk: true
   field :text, "Text"
+  field :ping, "Ping", type: Erupt::EditType::BUTTON, click: ->(form) { { eval: "pong:#{form["text"]}" } }
 end
 
 node = Erupt::Node.new("conformance", ENV.fetch("ERUPT_ACCESS_TOKEN"), ENV.fetch("ERUPT_SERVER"),

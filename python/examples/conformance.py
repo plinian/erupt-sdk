@@ -5,7 +5,7 @@ import os
 from erupt import DataProxy, Fail, Field, MemoryRepository, Node, erupt, operation
 
 
-@erupt("Category")
+@erupt("Category", drills=[{"title": "Articles", "link": {"linkErupt": "Article", "joinColumn": "category"}}])
 class Category:
     id: int = Field(pk=True)
     name: str = Field("Name", search=True)
@@ -57,6 +57,7 @@ class NoteProxy(DataProxy):
 class Note:
     id: int = Field(pk=True)
     text: str = Field("Text")
+    ping = Field("Ping", type="BUTTON", click=lambda form: {"eval": f"pong:{form.get('text')}"})
 
 
 if __name__ == "__main__":

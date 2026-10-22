@@ -41,7 +41,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
         if (!AutoCreateSqlite) return;
         var columns = model.Stored.Select(f => f.IsPk
             ? $"{Q(f.Name)} INTEGER PRIMARY KEY AUTOINCREMENT"
-            : $"{Q(f.Name)} {(f.Type is "NUMBER" ? "NUMERIC" : f.Type is "BOOLEAN" || f.IsReference ? "INTEGER" : "TEXT")}");
+            : $"{Q(f.Name)} {(f.IsNumber ? "NUMERIC" : f.Type is "BOOLEAN" || f.IsReference ? "INTEGER" : "TEXT")}");
         using var conn = Open();
         Execute(conn, $"CREATE TABLE IF NOT EXISTS {Q(table)} ({string.Join(", ", columns)})", []);
     }

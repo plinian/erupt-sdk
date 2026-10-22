@@ -20,6 +20,9 @@ module Erupt
 
     def enum_values(name) = DEFS.fetch(name).fetch("enum")
 
+    # The declared defaults of an annotation, as Java fills an attribute left out.
+    def defaults(name) = DEFS.fetch(name)["properties"].each_with_object({}) { |(k, v), h| h[k] = v["default"] if v.key?("default") }
+
     # Raise ArgumentError unless +value+ fits definition +name+. +partial+ (an override) lets every attribute
     # be omitted; otherwise the attributes the Java side always emits must be present.
     def check(name, value, path = name, partial: true)

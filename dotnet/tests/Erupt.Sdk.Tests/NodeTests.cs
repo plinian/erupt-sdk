@@ -15,7 +15,7 @@ public class NodeTests
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) => Task.FromResult(answer(request));
     }
 
-    private static EruptNode Node(bool serverUp = true)
+    private static EruptNode Node(bool serverUp = true, EruptModel? article = null)
     {
         var node = new EruptNode(new NodeOptions { Name = "blog", AccessToken = Token, Servers = ["http://server"] });
         node.Http = new HttpClient(new PowerServer(_ => serverUp
@@ -25,7 +25,7 @@ public class NodeTests
             }
             : new HttpResponseMessage(HttpStatusCode.InternalServerError)));
         node.Register<Category>(new MemoryRepository(new Record { ["name"] = "Tech" }, new Record { ["name"] = "Python", ["parent"] = 1 }));
-        node.Register(EruptModel.Of<Article>(), new MemoryRepository());
+        node.Register(article ?? EruptModel.Of<Article>(), new MemoryRepository());
         return node;
     }
 
@@ -78,6 +78,30 @@ public class NodeTests
         Assert.Equal("Title cannot be empty", fail!["message"]!.GetValue<string>());
         var (treeStatus, _) = await Call(node, "GET", "/erupt-api/data/Article/reference-tree/topic");
         Assert.Equal(404, treeStatus); // the server builds reference trees
+        // the picker is the server's too: it reads the referenced model's own table
+        Assert.Equal(404, (await Call(node, "POST", "/erupt-api/data/Article/reference-table/category", new { })).Status);
+    }
+
+    [Fact]
+    public async Task Operations()
+    {
+        var node = Node(article: EruptModel.Of<Article>()
+            .Operation("publish", new OperationOptions { Title = "Publish", Form = EruptModel.Of<PublishForm>() }, _ => Task.CompletedTask)
+            .Operation("feature", new OperationOptions { Title = "Feature" }, _ => Task.FromResult<string?>("alert('featured')"))
+            .Operation("hidden", new OperationOptions { Title = "Hidden", Show = _ => false }, _ => Task.CompletedTask));
+        await Call(node, "POST", "/erupt-api/data/modify/Article", new { title = "A" });
+        var ids = new[] { 1 };
+        const string path = "/erupt-api/invoke/Article/operation/";
+        Assert.False((await Call(node, "POST", path + "publish", new { ids, param = new { } })).Body!["success"]!.GetValue<bool>());
+        var (_, r) = await Call(node, "POST", path + "publish", new { ids, param = new { note = "go" } });
+        Assert.Equal("Executed successfully", r!["message"]!.GetValue<string>());
+        Assert.Equal("alert('featured')", (await Call(node, "POST", path + "feature", new { ids })).Body!["data"]!.GetValue<string>());
+        Assert.Equal(403, (await Call(node, "POST", path + "hidden", new { ids })).Status);
+        Assert.Equal(404, (await Call(node, "POST", path + "missing", new { })).Status);
+        const string form = "/erupt-api/invoke/Article/operation-form/";
+        Assert.Equal("""{"note":null}""", (await Call(node, "POST", form + "publish", new { })).Body!["data"]!.ToJsonString());
+        Assert.Null((await Call(node, "POST", form + "feature", new { })).Body!["data"]); // an operation without a form
+        Assert.Equal(404, (await Call(node, "POST", "/erupt-api/data/Article/operator/publish", new { ids })).Status);
     }
 
     [Fact]
@@ -129,6 +153,138 @@ public class NodeTests
         var vis = build!["eruptModel"]!["eruptJson"]!["vis"]!.AsArray().Select(v => v!.AsObject()).ToList();
         Assert.Equal(["q", "Reversed"], vis.Select(v => v["code"]!.GetValue<string>()));
         Assert.DoesNotContain(vis, v => v.ContainsKey("filter") || v.ContainsKey("orderBy"));
+    }
+
+    [Fact]
+    public async Task LinkTree()
+    {
+        var node = Node();
+        node.Register(EruptModel.Of<Doc>().Options(new EruptOptions { LinkTree = new LinkTree { Field = "topic", DependNode = true } }),
+            new MemoryRepository(new Record { ["title"] = "a", ["topic"] = 1 }, new Record { ["title"] = "b", ["topic"] = 2 }, new Record { ["title"] = "c", ["topic"] = 3 }));
+        async Task<IEnumerable<string>> Titles(object body) =>
+            (await Call(node, "POST", "/erupt-api/data/table/Doc", body, "Doc")).Body!["list"]!.AsArray().Select(r => r!["title"]!.GetValue<string>());
+        Assert.Empty(await Titles(new { })); // DependNode: nothing until a tree node is picked
+        Assert.Equal(["b"], await Titles(new { linkTreeVal = new[] { 2 } }));
+        Assert.Equal(["a", "b"], await Titles(new { linkTreeVal = new[] { "1", "2" } }));
+        Assert.Contains("must be a reference field", Assert.Throws<ArgumentException>(() =>
+            EruptModel.Of<Doc>().Options(new EruptOptions { LinkTree = new LinkTree { Field = "title" } })).Message);
+    }
+
+    [Fact]
+    public async Task FieldTypesAndInvoke()
+    {
+        static FieldUpdate Refuse(Record _) => throw new EruptFailure("not now");
+        var node = Node();
+        node.Register(EruptModel.Of<Order>()
+            .Fetch(o => o.Status, form => [("new", "New"), (form.GetValueOrDefault("note") as string ?? "x", "From form")])
+            .Fetch(o => o.Tags, _ => ["red", "blue"])
+            .OnChange(o => o.Qty, form => new FieldUpdate { FormData = new Record { ["note"] = $"{form["qty"]} items" } })
+            .Complete(o => o.City, async (_, typed) =>
+            {
+                await Task.Yield();
+                return new[] { "Paris", "Tokyo" }.Where(c => c.Contains(typed, StringComparison.OrdinalIgnoreCase));
+            })
+            .Click(o => o.Calc, _ => new FieldUpdate { Eval = "alert(1)", FormData = new Record { ["qty"] = 2 } })
+            .Click(o => o.Stop, Refuse), new MemoryRepository());
+        var (_, build) = await Call(node, "GET", "/erupt-api/build/Order", erupt: "Order");
+        var fields = build!["eruptModel"]!["eruptFieldModels"]!.AsArray().ToDictionary(f => f!["fieldName"]!.GetValue<string>(), f => f!);
+        JsonNode Edit(string name) => fields[name]["eruptFieldJson"]!["edit"]!;
+        Assert.Equal("""["invoke"]""", Edit("status")["choiceType"]!["fetchHandler"]!.ToJsonString());
+        Assert.Equal("""["invoke"]""", Edit("tags")["tagsType"]!["fetchHandler"]!.ToJsonString());
+        Assert.Equal("invoke", Edit("qty")["onchange"]!.GetValue<string>());
+        Assert.Equal(["MARKDOWN", "ATTACHMENT", "BUTTON", "MULTI_CHOICE"], new[] { "body", "files", "calc", "colors" }.Select(n => Edit(n)["type"]!.GetValue<string>()));
+        Assert.Equal(["Category", "Category"], new[] { "cats", "sections" }.Select(n => fields[n]["fieldReturnName"]!.GetValue<string>()));
+        Assert.Empty(fields["calc"]["eruptFieldJson"]!["views"]!.AsArray());
+
+        Task<(int Status, JsonNode? Body)> Invoke(string kind, string field, object? form = null, string? value = null) =>
+            Call(node, "POST", $"/erupt-api/invoke/Order/{kind}/{field}", new { form = form ?? new { }, value }, "Order");
+        Assert.Equal("""[{"value":"new","label":"New"},{"value":"n","label":"From form"}]""",
+            (await Invoke("options", "status", new { note = "n" })).Body!["data"]!.ToJsonString());
+        Assert.Equal("""["red","blue"]""", (await Invoke("options", "tags")).Body!["data"]!.ToJsonString());
+        Assert.Equal("""{"formData":{"note":"3 items"},"editExpr":{}}""", (await Invoke("onchange", "qty", new { qty = 3 })).Body!["data"]!.ToJsonString());
+        Assert.Equal("""["Paris"]""", (await Invoke("autocomplete", "city", value: "pa")).Body!["data"]!.ToJsonString());
+        Assert.Equal("alert(1)", (await Invoke("button", "calc")).Body!["data"]!["eval"]!.GetValue<string>());
+        var stop = (await Invoke("button", "stop")).Body!;
+        Assert.Equal((false, "not now"), (stop["success"]!.GetValue<bool>(), stop["message"]!.GetValue<string>()));
+        Assert.Equal(404, (await Invoke("button", "qty")).Status); // a field without that code
+        Assert.Equal(404, (await Invoke("options", "missing")).Status);
+
+        // picked records arrive as [{id: key}] and are stored as their keys
+        var (_, r) = await Call(node, "POST", "/erupt-api/data/modify/Order",
+            new { cats = new object[] { new { id = 1 }, new { id = "2" } }, sections = new[] { new { id = 3 } }, tags = "[\"red\"]", colors = new[] { "red" } }, "Order");
+        Assert.True(r!["success"]!.GetValue<bool>());
+        var row = (await Call(node, "POST", "/erupt-api/data/table/Order", new { }, "Order")).Body!["list"]![0]!.AsObject();
+        Assert.Equal(("[1,2]", "[3]", """["red"]"""), (row["cats"]!.ToJsonString(), row["sections"]!.ToJsonString(), row["colors"]!.ToJsonString()));
+        Assert.False(row.ContainsKey("calc"));
+        Assert.Equal("invoke", node.NodeInfo()["capabilities"]![0]!.GetValue<string>());
+
+        // field code belongs to its type
+        Assert.Contains("belongs to AUTO_COMPLETE", Assert.Throws<ArgumentException>(() => EruptModel.Of<Order>().Complete(o => o.Note, (_, _) => [])).Message);
+        Assert.Contains("belongs to BUTTON", Assert.Throws<ArgumentException>(() => EruptModel.Of<Order>().Click(o => o.Qty, _ => new FieldUpdate())).Message);
+        Assert.Contains("belongs to TAGS", Assert.Throws<ArgumentException>(() => EruptModel.Of<Order>().Fetch(o => o.Status, _ => ["a"])).Message);
+        Assert.Contains("belongs to CHOICE", Assert.Throws<ArgumentException>(() => EruptModel.Of<Order>().Fetch(o => o.Note, _ => [("a", "A")])).Message);
+    }
+
+    private static EruptNode BookNode()
+    {
+        var node = Node();
+        node.Register(EruptModel.Of<Author>().Drill(new Drill { Title = "Books", Link = new Link { LinkErupt = "Book" } }, joinColumn: "author.id"),
+            new MemoryRepository(new Record { ["name"] = "Ann" }, new Record { ["name"] = "Bob" }));
+        node.Register(EruptModel.Of<Book>().Edit(b => b.Shelf, new Edit { ReferenceTableType = new ReferenceTableType { DependField = "author" } }),
+            new MemoryRepository(new Record { ["title"] = "a", ["author"] = 1 }, new Record { ["title"] = "b", ["author"] = 2 }, new Record { ["title"] = "c", ["author"] = 1 }));
+        return node;
+    }
+
+    [Fact]
+    public async Task Drill()
+    {
+        var node = BookNode();
+        void Drill(HttpRequest r, string code)
+        {
+            r.Headers["Drill"] = code;
+            r.Headers["DrillSourceErupt"] = "Author";
+            r.Headers["DrillValue"] = "1";
+        }
+        var (_, page) = await Call(node, "POST", "/erupt-api/data/table/Book", new { }, "Book", r => Drill(r, "Books"));
+        Assert.Equal(["a", "c"], page!["list"]!.AsArray().Select(r => r!["title"]!.GetValue<string>()));
+        Assert.Equal(403, (await Call(node, "POST", "/erupt-api/data/table/Book", new { }, "Book", r => Drill(r, "x"))).Status);
+        var (_, build) = await Call(node, "GET", "/erupt-api/build/Author", erupt: "Author");
+        var drill = build!["eruptModel"]!["eruptJson"]!["drills"]![0]!.AsObject();
+        Assert.Equal(("Books", "Books", "Book"), (drill["code"]!.GetValue<string>(), drill["title"]!.GetValue<string>(), drill["link"]!["linkErupt"]!.GetValue<string>()));
+        Assert.False(drill["link"]!.AsObject().ContainsKey("joinColumn"));
+    }
+
+    [Fact]
+    public async Task SimpleTypesAndDependColumn()
+    {
+        var node = BookNode();
+        var (_, build) = await Call(node, "GET", "/erupt-api/build/Book", erupt: "Book");
+        var edit = build!["eruptModel"]!["eruptFieldModels"]!.AsArray().ToDictionary(f => f!["fieldName"]!.GetValue<string>(), f => f!["eruptFieldJson"]!["edit"]!);
+        Assert.Equal(["COLOR", "RATE", "HIDDEN", "TRANSFER"], new[] { "colour", "stars", "secret", "readers" }.Select(n => edit[n]["type"]!.GetValue<string>()));
+        Assert.Equal("parent", edit["shelf"]["referenceTableType"]!["dependColumn"]!.GetValue<string>()); // the server reads it off the build
+        Assert.True((await Call(node, "POST", "/erupt-api/data/modify/Book", new { title = "d", stars = "4", readers = new[] { new { id = 2 } } }, "Book")).Body!["success"]!.GetValue<bool>());
+        var row = (await Call(node, "POST", "/erupt-api/data/table/Book", new { }, "Book")).Body!["list"]!.AsArray()[^1]!;
+        Assert.Equal((4, "[2]"), (row["stars"]!.GetValue<long>(), row["readers"]!.ToJsonString()));
+    }
+
+    [Fact]
+    public async Task NodeConfigAndUserInfo()
+    {
+        var node = Node();
+        var seen = new List<(string Path, string? Token)>();
+        node.Http = new HttpClient(new PowerServer(request =>
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            seen.Add((path, request.Headers.TryGetValues("token", out var token) ? token.Single() : null));
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(path.Contains("userinfo") ? """{"account":"admin","roles":["r"]}""" : "cfg"),
+            };
+        }));
+        Assert.Equal("cfg", await node.ConfigAsync());
+        Assert.Equal("cfg", await node.GroupConfigAsync());
+        Assert.Equal("""{"account":"admin","roles":["r"]}""", (await node.UserInfoAsync())!.ToJsonString());
+        Assert.Equal(["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog", "/erupt-cloud-api/userinfo/blog"], seen.Select(s => s.Path));
     }
 
     [Fact]

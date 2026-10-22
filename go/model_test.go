@@ -155,7 +155,7 @@ func TestDeclarationErrors(t *testing.T) {
 			T string `erupt:"type=INPUTT"`
 		}{}, nil, "is not a EditType"},
 		{struct {
-			T string `erupt:"type=HTML_EDITOR"`
+			T string `erupt:"type=TAB_TABLE_ADD"`
 		}{}, nil, "is not supported yet"},
 		{struct {
 			T string `erupt:"colour=red"`

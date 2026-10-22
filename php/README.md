@@ -193,6 +193,64 @@ final class Task { /* ... */ }
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`raw: ['tree' => ['id' => 'id', 'label' => 'name', 'pid' => 'parent']]` shows the model as a tree, and
+`raw: ['linkTree' => ['field' => 'category']]` puts the tree of a reference field beside the table: the erupt
+server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+(`'dependNode' => true` shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the inferred types, `type:` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores the
+upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR` (all text), `BUTTON` (form only),
+and `CHECKBOX` / `TAB_TREE` with `ref:`: the picked records, stored as the JSON list of their keys. An
+`array` property with `choices` is a `MULTI_CHOICE`.
+
+A field can run its own code: `fetch`, `onchange`, `complete` and `click` name a static method of the model
+class, which the erupt server calls through the node's `invoke` endpoint with the form's values:
+
+```php
+#[Erupt('Order')]
+final class Order
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Status', fetch: 'statusOptions')] public string $status;      // options, also TAGS: [...]
+    #[Field('Qty', onchange: 'qtyChanged')] public int $qty;
+    #[Field('City', type: 'AUTO_COMPLETE', complete: 'cities')] public string $city;
+    #[Field('Total')] public float $total;
+    #[Field('Recalc', type: 'BUTTON', click: 'recalc')] public ?string $recalc;
+    #[Field('Tags', type: 'CHECKBOX', ref: Tag::class)] public array $tags;
+
+    public static function statusOptions(array $form): array { return ['new' => 'New', 'paid' => 'Paid']; }
+    public static function qtyChanged(array $form): array { return ['formData' => ['total' => $form['qty'] * 9], 'editExpr' => new \stdClass()]; }
+    public static function cities(array $form, string $typed): array { return lookup($typed); }
+    public static function recalc(array $form): array { return ['eval' => "alert('done')", 'formData' => new \stdClass()]; }
+}
+```
+
+`fetch` belongs to `CHOICE` / `MULTI_CHOICE` (`value => label`) and `TAGS` (a list), `complete` to
+`AUTO_COMPLETE`, `click` to `BUTTON`; `onchange` to any field. Throw `Fail` to refuse with a message.
+
+Also: `COLOR`, `ICON`, `SIGNATURE`, `MAP`, `HIDDEN` (text), `RATE`, `SLIDER` (numbers) and `TRANSFER` (like
+`CHECKBOX`). A reference table depending on another field takes
+`edit: ['referenceTableType' => ['dependField' => 'province', 'dependColumn' => 'province']]`: the erupt server
+keeps the picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```php
+#[Erupt('Author', raw: ['drills' => [['title' => 'Books', 'link' => ['linkErupt' => 'Book', 'joinColumn' => 'author']]]])]
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written (a SQL repository then). Both models must be on the node.
+
+## Server config and user info
+
+`$node->config()` and `$node->groupConfig()` return the config text set for the node and its group on the erupt
+server; `$node->userInfo()` the acting user's full info (roles, org, post), while a request is served.
+
 ## Without a registry
 
 Without Packagist, point Composer at the read-only split repository:
@@ -209,7 +267,8 @@ A copy does not update itself: when erupt changes the protocol or the annotation
 
 ## Differences from the Python SDK
 
-- Operation code defaults to the method name; `show` names a static method instead of taking a lambda.
+- Operation code defaults to the method name; `show` names a static method instead of taking a lambda, and so
+  do a field's `fetch`, `onchange`, `complete` and `click`.
 - Dates are stored as wall-clock strings, not date objects.
 - `PdoRepository` sorts nulls last (first when descending) on every database and LIKE-escapes with `!`.
 - A request body that is not a JSON object counts as empty instead of answering 500.

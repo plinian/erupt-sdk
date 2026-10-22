@@ -128,6 +128,62 @@ let task = Model::new("Task", "Task")
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`.raw(json!({"tree": {"id": "id", "label": "name", "pid": "parent"}}))` shows the model as a tree, and
+`.raw(json!({"linkTree": {"field": "category"}}))` puts the tree of a reference field beside the table: the
+erupt server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+(`"dependNode": true` shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the constructors above, `Field::of(EditType::…)` takes `Tags`, `AutoComplete`, `Attachment` (the erupt
+server stores the upload, the node keeps its path), `HtmlEditor`, `Markdown`, `CodeEditor` (all text) and
+`Button` (form only); `Field::multi_choice` is a `MULTI_CHOICE`, and `Field::checkbox` / `Field::tab_tree`
+take another model: the picked records, stored as the JSON list of their keys.
+
+A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
+values:
+
+```rust
+let order = Model::new("Order", "Order")
+    .field("id", Field::pk())
+    .field("status", Field::choice("Status", &[])            // options, fetched when the form opens
+        .fetch(|form| Ok(vec![("new".into(), "New".into()), ("paid".into(), "Paid".into())])))
+    .field("qty", Field::number("Qty")
+        .onchange(|form| Ok(json!({"formData": {"total": as_f64(&form["qty"]).unwrap_or(0.0) * 9.0}, "editExpr": {}}))))
+    .field("city", Field::of(EditType::AutoComplete, "City").complete(|form, typed| lookup(typed)))
+    .field("total", Field::number("Total"))
+    .field("recalc", Field::of(EditType::Button, "Recalc")
+        .click(|form| Ok(json!({"eval": "alert('done')", "formData": {}}))))
+    .field("tags", Field::checkbox(&tag, "Tags"))
+    .build()?;
+```
+
+`fetch` belongs to `CHOICE` / `MULTI_CHOICE`, `fetch_tags` (a `Vec<String>`) to `TAGS`, `complete` to
+`AUTO_COMPLETE`, `click` to `BUTTON`, `onchange` to any field; another type fails at `build()`. Return
+`Err(Error::fail(msg))` to refuse with a message.
+
+Also: `Color`, `Icon`, `Signature`, `Map`, `Hidden` (text), `Rate`, `Slider` (numbers), and `Field::transfer`
+(like `Field::checkbox`). A reference table depending on another field takes
+`.edit(json!({"referenceTableType": {"dependField": "province", "dependColumn": "province"}}))`: the erupt server
+keeps the picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```rust
+Model::new("Author", "Author")
+    .raw(json!({"drills": [{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author"}}]}))
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.config()` and `node.group_config()` return the config text set for the node and its group on the erupt
+server; `node.user_info()` the acting user's full info (roles, org, post), on the thread serving a request.
+
 ## Storage
 
 `Repository` (`bind`, `page`, `get`, `add`, `update`, `delete`) puts a model on anything; without a sort it

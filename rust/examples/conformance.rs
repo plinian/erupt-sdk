@@ -1,5 +1,5 @@
 //! The conformance fixture (conformance/README.md) in Rust.
-use erupt::types::RowOperationMode;
+use erupt::types::{EditType, RowOperationMode};
 use erupt::{DataProxy, Error, Field, MemoryRepository, Model, Node, Operation, Record};
 use serde_json::{json, Value};
 
@@ -25,6 +25,7 @@ impl DataProxy for NoteProxy {
 
 fn main() -> erupt::Result<()> {
     let category = Model::new("Category", "Category")
+        .raw(json!({"drills": [{"title": "Articles", "link": {"linkErupt": "Article", "joinColumn": "category"}}]}))
         .field("id", Field::pk())
         .field("name", Field::input("Name").search())
         .field("parent", Field::number("Parent"))
@@ -87,6 +88,13 @@ fn main() -> erupt::Result<()> {
         .data_proxy(NoteProxy)
         .field("id", Field::pk())
         .field("text", Field::input("Text"))
+        .field(
+            "ping",
+            Field::of(EditType::Button, "Ping").click(|form| {
+                let text = form.get("text").and_then(Value::as_str).unwrap_or("");
+                Ok(json!({"eval": format!("pong:{text}")}))
+            }),
+        )
         .build()?;
 
     let env = |name: &str| std::env::var(name).unwrap_or_default();

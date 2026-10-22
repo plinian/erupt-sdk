@@ -28,7 +28,7 @@ type SQLRepository struct {
 }
 
 var sqliteTypes = map[string]string{"NUMBER": "NUMERIC", "BOOLEAN": "INTEGER", "DATE": "DATE", typeDateTime: "TIMESTAMP",
-	typeReferenceTable: "INTEGER", typeReferenceTree: "INTEGER"}
+	typeReferenceTable: "INTEGER", typeReferenceTree: "INTEGER", "RATE": "NUMERIC", "SLIDER": "NUMERIC"}
 
 func (r *SQLRepository) Bind(m *Model) error {
 	if !identifier.MatchString(r.Table) {
@@ -328,7 +328,7 @@ func (r *SQLRepository) fromDB(f *field, v any) any {
 			return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 		}
 		return t
-	case f.pk || f.typ == "NUMBER" || f.isReference():
+	case f.pk || f.isNumber() || f.isReference():
 		if s, ok := v.(string); ok {
 			if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 				return n

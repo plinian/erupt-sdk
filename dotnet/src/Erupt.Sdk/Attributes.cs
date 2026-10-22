@@ -29,7 +29,8 @@ public sealed class PkAttribute : Attribute
 /// <summary>
 /// One column. The title labels both the table column and the form input. The edit type follows the property
 /// type (string INPUT, numbers NUMBER, bool BOOLEAN, DateOnly DATE, DateTime DATE_TIME, another
-/// <see cref="EruptModelAttribute"/> class a reference, <see cref="ChoiceAttribute"/>s a CHOICE) unless
+/// <see cref="EruptModelAttribute"/> class a reference, <see cref="ChoiceAttribute"/>s a CHOICE, or a MULTI_CHOICE on a
+/// collection) unless
 /// <see cref="Type"/> is set.
 /// </summary>
 [AttributeUsage(AttributeTargets.Property)]
@@ -62,7 +63,10 @@ public sealed class FieldAttribute(string title = "") : Attribute
     /// </summary>
     public bool Virtual { get; set; }
 
-    /// <summary>The referenced model, for a property that holds a primary key (e.g. <c>long?</c>).</summary>
+    /// <summary>
+    /// The referenced model, for a property that holds a primary key (e.g. <c>long?</c>), or a list of them for a
+    /// CHECKBOX / TAB_TREE.
+    /// </summary>
     public Type? Ref { get; set; }
 
     /// <summary>Field of the referenced model shown for a reference.</summary>
@@ -70,6 +74,12 @@ public sealed class FieldAttribute(string title = "") : Attribute
 
     /// <summary>Parent field of the referenced model: turns the reference picker into a tree.</summary>
     public string? Tree { get; set; }
+
+    /// <summary>
+    /// A REFERENCE_TABLE whose <c>referenceTableType.dependField</c> is set: the referenced model's field the picker
+    /// keeps equal to the depend field's value (<c>@Transient</c> in Java, so not part of <see cref="Erupt.Edit"/>).
+    /// </summary>
+    public string? DependColumn { get; set; }
 }
 
 /// <summary>One option of a CHOICE field, in declaration order.</summary>

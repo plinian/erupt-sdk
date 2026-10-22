@@ -124,6 +124,67 @@ EruptModel.Of<TaskItem>()
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`Options(new EruptOptions { Tree = new Tree { Id = "id", Label = "name", Pid = "parent" } })` shows the model as a
+tree, and `LinkTree = new LinkTree { Field = "category" }` puts the tree of a reference field beside the table: the
+erupt server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+(`DependNode = true` shows none until one is picked). `LinkTree.Field` must be a reference field.
+
+## Field types and field code
+
+Besides the inferred types, `Type =` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores the
+upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR`, `COLOR`, `ICON`, `SIGNATURE`, `MAP`,
+`HIDDEN` (all text), `RATE`, `SLIDER` (numbers), `BUTTON` (form only), and `CHECKBOX` / `TAB_TREE` / `TRANSFER`
+with `Ref =`: the picked records, stored as the JSON list of their keys. A collection property with `[Choice]`s
+is a `MULTI_CHOICE`.
+
+A reference table depending on another field takes `[Field("Shelf", DependColumn = "province")]` plus
+`.Edit(x => x.Shelf, new Edit { ReferenceTableType = new ReferenceTableType { DependField = "province" } })`: the
+erupt server keeps the picked model's rows whose `DependColumn` holds the depend field's value.
+
+A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
+values. Attributes cannot hold code, so the model builder registers it by property:
+
+```csharp
+[EruptModel("Order")]
+public sealed class Order
+{
+    [Pk] public long Id { get; set; }
+    [Field("Status", Type = EditType.CHOICE)] public string? Status { get; set; }
+    [Field("Qty")] public long? Qty { get; set; }
+    [Field("City", Type = EditType.AUTO_COMPLETE)] public string? City { get; set; }
+    [Field("Total")] public double? Total { get; set; }
+    [Field("Recalc", Type = EditType.BUTTON)] public object? Recalc { get; set; }
+    [Field("Tags", Type = EditType.CHECKBOX, Ref = typeof(Tag))] public List<long>? Tags { get; set; }
+}
+
+node.Register(EruptModel.Of<Order>()
+    .Fetch(o => o.Status, form => [("new", "New"), ("paid", "Paid")])          // TAGS: form => ["a", "b"]
+    .OnChange(o => o.Qty, form => new FieldUpdate { FormData = new Record { ["total"] = (long)form["qty"]! * 9 } })
+    .Complete(o => o.City, async (form, typed) => await LookupAsync(typed))
+    .Click(o => o.Recalc, form => new FieldUpdate { Eval = "alert('done')" }), repository);
+```
+
+`Fetch` belongs to `CHOICE` / `MULTI_CHOICE` (value / label pairs) and `TAGS` (strings), `Complete` to
+`AUTO_COMPLETE`, `Click` to `BUTTON`, `OnChange` to any field; anything else throws at declaration. Each takes
+a plain or an async function; throw `EruptFailure` to refuse with a message.
+
+## Drills
+
+```csharp
+node.Register(EruptModel.Of<Author>()
+    .Drill(new Drill { Title = "Books", Link = new Link { LinkErupt = "Book" } }, joinColumn: "author"), repository);
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`column:`, `id` by default);
+`Link.LinkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.ConfigAsync()` and `node.GroupConfigAsync()` return the config text set for the node and its group on the
+erupt server; `node.UserInfoAsync()` the acting user's full info (roles, org, post), while a request is served.
+
 ## Run
 
 ```csharp

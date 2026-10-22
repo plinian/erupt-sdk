@@ -11,9 +11,9 @@ namespace Erupt;
 final class PdoRepository implements Repository
 {
     private const SQL_OPS = ['EQ' => '=', 'NEQ' => '<>', 'GT' => '>', 'GTE' => '>=', 'LT' => '<', 'LTE' => '<='];
-    private const SQLITE_TYPES = ['NUMBER' => 'NUMERIC', 'BOOLEAN' => 'INTEGER', 'REFERENCE_TABLE' => 'INTEGER', 'REFERENCE_TREE' => 'INTEGER'];
+    private const SQLITE_TYPES = ['NUMBER' => 'NUMERIC', 'RATE' => 'NUMERIC', 'SLIDER' => 'NUMERIC', 'BOOLEAN' => 'INTEGER', 'REFERENCE_TABLE' => 'INTEGER', 'REFERENCE_TREE' => 'INTEGER'];
 
-    private const TYPED = ['BOOLEAN', 'NUMBER', 'DATE', 'DATE_TIME'];
+    private const TYPED = ['BOOLEAN', 'NUMBER', 'RATE', 'SLIDER', 'DATE', 'DATE_TIME'];
 
     private Model $model;
 

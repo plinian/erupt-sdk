@@ -14,7 +14,10 @@ struct NoteProxy: DataProxy {
 }
 
 do {
-    let category = try Model("Category") {
+    let category = try Model(
+        "Category", erupt: Erupt(drills: [Drill(link: Link(linkErupt: "Article"), title: "Articles")]),
+        drillJoin: ["Articles": DrillJoin(joinColumn: "category")]
+    ) {
         Field("id", pk: true)
         Field("name", "Name", search: true)
         Field("parent", "Parent", .number)
@@ -47,6 +50,7 @@ do {
     let note = try Model("Note", power: ["delete": false], dataProxy: [NoteProxy()]) {
         Field("id", pk: true)
         Field("text", "Text")
+        Field("ping", "Ping", type: .button, click: { form in FormChange(eval: "pong:" + (form["text"]?.text ?? "")) })
     }
 
     let node = try Node(

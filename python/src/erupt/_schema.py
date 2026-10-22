@@ -15,6 +15,11 @@ _PRIMITIVES = {
 }
 
 
+def defaults(name):
+    """The declared defaults of an annotation, as Java fills an attribute left out."""
+    return {k: v["default"] for k, v in DEFS[name]["properties"].items() if "default" in v}
+
+
 def enum_values(name):
     return tuple(DEFS[name]["enum"])
 

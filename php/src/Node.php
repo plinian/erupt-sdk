@@ -24,17 +24,17 @@ final class Node
     private const ROUTES = [
         ['GET', '#^/erupt-api/build/([^/]+)$#', 'build'],
         ['POST', '#^/erupt-api/data/table/([^/]+)$#', 'table'],
-        ['POST', '#^/erupt-api/data/([^/]+)/reference-table/([^/]+)$#', 'referenceTable'],
-        ['POST', '#^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$#', 'operationFormValue'],
-        ['POST', '#^/erupt-api/data/([^/]+)/operator/([^/]+)$#', 'operation'],
         ['GET', '#^/erupt-api/data/init-value/([^/]+)$#', 'initValue'],
         ['GET', '#^/erupt-api/data/([^/]+)/([^/]+)$#', 'get'],
         ['POST', '#^/erupt-api/data/modify/([^/]+)$#', 'add'],
         ['POST', '#^/erupt-api/data/modify/([^/]+)/update$#', 'update'],
         ['POST', '#^/erupt-api/data/modify/([^/]+)/delete$#', 'delete'],
+        ['POST', '#^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$#', 'invoke'],
     ];
 
     private static ?array $user = null;
+    /** the session token of the request being served */
+    private static ?string $token = null;
 
     /** @var list<string> */
     private readonly array $servers;
@@ -85,15 +85,6 @@ final class Node
         return $this;
     }
 
-    private function repoOf(Model $target): Repository
-    {
-        [$model, $repo] = $this->models[$target->name] ?? [null, null];
-        if ($model !== $target) {
-            throw new \LogicException("referenced erupt '$target->name' is not registered on this node");
-        }
-        return $repo;
-    }
-
     // ---------------------------------------------------------------- serving
 
     /** Serve the current PHP SAPI request (php-fpm, `php -S`): read the globals, emit the response. */
@@ -138,6 +129,7 @@ final class Node
             [$status, $payload] = [500, ['path' => $path, 'status' => 500, 'error' => 'erupt exception', 'message' => $e->getMessage()]];
         } finally {
             self::$user = null;
+            self::$token = null;
             $this->enforced = [];
         }
         return is_string($payload)
@@ -174,6 +166,7 @@ final class Node
             }
             $user = $headers['user'] ?? '';
             self::$user = $user === '' ? null : json_decode((string) base64_decode($user, true), true);
+            self::$token = $headers['token'] ?? null;
             [$model, $repo] = $this->models[$name];
             $args = array_map('rawurldecode', array_slice($m, 2));
             return [200, $this->$handler($model, $repo, new Request($headers, $body), ...$args)];
@@ -210,32 +203,20 @@ final class Node
     private function table(Model $model, Repository $repo, Request $request): array
     {
         $this->requirePower($model, $request, 'query');
-        return $this->page($model, $repo, $request->object());
+        return $this->page($model, $repo, $request->object(), $request);
     }
 
-    private function referenceTable(Model $model, Repository $repo, Request $request, string $field): array
-    {
-        $target = $this->referenceField($model, $field, 'REFERENCE_TABLE')->target();
-        return $this->page($target, $this->repoOf($target), $request->object());
-    }
-
-    private function referenceField(Model $model, string $field, ?string $editType = null): FieldSpec
-    {
-        $f = $model->fields[$field] ?? null;
-        if ($f === null || !$f->isReference() || ($editType !== null && $f->type !== $editType)) {
-            throw new Reply(404);
-        }
-        return $f;
-    }
-
-    private function page(Model $model, Repository $repo, array $body): array
+    private function page(Model $model, Repository $repo, array $body, Request $request): array
     {
         $pageIndex = max((int) (($body['pageIndex'] ?? null) ?: 1), 1);
         $pageSize = min(max((int) (($body['pageSize'] ?? null) ?: 10), 1), self::MAX_PAGE_SIZE);
         $query = new Query([], [], ($pageIndex - 1) * $pageSize, $pageSize);
+        // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+        $trusted = in_array('query', $this->enforced, true);
         foreach ((array) ($body['condition'] ?? []) as $c) {
-            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : []));
+            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : [], $trusted));
         }
+        $drill = $this->drill($model, $request, $query);
         foreach ((array) ($body['sort'] ?? []) as $s) {
             $f = is_array($s) && is_string($s['field'] ?? null) ? ($model->fields[$s['field']] ?? null) : null;
             if ($f === null || !($f->decl->sortable || $f->isPk())) {
@@ -243,13 +224,18 @@ final class Node
             }
             $query->sort[] = [$f->name, strtoupper((string) ($s['direction'] ?? 'ASC')) === 'DESC'];
         }
+        // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+        $picked = $body['linkTreeVal'] ?? null;
+        if ($model->linkTree && $picked !== null) {
+            $query->conditions[] = $this->condition($model->fields[$model->linkTree[0]], 'IN', $picked);
+        }
         // a @Vis view's own filter and order, then the DataProxy's
         [$filters, $sort] = is_string($body['vis'] ?? null) ? ($model->vis[$body['vis']] ?? [[], []]) : [[], []];
         if (!$query->sort) {
             $query->sort = $sort ?: $model->orderBy;
         }
-        $query->filters = [...$filters, ...$model->filters($query->conditions)];
-        [$total, $records] = $repo->page($query);
+        $query->filters = [...$drill, ...$filters, ...$model->filters($query->conditions)];
+        [$total, $records] = $model->linkTree && $model->linkTree[1] && $picked === null ? [0, []] : $repo->page($query);
         $rows = $this->rows($model, $records);
         $model->hook('afterFetch', $rows);
         return ['pageIndex' => $pageIndex, 'pageSize' => $pageSize, 'total' => $total,
@@ -257,12 +243,34 @@ final class Node
             'sort' => null, 'alert' => null, 'extraContent' => null];
     }
 
+    /**
+     * A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+     * joinColumn holds the source row's column; its linkCondition is returned as a filter.
+     *
+     * @return list<array{0: string, 1: list<mixed>}>
+     */
+    private function drill(Model $model, Request $request, Query $query): array
+    {
+        $code = $request->headers['drill'] ?? null;
+        if ($code === null) {
+            return [];
+        }
+        [$source, $repo] = $this->models[$request->headers['drillsourceerupt'] ?? ''] ?? [null, null];
+        $drill = $source?->drills[$code] ?? throw new Reply(403);
+        if ($drill['erupt'] !== $model->name || !isset($model->fields[$drill['join']])) {
+            throw new Fail("illegal erupt from drill '$code'");
+        }
+        $row = $repo->get(self::pk($source, $request->headers['drillvalue'] ?? null)) ?? throw new Fail('record not found');
+        $query->conditions[] = $this->condition($model->fields[$drill['join']], 'EQ', $row[$drill['column']] ?? null);
+        return $drill['condition'] === '' ? [] : [[$drill['condition'], []]];
+    }
+
     /** @return list<Cond> */
-    private function conditions(Model $model, array $c): array
+    private function conditions(Model $model, array $c, bool $trusted = false): array
     {
         $key = $c['key'] ?? null;
         $f = is_string($key) ? ($model->fields[$key] ?? null) : null;
-        if ($f === null || $f->isPk() || !$f->decl->search) {
+        if ($f === null || (!$trusted && ($f->isPk() || !$f->decl->search))) {
             throw new Fail("illegal search field '" . (is_scalar($key) ? $key : json_encode($key)) . "'");
         }
         $op = ($c['expression'] ?? null) ?: 'EQ';
@@ -377,6 +385,34 @@ final class Node
     }
 
     /**
+     * The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the
+     * operation code, or a field's fetched options, onchange, auto-complete or button with the form's values.
+     */
+    private function invoke(Model $model, Repository $repo, Request $request, string $kind, string $field): array
+    {
+        if ($kind === 'operation') {
+            return $this->operation($model, $repo, $request, $field);
+        }
+        if ($kind === 'operation-form') {
+            return self::r(data: $this->operationFormValue($model, $field));
+        }
+        $f = current(array_filter($model->declared, fn(FieldSpec $f) => $f->name === $field)) ?: null;
+        $fn = $f?->code[$kind] ?? throw new Reply(404);
+        $body = $request->object();
+        $form = is_array($body['form'] ?? null) ? $body['form'] : [];
+        if ($kind === 'autocomplete') {
+            return self::r(data: array_values($fn($form, is_scalar($body['value'] ?? null) ? (string) $body['value'] : '')));
+        }
+        $answer = $fn($form);
+        if ($kind === 'options') {
+            // value => label, as the choices of a field; a TAGS answers its list of tags
+            $answer = $f->type === 'TAGS' ? array_values($answer)
+                : array_map(fn($v, $label) => ['value' => (string) $v, 'label' => $label], array_keys($answer), $answer);
+        }
+        return self::r(data: $answer);
+    }
+
+    /**
      * Records to browser rows. A reference stays its key: the server resolves its label, the flattened
      * <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
      */
@@ -403,10 +439,11 @@ final class Node
         return $op;
     }
 
-    private function operationFormValue(Model $model, Repository $repo, Request $request, string $code): array
+    private function operationFormValue(Model $model, string $code): ?array
     {
-        $form = $this->operationOf($model, $code)->formModel() ?? throw new Reply(404); // the browser ignores a 404 here
-        return array_fill_keys(array_keys($form->fields), null);
+        // none without a form: the server answers the browser a 404, and it opens an empty one
+        $form = $this->operationOf($model, $code)->formModel();
+        return $form ? array_fill_keys(array_keys($form->fields), null) : null;
     }
 
     private function operation(Model $model, Repository $repo, Request $request, string $code): array
@@ -512,6 +549,37 @@ final class Node
         return $power;
     }
 
+    // ---------------------------------------------------------------- server calls
+
+    /** The config text set for this node on the erupt server (Node Config). */
+    public function config(): string
+    {
+        return $this->serverText('/erupt-cloud-api/node-config/' . rawurlencode($this->name), ['Access-Token' => $this->accessToken]);
+    }
+
+    /** The config text of this node's group on the erupt server. */
+    public function groupConfig(): string
+    {
+        return $this->serverText('/erupt-cloud-api/node-group-config/' . rawurlencode($this->name), ['Access-Token' => $this->accessToken]);
+    }
+
+    /** The acting user's full info from the erupt server (roles, org, post...), for the request being served. */
+    public function userInfo(): ?array
+    {
+        $text = $this->serverText('/erupt-cloud-api/userinfo/' . rawurlencode($this->name), ['Access-Token' => $this->accessToken, 'token' => self::$token ?? '']);
+        $info = $text === '' ? null : json_decode($text, true, 512, JSON_THROW_ON_ERROR);
+        return is_array($info) ? $info : null;
+    }
+
+    private function serverText(string $path, array $headers): string
+    {
+        [$status, $body] = Http::request('GET', $this->server() . $path, $headers);
+        if ($status !== 200) {
+            throw new \RuntimeException("$path answered $status");
+        }
+        return $body;
+    }
+
     // ---------------------------------------------------------------- registration
 
     private function server(): string
@@ -564,7 +632,7 @@ final class Node
         $server = $this->server();
         $info = ['instanceId' => $this->instanceId, 'nodeName' => $this->name, 'accessToken' => $this->accessToken,
             'version' => 'php-' . self::VERSION, 'nodeAddress' => [$this->address($port)], 'eruptModules' => [],
-            'erupts' => array_keys($this->models), 'resources' => new \stdClass()];
+            'erupts' => array_keys($this->models), 'resources' => new \stdClass(), 'capabilities' => ['invoke']];
         try {
             [$status] = Http::request('POST', "$server/erupt-cloud-api/register-node", ['Content-Type' => 'application/json'], Json::encode($info), 10);
             if ($status >= 200 && $status < 300) {

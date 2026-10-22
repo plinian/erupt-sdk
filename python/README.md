@@ -122,6 +122,57 @@ class Task: ...
 
 Dragging on a board, calendar or gantt view is saved by the erupt server through the node's `get` and `update`.
 
+## Trees
+
+`tree={"id": "id", "label": "name", "pid": "parent"}` shows the model as a tree, and
+`linkTree={"field": "category"}` puts the tree of a reference field beside the table: the erupt server builds
+both trees from the node's table, and the node keeps the rows under the picked tree node (`dependNode: True`
+shows none until one is picked). `linkTree.field` must be a reference field.
+
+## Field types and field code
+
+Besides the inferred types, `type=` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores the
+upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR` (all text), `BUTTON` (form only),
+and `CHECKBOX` / `TAB_TREE` with `ref=`: the picked records, stored as the JSON list of their keys. A
+`list`-annotated field with `choices` is a `MULTI_CHOICE`.
+
+A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
+values:
+
+```python
+@erupt("Order")
+class Order:
+    id: int = Field(pk=True)
+    status: str = Field("Status", fetch=lambda form: {"new": "New", "paid": "Paid"})   # options, also TAGS: [...]
+    qty: int = Field("Qty", onchange=lambda form: {"formData": {"total": form["qty"] * 9}, "editExpr": {}})
+    city: str = Field("City", type="AUTO_COMPLETE", complete=lambda form, typed: lookup(typed))
+    total: float = Field("Total")
+    recalc = Field("Recalc", type="BUTTON", click=lambda form: {"eval": "alert('done')", "formData": {}})
+    tags: list = Field("Tags", type="CHECKBOX", ref=Tag)
+```
+
+`fetch` belongs to `CHOICE` / `MULTI_CHOICE` (`{value: label}` or pairs) and `TAGS` (a list), `complete` to
+`AUTO_COMPLETE`, `click` to `BUTTON`; `onchange` to any field. Raise `Fail` to refuse with a message.
+
+Also: `COLOR`, `ICON`, `SIGNATURE`, `MAP`, `HIDDEN` (text), `RATE`, `SLIDER` (numbers) and `TRANSFER` (like
+`CHECKBOX`). A reference table depending on another field takes
+`edit={"referenceTableType": {"dependField": "province", "dependColumn": "province"}}`: the erupt server keeps the
+picked model's rows whose `dependColumn` holds the depend field's value.
+
+## Drills
+
+```python
+@erupt("Author", drills=[{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author"}}])
+```
+
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
+`link.linkCondition` adds SQL as written. Both models must be on the node.
+
+## Server config and user info
+
+`node.config()` and `node.group_config()` return the config text set for the node and its group on the erupt
+server; `node.user_info()` the acting user's full info (roles, org, post), while a request is served.
+
 ## Storage
 
 Storage is any `Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:
@@ -147,7 +198,8 @@ repo = SqlRepository(lambda: pymysql.connect(**MYSQL), "article", dialect="mysql
 Without a sort, every repository returns rows by primary key ascending. `erupt.current_user()` returns the
 acting user inside a repository call.
 
-Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload, Excel, i18n of messages.
+Not yet: sub-tables (TAB_TABLE_*), TPL operations, i18n of messages. Trees, file
+upload and Excel are done by the erupt server.
 
 ## Without a registry
 

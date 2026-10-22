@@ -31,6 +31,52 @@ public sealed class Article
     [Field("Topic", Tree = "parent")] public Category? Topic { get; set; }
 }
 
+[EruptModel("Doc")]
+public sealed class Doc
+{
+    [Pk] public long Id { get; set; }
+    [Field("Title")] public string? Title { get; set; }
+    [Field("Topic", Tree = "parent")] public Category? Topic { get; set; }
+}
+
+[EruptModel("Order")]
+public sealed class Order
+{
+    [Pk] public long Id { get; set; }
+    [Field("Status", Type = EditType.CHOICE)] public string? Status { get; set; }
+    [Field("Tags", Type = EditType.TAGS)] public string? Tags { get; set; }
+    [Field("Qty")] public long? Qty { get; set; }
+    [Field("Note")] public string? Note { get; set; }
+    [Field("City", Type = EditType.AUTO_COMPLETE)] public string? City { get; set; }
+    [Field("Body", Type = EditType.MARKDOWN)] public string? Body { get; set; }
+    [Field("Files", Type = EditType.ATTACHMENT)] public string? Files { get; set; }
+    [Field("Categories", Type = EditType.CHECKBOX, Ref = typeof(Category))] public List<long>? Cats { get; set; }
+    [Field("Sections", Type = EditType.TAB_TREE, Ref = typeof(Category))] public List<long>? Sections { get; set; }
+    [Field("Colors"), Choice("red", "Red"), Choice("blue", "Blue")] public List<string>? Colors { get; set; }
+    [Field("Calc", Type = EditType.BUTTON)] public object? Calc { get; set; }
+    [Field("Stop", Type = EditType.BUTTON)] public object? Stop { get; set; }
+}
+
+[EruptModel("Author")]
+public sealed class Author
+{
+    [Pk] public long Id { get; set; }
+    [Field("Name")] public string? Name { get; set; }
+}
+
+[EruptModel("Book")]
+public sealed class Book
+{
+    [Pk] public long Id { get; set; }
+    [Field("Title")] public string? Title { get; set; }
+    [Field("Author")] public Author? Author { get; set; }
+    [Field("Colour", Type = EditType.COLOR)] public string? Colour { get; set; }
+    [Field("Stars", Type = EditType.RATE)] public long? Stars { get; set; }
+    [Field("Secret", Type = EditType.HIDDEN)] public string? Secret { get; set; }
+    [Field("Readers", Type = EditType.TRANSFER, Ref = typeof(Category))] public List<long>? Readers { get; set; }
+    [Field("Shelf", DependColumn = "parent")] public Category? Shelf { get; set; }
+}
+
 [EruptModel("Memo", DataProxy = [typeof(MemoProxy)])]
 public sealed class Memo
 {
@@ -102,7 +148,7 @@ public sealed class TwoPks
 public sealed class UnsupportedType
 {
     [Pk] public long Id { get; set; }
-    [Field("Html", Type = EditType.HTML_EDITOR)] public string? Html { get; set; }
+    [Field("Tpl", Type = EditType.TPL)] public string? Tpl { get; set; }
 }
 
 [EruptModel("Bad")]

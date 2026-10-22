@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -191,6 +192,25 @@ func TestNodeOverSQLite(t *testing.T) {
 	// a reference travels as its key; the server adds the label and the flattened column
 	if _, ok := row["category_name"]; ok {
 		t.Errorf("category_name is the server's to add: %v", row)
+	}
+	// operations and their form values run through invoke, under the operation code
+	ids := `{"ids":[` + str(row["id"]) + `],"param":{"note":"go"}}`
+	if code, r := call("POST", "/erupt-api/invoke/Article/operation/feature", "Article", ids); code != 200 || r.(map[string]any)["success"] != true {
+		t.Errorf("operation: %d %v", code, r)
+	}
+	if code, _ := call("POST", "/erupt-api/invoke/Article/operation/missing", "Article", `{}`); code != 404 {
+		t.Errorf("unknown operation: %d", code)
+	}
+	for op, want := range map[string]any{"publish": map[string]any{"note": nil}, "feature": nil} {
+		if _, r := call("POST", "/erupt-api/invoke/Article/operation-form/"+op, "Article", `{}`); !reflect.DeepEqual(r.(map[string]any)["data"], want) {
+			t.Errorf("form value of %s: %v", op, r)
+		}
+	}
+	// the picker and the old operator routes are the server's
+	for _, path := range []string{"reference-table/category", "operator/feature", "operator/publish/form-value"} {
+		if code, _ := call("POST", "/erupt-api/data/Article/"+path, "Article", ids); code != 404 {
+			t.Errorf("%s: %d", path, code)
+		}
 	}
 }
 
@@ -419,6 +439,50 @@ func TestBeforeFetch(t *testing.T) {
 	}
 }
 
+type doc struct {
+	ID    int64  `json:"id" erupt:"pk"`
+	Title string `json:"title" erupt:"title=Title"`
+	Topic int64  `json:"topic" erupt:"title=Topic;ref=Category;tree=parent"`
+}
+
+func TestLinkTree(t *testing.T) {
+	if _, err := NewModel(doc{}, "Doc", WithRaw(M{"linkTree": M{"field": "title"}})); err == nil {
+		t.Error("a linkTree on a non-reference field was accepted")
+	}
+	category, _ := testModels(t)
+	m, err := NewModel(doc{}, "Doc", WithName("Doc"), WithRaw(M{"linkTree": LinkTree{Field: Ptr("topic"), DependNode: Ptr(true)}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, _ := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
+	if err := node.Register(category, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Register(m, NewMemoryRepository(Record{"title": "a", "topic": 1}, Record{"title": "b", "topic": 2}, Record{"title": "c", "topic": 3})); err != nil {
+		t.Fatal(err)
+	}
+	titles := func(body string) []string {
+		req := httptest.NewRequest("POST", "/erupt-api/data/table/Doc", strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", "Doc")
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var page struct{ List []map[string]any }
+		_ = json.Unmarshal(w.Body.Bytes(), &page)
+		out := []string{}
+		for _, row := range page.List {
+			out = append(out, str(row["title"]))
+		}
+		return out
+	}
+	// dependNode: nothing until a tree node is picked
+	for body, want := range map[string][]string{`{}`: {}, `{"linkTreeVal":[2]}`: {"b"}, `{"linkTreeVal":["1","2"]}`: {"a", "b"}} {
+		if got := titles(body); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %v, want %v", body, got, want)
+		}
+	}
+}
+
 // A virtual field is in the build only; a slice or map field round-trips as a JSON value.
 func TestVirtualAndJSONFields(t *testing.T) {
 	type Widget struct {
@@ -475,5 +539,313 @@ func TestVirtualAndJSONFields(t *testing.T) {
 	}
 	if _, err := NewModel(Bad{}, "Bad"); err == nil {
 		t.Fatal("a searchable JSON field accepted")
+	}
+}
+
+type order struct {
+	ID       int64   `json:"id" erupt:"pk"`
+	Status   string  `json:"status" erupt:"title=Status"`
+	Tags     string  `json:"tags" erupt:"title=Tags;type=TAGS"`
+	Qty      int64   `json:"qty" erupt:"title=Qty"`
+	Note     string  `json:"note" erupt:"title=Note"`
+	City     string  `json:"city" erupt:"title=City;type=AUTO_COMPLETE"`
+	Body     string  `json:"body" erupt:"title=Body;type=MARKDOWN"`
+	Files    string  `json:"files" erupt:"title=Files;type=ATTACHMENT"`
+	Cats     []int64 `json:"cats" erupt:"title=Categories;type=CHECKBOX;ref=Category"`
+	Sections []int64 `json:"sections" erupt:"title=Sections;type=TAB_TREE;ref=Category"`
+	Calc     any     `json:"calc" erupt:"title=Calc;type=BUTTON"`
+	Stop     any     `json:"stop" erupt:"title=Stop;type=BUTTON"`
+}
+
+func TestFieldTypesAndInvoke(t *testing.T) {
+	type picks struct {
+		ID    int64    `json:"id" erupt:"pk"`
+		Roles []string `json:"roles" erupt:"title=Roles;choices=a:A,b:B"`
+	}
+	if m, err := NewModel(picks{}, "Picks"); err != nil || m.FieldType("roles") != "MULTI_CHOICE" {
+		t.Errorf("a slice field with choices: %v %v", m, err)
+	}
+	complete := FieldCode{Complete: func(context.Context, M, string) ([]string, error) { return nil, nil }}
+	if _, err := NewModel(order{}, "Order", WithFieldCode("note", complete)); err == nil {
+		t.Error("Complete on an INPUT was accepted")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
+	}))
+	defer server.Close()
+	category, _ := testModels(t)
+	m, err := NewModel(order{}, "Order", WithName("Order"),
+		WithFieldCode("status", FieldCode{Fetch: func(_ context.Context, form M) ([]Option, error) {
+			note, _ := form["note"].(string)
+			return []Option{{"new", "New"}, {note, "From form"}}, nil
+		}}),
+		WithFieldCode("tags", FieldCode{Tags: func(context.Context, M) ([]string, error) { return []string{"red", "blue"}, nil }}),
+		WithFieldCode("qty", FieldCode{Onchange: func(_ context.Context, form M) (Change, error) {
+			return Change{FormData: M{"note": str(form["qty"]) + " items"}}, nil
+		}}),
+		WithFieldCode("city", FieldCode{Complete: func(_ context.Context, _ M, typed string) ([]string, error) {
+			var out []string
+			for _, c := range []string{"Paris", "Tokyo"} {
+				if strings.Contains(strings.ToLower(c), strings.ToLower(typed)) {
+					out = append(out, c)
+				}
+			}
+			return out, nil
+		}}),
+		WithFieldCode("calc", FieldCode{Click: func(context.Context, M) (Click, error) {
+			return Click{Eval: "alert(1)", FormData: M{"qty": 2}}, nil
+		}}),
+		WithFieldCode("stop", FieldCode{Click: func(context.Context, M) (Click, error) { return Click{}, Fail("not now") }}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, _ := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	if err := node.Register(category, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Register(m, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
+	}
+	call := func(method, path, body string) (int, map[string]any) {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", "Order")
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var v map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		return w.Code, v
+	}
+	_, build := call("GET", "/erupt-api/build/Order", "")
+	fields, edit := map[string]map[string]any{}, map[string]map[string]any{}
+	for _, f := range build["eruptModel"].(map[string]any)["eruptFieldModels"].([]any) {
+		f := f.(map[string]any)
+		fields[str(f["fieldName"])] = f
+		edit[str(f["fieldName"])] = f["eruptFieldJson"].(map[string]any)["edit"].(map[string]any)
+	}
+	for name, attr := range map[string]string{"status": "choiceType", "tags": "tagsType"} {
+		if got := edit[name][attr].(map[string]any)["fetchHandler"]; !reflect.DeepEqual(got, []any{"invoke"}) {
+			t.Errorf("%s fetchHandler %v", name, got)
+		}
+	}
+	if edit["qty"]["onchange"] != "invoke" || edit["body"]["type"] != "MARKDOWN" || edit["files"]["type"] != "ATTACHMENT" || edit["calc"]["type"] != "BUTTON" {
+		t.Errorf("edits %v %v %v %v", edit["qty"]["onchange"], edit["body"]["type"], edit["files"]["type"], edit["calc"]["type"])
+	}
+	if fields["cats"]["fieldReturnName"] != "Category" || fields["sections"]["fieldReturnName"] != "Category" {
+		t.Errorf("fieldReturnName %v %v", fields["cats"]["fieldReturnName"], fields["sections"]["fieldReturnName"])
+	}
+	invoke := func(kind, field, body string) (int, map[string]any) {
+		return call("POST", "/erupt-api/invoke/Order/"+kind+"/"+field, body)
+	}
+	data := func(kind, field, body string) any {
+		_, r := invoke(kind, field, body)
+		return r["data"]
+	}
+	for _, c := range []struct {
+		kind, field, body string
+		want              any
+	}{
+		{"options", "status", `{"form":{"note":"n"}}`, []any{M{"value": "new", "label": "New"}, M{"value": "n", "label": "From form"}}},
+		{"options", "tags", `{}`, []any{"red", "blue"}},
+		{"onchange", "qty", `{"form":{"qty":3}}`, M{"formData": M{"note": "3 items"}}},
+		{"autocomplete", "city", `{"form":{},"value":"pa"}`, []any{"Paris"}},
+		{"button", "calc", `{"form":{}}`, M{"eval": "alert(1)", "formData": M{"qty": float64(2)}}},
+	} {
+		if got := data(c.kind, c.field, c.body); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s %s: %#v", c.kind, c.field, got)
+		}
+	}
+	if _, r := invoke("button", "stop", `{}`); r["success"] != false || r["message"] != "not now" {
+		t.Errorf("a refused click %v", r)
+	}
+	for _, field := range []string{"button/qty", "options/missing"} {
+		if status, _ := call("POST", "/erupt-api/invoke/Order/"+field, `{}`); status != 404 {
+			t.Errorf("%s: %d", field, status)
+		}
+	}
+	// picked records arrive as [{id: key}] and are stored as their keys
+	if _, r := call("POST", "/erupt-api/data/modify/Order", `{"cats":[{"id":1},{"id":"2"}],"sections":[{"id":3}],"tags":"[\"red\"]"}`); r["success"] != true {
+		t.Fatalf("add %v", r)
+	}
+	_, page := call("POST", "/erupt-api/data/table/Order", `{}`)
+	row := page["list"].([]any)[0].(map[string]any)
+	if !reflect.DeepEqual(row["cats"], []any{float64(1), float64(2)}) || !reflect.DeepEqual(row["sections"], []any{float64(3)}) {
+		t.Errorf("keys %v %v", row["cats"], row["sections"])
+	}
+	if _, ok := row["calc"]; ok {
+		t.Error("a BUTTON reached the row")
+	}
+}
+
+type author struct {
+	ID   int64  `json:"id" erupt:"pk"`
+	Name string `json:"name" erupt:"title=Name"`
+}
+
+type book struct {
+	ID      int64   `json:"id" erupt:"pk"`
+	Title   string  `json:"title" erupt:"title=Title"`
+	Author  int64   `json:"author" erupt:"title=Author;ref=Author"`
+	Colour  string  `json:"colour" erupt:"title=Colour;type=COLOR"`
+	Stars   int64   `json:"stars" erupt:"title=Stars;type=RATE"`
+	Secret  string  `json:"secret" erupt:"title=Secret;type=HIDDEN"`
+	Readers []int64 `json:"readers" erupt:"title=Readers;type=TRANSFER;ref=Category"`
+	Shelf   int64   `json:"shelf" erupt:"title=Shelf;ref=Category"`
+}
+
+// bookNode serves Category, Author (drilling into its books) and Book.
+func bookNode(t *testing.T, server string) (*Node, func(method, path, body string, headers map[string]string) (int, map[string]any)) {
+	t.Helper()
+	category, _ := testModels(t)
+	a, err := NewModel(author{}, "Author", WithName("Author"),
+		WithRaw(M{"drills": []M{{"title": "Books", "link": M{"linkErupt": "Book", "joinColumn": "author.id"}}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewModel(book{}, "Book", WithName("Book"),
+		WithFieldEdit("shelf", M{"referenceTableType": M{"dependField": "author", "dependColumn": "parent"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, _ := NewNode(Config{Name: "blog", AccessToken: "secret", Servers: []string{server}})
+	for _, reg := range []struct {
+		m    *Model
+		repo Repository
+	}{
+		{category, NewMemoryRepository()},
+		{a, NewMemoryRepository(Record{"name": "Ann"}, Record{"name": "Bob"})},
+		{b, NewMemoryRepository(Record{"title": "a", "author": 1}, Record{"title": "b", "author": 2}, Record{"title": "c", "author": 1})},
+	} {
+		if err := node.Register(reg.m, reg.repo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return node, func(method, path, body string, headers map[string]string) (int, map[string]any) {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Access-Token", "secret")
+		req.Header.Set("erupt", path[strings.LastIndex(path, "/")+1:])
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		node.ServeHTTP(w, req)
+		var v map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		return w.Code, v
+	}
+}
+
+func powerServer(t *testing.T) string {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func titlesOf(page map[string]any) []string {
+	out := []string{}
+	list, _ := page["list"].([]any)
+	for _, row := range list {
+		out = append(out, str(row.(map[string]any)["title"]))
+	}
+	return out
+}
+
+func TestDrill(t *testing.T) {
+	node, call := bookNode(t, powerServer(t))
+	drill := map[string]string{"Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1"}
+	if _, page := call("POST", "/erupt-api/data/table/Book", `{}`, drill); !reflect.DeepEqual(titlesOf(page), []string{"a", "c"}) {
+		t.Errorf("drilled rows %v", titlesOf(page))
+	}
+	for k, v := range map[string]string{"Drill": "x", "DrillSourceErupt": "Book"} {
+		headers := map[string]string{"Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1", k: v}
+		if status, _ := call("POST", "/erupt-api/data/table/Book", `{}`, headers); status != 403 {
+			t.Errorf("%s=%s: %d", k, v, status)
+		}
+	}
+	if _, r := call("POST", "/erupt-api/data/table/Category", `{}`, drill); r["success"] != false {
+		t.Errorf("a drill into another model %v", r)
+	}
+	_, build := call("GET", "/erupt-api/build/Author", "", nil)
+	drills := build["eruptModel"].(map[string]any)["eruptJson"].(map[string]any)["drills"].([]any)
+	want := []any{M{"code": "Books", "title": "Books", "fold": false, "icon": "fa fa-sitemap", "link": M{"linkErupt": "Book", "linkCondition": ""}}}
+	if !reflect.DeepEqual(drills, want) {
+		t.Errorf("build drills %v", drills)
+	}
+	if _, err := NewModel(author{}, "Author", WithRaw(M{"drills": []M{{"title": "x", "link": M{"linkErupt": "Book"}}}})); err == nil {
+		t.Error("a drill without joinColumn was accepted")
+	}
+	// a signed "query" takes a condition on a field the search bar does not have
+	body := `{"condition":[{"key":"author","expression":"EQ","value":2}]}`
+	if _, r := call("POST", "/erupt-api/data/table/Book", body, nil); r["success"] != false {
+		t.Errorf("an unsigned condition on a non-search field %v", r)
+	}
+	ts := time.Now().Unix()
+	path := "/erupt-api/data/table/Book"
+	signed := map[string]string{HeaderTimestamp: strconv.FormatInt(ts, 10), HeaderEnforced: "power,query",
+		HeaderSignature: Sign(node.cfg.AccessToken, "POST", path, ts, "power,query", "", []byte(body))}
+	if _, page := call("POST", path, body, signed); !reflect.DeepEqual(titlesOf(page), []string{"b"}) {
+		t.Errorf("signed query %v", page)
+	}
+}
+
+func TestSimpleTypesAndDependColumn(t *testing.T) {
+	_, call := bookNode(t, powerServer(t))
+	_, build := call("GET", "/erupt-api/build/Book", "", nil)
+	edit := map[string]map[string]any{}
+	for _, f := range build["eruptModel"].(map[string]any)["eruptFieldModels"].([]any) {
+		f := f.(map[string]any)
+		edit[str(f["fieldName"])] = f["eruptFieldJson"].(map[string]any)["edit"].(map[string]any)
+	}
+	for name, typ := range map[string]string{"colour": "COLOR", "stars": "RATE", "secret": "HIDDEN", "readers": "TRANSFER"} {
+		if edit[name]["type"] != typ {
+			t.Errorf("%s: %v", name, edit[name]["type"])
+		}
+	}
+	if got := edit["shelf"]["referenceTableType"].(map[string]any)["dependColumn"]; got != "parent" {
+		t.Errorf("dependColumn %v: the server reads it off the build", got)
+	}
+	if _, r := call("POST", "/erupt-api/data/modify/Book", `{"title":"d","stars":"4","readers":[{"id":2}]}`, nil); r["success"] != true {
+		t.Fatalf("add %v", r)
+	}
+	_, page := call("POST", "/erupt-api/data/table/Book", `{}`, nil)
+	list := page["list"].([]any)
+	row := list[len(list)-1].(map[string]any)
+	if row["stars"] != float64(4) || !reflect.DeepEqual(row["readers"], []any{float64(2)}) {
+		t.Errorf("stars %v readers %v", row["stars"], row["readers"])
+	}
+}
+
+func TestNodeConfigAndUserInfo(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Access-Token") != "secret" {
+			w.WriteHeader(403)
+			return
+		}
+		seen = append(seen, r.URL.Path+" "+r.Header.Get("token"))
+		if strings.Contains(r.URL.Path, "userinfo") {
+			_, _ = w.Write([]byte(`{"account":"admin","roles":["r"]}`))
+			return
+		}
+		_, _ = w.Write([]byte("cfg"))
+	}))
+	defer server.Close()
+	node, _ := NewNode(Config{Name: "blog", AccessToken: "secret", Servers: []string{server.URL}})
+	ctx := context.Background()
+	if c, err := node.NodeConfig(ctx); c != "cfg" || err != nil {
+		t.Errorf("node config %q %v", c, err)
+	}
+	if c, err := node.GroupConfig(ctx); c != "cfg" || err != nil {
+		t.Errorf("group config %q %v", c, err)
+	}
+	info, err := node.UserInfo(context.WithValue(ctx, tokenKey{}, "tk"))
+	if err != nil || !reflect.DeepEqual(info, M{"account": "admin", "roles": []any{"r"}}) {
+		t.Errorf("user info %v %v", info, err)
+	}
+	want := []string{"/erupt-cloud-api/node-config/blog ", "/erupt-cloud-api/node-group-config/blog ", "/erupt-cloud-api/userinfo/blog tk"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Errorf("calls %q", seen)
 	}
 }

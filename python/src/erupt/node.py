@@ -27,6 +27,7 @@ log = logging.getLogger("erupt")
 __version__ = "0.1.0"
 
 _user = contextvars.ContextVar("erupt_user", default=None)
+_token = contextvars.ContextVar("erupt_token", default=None)
 
 # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
 _UNSUPPORTED_POWER = {"print": False, "ai": False}
@@ -59,6 +60,10 @@ class _Reply(Exception):
         self.status, self.body = status, body
 
 
+# invoke kind -> the Field attribute holding its code
+_INVOKED = {"options": "fetch", "onchange": "onchange", "autocomplete": "complete", "button": "click"}
+
+
 class Fail(Exception):
     """A business error shown to the user as a message: raise it from a DataProxy hook or an operation."""
 
@@ -85,14 +90,12 @@ class Node:
         self._routes = [
             ("GET", re.compile(r"^/erupt-api/build/([^/]+)$"), self._build),
             ("POST", re.compile(r"^/erupt-api/data/table/([^/]+)$"), self._table),
-            ("POST", re.compile(r"^/erupt-api/data/([^/]+)/reference-table/([^/]+)$"), self._reference_table),
-            ("POST", re.compile(r"^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$"), self._operation_form_value),
-            ("POST", re.compile(r"^/erupt-api/data/([^/]+)/operator/([^/]+)$"), self._operation),
             ("GET", re.compile(r"^/erupt-api/data/init-value/([^/]+)$"), self._init_value),
             ("GET", re.compile(r"^/erupt-api/data/([^/]+)/([^/]+)$"), self._get),
             ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)$"), self._add),
             ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/update$"), self._update),
             ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/delete$"), self._delete),
+            ("POST", re.compile(r"^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$"), self._invoke),
         ]
 
     def register(self, cls, repository):
@@ -106,14 +109,6 @@ class Node:
         repository.bind(model)
         self.models[model.name] = (model, repository)
         return self
-
-    def _repo_of(self, target):
-        entry = self.models.get(target.name)
-        if entry is None or entry[0] is not target:
-            raise ValueError(f"referenced erupt '{target.name}' is not registered on this node")
-        return entry[1]
-
-    # ---------------------------------------------------------------- WSGI
 
     def __call__(self, environ, start_response):
         try:
@@ -157,6 +152,7 @@ class Node:
                     raise _Reply(404, "")
                 user = environ.get("HTTP_USER")
                 _user.set(json.loads(base64.b64decode(user)) if user else None)
+                _token.set(environ.get("HTTP_TOKEN"))
                 model, repo = self.models[name]
                 args = [urllib.parse.unquote(g) for g in match.groups()[1:]]
                 return 200, handler(model, repo, environ, *args)
@@ -188,46 +184,60 @@ class Node:
 
     def _table(self, model, repo, environ):
         self._require(model, environ, "query")
-        return self._page(model, repo, _read_json(environ) or {})
+        return self._page(model, repo, _read_json(environ) or {}, environ)
 
-    def _reference_table(self, model, repo, environ, field):
-        f = self._reference_field(model, field, "REFERENCE_TABLE")
-        return self._page(f.target, self._repo_of(f.target), _read_json(environ) or {})
-
-    @staticmethod
-    def _reference_field(model, field, edit_type=None):
-        f = model.fields.get(field)
-        if f is None or f.type not in ("REFERENCE_TABLE", "REFERENCE_TREE") or (edit_type and f.type != edit_type):
-            raise _Reply(404, "")
-        return f
-
-    def _page(self, model, repo, body):
+    def _page(self, model, repo, body, environ):
         page_index = max(int(body.get("pageIndex") or 1), 1)
         page_size = min(max(int(body.get("pageSize") or 10), 1), _MAX_PAGE_SIZE)
         query = Query(offset=(page_index - 1) * page_size, limit=page_size)
+        # under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
+        trusted = "query" in environ.get("erupt.enforced", ())
         for c in body.get("condition") or []:
-            query.conditions.extend(self._conditions(model, c))
+            query.conditions.extend(self._conditions(model, c, trusted))
+        drill = self._drill(model, environ, query)
         for s in body.get("sort") or []:
             f = model.fields.get(s.get("field"))
             if f is None or not (f.sortable or f.pk):
                 raise Fail(f"illegal sort field '{s.get('field')}'")
             query.sort.append((f.name, str(s.get("direction", "ASC")).upper() == "DESC"))
+        # a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
+        picked = body.get("linkTreeVal")
+        if model.link_tree and picked is not None:
+            query.conditions.append(self._condition(model.fields[model.link_tree[0]], "IN", picked))
         # a @Vis view's own filter and order, then the DataProxy's
         filters, sort = model.vis.get(body.get("vis"), ([], []))
         if not query.sort:
             query.sort = list(sort or model.order_by)
-        query.filters = filters + model.filters(query.conditions)
-        total, records = repo.page(query)
+        query.filters = drill + filters + model.filters(query.conditions)
+        total, records = (0, []) if model.link_tree and model.link_tree[1] and picked is None else repo.page(query)
         rows = self._rows(model, records)
         model.hook("after_fetch", rows)
         return {"pageIndex": page_index, "pageSize": page_size, "total": total,
                 "totalPage": math.ceil(total / page_size), "list": rows,
                 "sort": None, "alert": None, "extraContent": None}
 
+    def _drill(self, model, environ, query):
+        """A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
+        joinColumn holds the source row's column; its linkCondition is returned as a filter."""
+        code = environ.get("HTTP_DRILL")
+        if code is None:
+            return []
+        source = self.models.get(environ.get("HTTP_DRILLSOURCEERUPT") or "")
+        link = source[0].drills.get(code) if source else None
+        if link is None:
+            raise _Reply(403, "")
+        if link.erupt != model.name or link.join not in model.fields:
+            raise Fail(f"illegal erupt from drill '{code}'")
+        row = source[1].get(self._pk(source[0], environ.get("HTTP_DRILLVALUE")))
+        if row is None:
+            raise Fail("record not found")
+        query.conditions.append(self._condition(model.fields[link.join], "EQ", row.get(link.column)))
+        return [(link.condition, [])] if link.condition else []
+
     @staticmethod
-    def _conditions(model, c):
+    def _conditions(model, c, trusted=False):
         f = model.fields.get(c.get("key"))
-        if f is None or f.pk or not f.search:
+        if f is None or (not trusted and (f.pk or not f.search)):
             raise Fail(f"illegal search field '{c.get('key')}'")
         op = c.get("expression") or "EQ"
         if op not in _OPS:
@@ -313,6 +323,27 @@ class Node:
             model.hook("after_delete", record)
         return _r()
 
+    def _invoke(self, model, repo, environ, kind, name):
+        """The node's own code (erupt-cloud/PROTOCOL.md §5.5): a row operation and its form values under the
+        operation code, or a field's fetched options, onchange, auto-complete or button with the form's values."""
+        if kind == "operation":
+            return self._operation(model, repo, environ, name)
+        if kind == "operation-form":
+            return _r(data=self._operation_form_value(model, name))
+        f = next((f for f in model.declared if f.name == name), None)
+        fn = getattr(f, _INVOKED.get(kind, ""), None) if f else None
+        if fn is None:
+            raise _Reply(404, "")
+        body = _read_json(environ) or {}
+        form = body.get("form") or {}
+        if kind == "autocomplete":
+            return _r(data=list(fn(form, body.get("value") or "")))
+        answer = fn(form)
+        if kind == "options" and f.type != "TAGS":
+            # {value: label} or [(value, label)], as the choices of a field
+            answer = [{"value": str(v), "label": label} for v, label in (answer.items() if isinstance(answer, dict) else answer)]
+        return _r(data=answer)
+
     @staticmethod
     def _rows(model, records):
         """Records to browser rows. A reference stays its key: the server resolves its label, the flattened
@@ -326,11 +357,10 @@ class Node:
             raise _Reply(404 if op is None else 403, "")
         return op
 
-    def _operation_form_value(self, model, repo, environ, code):
+    def _operation_form_value(self, model, code):
         op = self._operation_of(model, code)
-        if not op.form:
-            raise _Reply(404, "")  # the browser ignores a 404 here and opens an empty form
-        return {name: None for name in op.form_model.fields}
+        # none without a form: the server answers the browser a 404, and it opens an empty one
+        return {name: None for name in op.form_model.fields} if op.form else None
 
     def _operation(self, model, repo, environ, code):
         op = self._operation_of(model, code)
@@ -409,6 +439,24 @@ class Node:
 
     # ---------------------------------------------------------------- server calls
 
+    def config(self):
+        """The config text set for this node on the erupt server (Node Config)."""
+        return self._server_text(f"/erupt-cloud-api/node-config/{self.name}", {"Access-Token": self.access_token})
+
+    def group_config(self):
+        """The config text of this node's group on the erupt server."""
+        return self._server_text(f"/erupt-cloud-api/node-group-config/{self.name}", {"Access-Token": self.access_token})
+
+    def user_info(self):
+        """The acting user's full info from the erupt server (roles, org, post...), for the request being served."""
+        text = self._server_text(f"/erupt-cloud-api/userinfo/{self.name}",
+                                 {"Access-Token": self.access_token, "token": _token.get() or ""})
+        return json.loads(text) if text else None
+
+    def _server_text(self, path, headers):
+        with urllib.request.urlopen(urllib.request.Request(next(self._server_cycle) + path, headers=headers), timeout=5) as resp:
+            return resp.read().decode("utf-8")
+
     def _server_get(self, path, params, headers):
         url = next(self._server_cycle) + path + "?" + urllib.parse.urlencode(params)
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=5) as resp:
@@ -417,7 +465,7 @@ class Node:
     def _node_info(self):
         return {"instanceId": self._instance_id, "nodeName": self.name, "accessToken": self.access_token,
                 "version": f"python-{__version__}", "nodeAddress": [self.address],
-                "eruptModules": [], "erupts": list(self.models), "resources": {}}
+                "eruptModules": [], "erupts": list(self.models), "resources": {}, "capabilities": ["invoke"]}
 
     def _heartbeat_loop(self):
         failing = False

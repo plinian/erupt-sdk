@@ -11,7 +11,13 @@ namespace Erupt\Attribute;
  * `form` hide the field from the table / the form. `view` / `edit` are raw `@View` / `@Edit` attributes.
  * A property typed `array` holds a JSON array (MULTI_CHOICE, its options in `choices`), `object` / `stdClass`
  * a JSON object (KEY_VALUE): stored as JSON text by SQL repositories. `virtual` declares a form-only element
- * (DIVIDE, CALLOUT, EMPTY, GROUP) that is in the build but never read or written.
+ * (DIVIDE, CALLOUT, EMPTY, GROUP, and every BUTTON) that is in the build but never read or written. CHECKBOX /
+ * TAB_TREE with `ref` hold the picked records of that model, stored as the JSON list of their keys.
+ * `fetch` / `onchange` / `complete` / `click` name a static method of the model class that the node runs when
+ * the server invokes the field: fetch(array $form) the options of a CHOICE / MULTI_CHOICE (value => label) or
+ * the tags of a TAGS (a list), onchange(array $form) ['formData' => ..., 'editExpr' => ...], complete(array $form,
+ * string $typed) the suggestions of an AUTO_COMPLETE, click(array $form) ['eval' => ..., 'formData' => ...,
+ * 'editExpr' => ...] of a BUTTON. Throw Fail to refuse with a message.
  */
 #[\Attribute(\Attribute::TARGET_PROPERTY)]
 final class Field
@@ -32,6 +38,10 @@ final class Field
         public array $view = [],
         public array $edit = [],
         public bool $virtual = false,
+        public ?string $fetch = null,
+        public ?string $onchange = null,
+        public ?string $complete = null,
+        public ?string $click = null,
     ) {
     }
 }

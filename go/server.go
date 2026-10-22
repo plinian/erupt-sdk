@@ -82,26 +82,59 @@ func (n *Node) server() string {
 }
 
 func (n *Node) serverGet(ctx context.Context, path string, params url.Values, token string, out any) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", n.server()+path+"?"+params.Encode(), nil)
+	body, err := n.serverText(ctx, path+"?"+params.Encode(), map[string]string{"token": token})
 	if err != nil {
 		return err
 	}
-	req.Header.Set("token", token)
+	return json.Unmarshal([]byte(body), out)
+}
+
+func (n *Node) serverText(ctx context.Context, path string, headers map[string]string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", n.server()+path, nil)
+	if err != nil {
+		return "", err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return json.Unmarshal(body, out)
+	return string(body), nil
+}
+
+// NodeConfig is the config text set for this node on the erupt server (Node Config).
+func (n *Node) NodeConfig(ctx context.Context) (string, error) {
+	return n.serverText(ctx, "/erupt-cloud-api/node-config/"+url.PathEscape(n.cfg.Name), map[string]string{"Access-Token": n.cfg.AccessToken})
+}
+
+// GroupConfig is the config text of this node's group on the erupt server.
+func (n *Node) GroupConfig(ctx context.Context) (string, error) {
+	return n.serverText(ctx, "/erupt-cloud-api/node-group-config/"+url.PathEscape(n.cfg.Name), map[string]string{"Access-Token": n.cfg.AccessToken})
+}
+
+// UserInfo is the acting user's full info from the erupt server (roles, org, post...), for the request ctx
+// serves; nil when the server answers nothing.
+func (n *Node) UserInfo(ctx context.Context) (M, error) {
+	token, _ := ctx.Value(tokenKey{}).(string)
+	text, err := n.serverText(ctx, "/erupt-cloud-api/userinfo/"+url.PathEscape(n.cfg.Name),
+		map[string]string{"Access-Token": n.cfg.AccessToken, "token": token})
+	if err != nil || strings.TrimSpace(text) == "" {
+		return nil, err
+	}
+	var info M
+	return info, json.Unmarshal([]byte(text), &info)
 }
 
 func (n *Node) post(path, contentType string, body string) error {
@@ -124,7 +157,7 @@ func (n *Node) register(instanceID string) error {
 	n.mu.RUnlock()
 	info, err := json.Marshal(M{"instanceId": instanceID, "nodeName": n.cfg.Name, "accessToken": n.cfg.AccessToken,
 		"version": "go-" + Version, "nodeAddress": []string{n.cfg.Address}, "eruptModules": []string{},
-		"erupts": erupts, "resources": M{}})
+		"erupts": erupts, "resources": M{}, "capabilities": []string{"invoke"}})
 	if err != nil {
 		return err
 	}

@@ -16,6 +16,10 @@ module Erupt
   # Not an EditType: the SDK's DATE whose picker includes the time, inferred from a Time field
   DATE_TIME = "DATE_TIME"
   REFERENCES = [EditType::REFERENCE_TABLE, EditType::REFERENCE_TREE].freeze
+  # many records of another model, stored as the JSON list of their keys
+  COLLECTIONS = [EditType::CHECKBOX, EditType::TAB_TREE, EditType::TRANSFER].freeze
+  # the edit attribute that names a fetchHandler, by the type that fetches options
+  FETCHED = { EditType::CHOICE => "choiceType", EditType::MULTI_CHOICE => "multiChoiceType", EditType::TAGS => "tagsType" }.freeze
   TIME_PATTERN = /\A(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?)?Z?\z/
 
   # Ruby class of a field -> the edit type it infers (DateTime before its superclass Date)
@@ -89,14 +93,18 @@ module Erupt
   #
   # A field of kind Array or Hash holds a JSON value (MULTI_CHOICE, KEY_VALUE): stored as JSON text by SQL
   # repositories, served as JSON. +virtual: true+ declares a form-only element (DIVIDE, CALLOUT, EMPTY, GROUP)
-  # that is in the build but never read or written.
+  # that is in the build but never read or written; so is a BUTTON.
+  #
+  # +fetch+, +onchange+, +complete+ and +click+ are the field's own code, run by the node when the server
+  # invokes it (see Node).
   class Field
-    attr_reader :name, :title, :type, :choices, :label, :tree, :ref
+    attr_reader :name, :title, :type, :choices, :label, :tree, :ref, :fetch, :onchange, :complete, :click
 
     def initialize(name, title = "", kind = nil, type: nil, pk: false, search: false, not_null: false, sortable: false,
                    table: true, form: true, choices: nil, ref: nil, label: :name, tree: nil, view: {}, edit: {},
-                   virtual: false)
-      @json, @virtual = [Array, Hash].include?(kind), virtual
+                   virtual: false, fetch: nil, onchange: nil, complete: nil, click: nil)
+      @json, @virtual = [Array, Hash].include?(kind), virtual || type.to_s == EditType::BUTTON
+      @fetch, @onchange, @complete, @click = fetch, onchange, complete, click
       kind = String if @json
       @name, @title, @pk, @search, @not_null = name.to_s, title, pk, search, not_null
       @sortable, @table, @form = sortable, table, form
@@ -104,6 +112,8 @@ module Erupt
       @ref = ref || (kind if kind.respond_to?(:erupt_model))
       @label, @tree = label.to_s, tree&.to_s
       @view, @edit = Erupt.stringify(view), Erupt.stringify(edit)
+      # referenceTableType.dependColumn is @Transient in Java: kept out of the schema check, written into the build
+      @depend_column = @edit["referenceTableType"].delete("dependColumn") if @edit["referenceTableType"].is_a?(Hash)
       path = "field #{@name}"
       raise ArgumentError, "#{path}: name must be an identifier" unless IDENTIFIER.match?(@name)
 
@@ -113,12 +123,19 @@ module Erupt
       @type = resolve_type(kind, type&.to_s, path) unless pk
       raise ArgumentError, "#{path}: edit type #{@type} is not supported yet" if @type && !DEFAULTS["fields"].key?(@type)
 
-      check_reference(path) if reference?
+      check_reference(path) if reference? || collection?
+      if (@fetch && !FETCHED.key?(@type)) || (@complete && @type != EditType::AUTO_COMPLETE) || (@click && @type != EditType::BUTTON)
+        raise ArgumentError, "#{path}: fetch, complete and click belong to CHOICE / MULTI_CHOICE / TAGS, AUTO_COMPLETE and BUTTON"
+      end
+
+      @json ||= collection?
     end
 
     %i[pk search not_null sortable table form json virtual].each { |flag| define_method(:"#{flag}?") { instance_variable_get(:"@#{flag}") } }
 
     def reference? = REFERENCES.include?(@type)
+
+    def collection? = COLLECTIONS.include?(@type)
 
     # The referenced model, for a reference field.
     def target = @ref.erupt_model
@@ -130,7 +147,8 @@ module Erupt
       return tpl if pk?
 
       edit = tpl["eruptFieldJson"]["edit"]
-      view = tpl["eruptFieldJson"]["views"][0]
+      # a BUTTON is a form element only: its template has no table column
+      view = tpl["eruptFieldJson"]["views"][0] || {}
       edit.merge!("title" => @title, "notNull" => not_null?, "show" => form?)
       edit["search"]["value"] = search?
       view.merge!("title" => @title, "sortable" => sortable?)
@@ -141,8 +159,15 @@ module Erupt
         picker.merge!("id" => target.pk, "label" => @label)
         picker["pid"] = @tree if @tree
         view["column"] = @label
+      elsif collection?
+        # the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+        tpl["fieldReturnName"] = target.name
+        view["column"] = @label
       end
+      edit[FETCHED[@type]]["fetchHandler"] = ["invoke"] if @fetch
+      edit["onchange"] = "invoke" if @onchange
       Erupt.merge!(edit, @edit)
+      edit["referenceTableType"]["dependColumn"] = @depend_column if @depend_column
       Erupt.merge!(view, @view)
       tpl["eruptFieldJson"]["views"] = [] unless table?
       if @choices # CHOICE, or MULTI_CHOICE over an Array
@@ -160,13 +185,20 @@ module Erupt
         value = value[target.pk] if value.is_a?(Hash)
         return target.fields[target.pk].coerce(value)
       end
+      if collection?
+        # picked records arrive as [{"id": key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), and are stored as keys
+        items = value.is_a?(String) ? JSON.parse(value.empty? ? "[]" : value) : value || []
+        raise ArgumentError, "must be a JSON array" unless items.is_a?(Array)
+
+        return items.map { |v| target.fields[target.pk].coerce(v.is_a?(Hash) ? v.values.first : v) }
+      end
       return nil if value.nil? || value == ""
       return integer(value) if pk?
       return json(value) if json?
 
       case @type
       when EditType::BOOLEAN then [true, false].include?(value) ? value : %w[true 1].include?(value.to_s.downcase)
-      when EditType::NUMBER then Erupt.number(value)
+      when EditType::NUMBER, EditType::RATE, EditType::SLIDER then Erupt.number(value)
       when DATE_TIME then Erupt.parse_time(value)
       when EditType::DATE then Erupt.parse_time(value).to_date
       when EditType::CHOICE
@@ -194,9 +226,10 @@ module Erupt
     end
 
     def resolve_type(kind, type, path)
+      return type if COLLECTIONS.include?(type)
       return @tree ? EditType::REFERENCE_TREE : EditType::REFERENCE_TABLE if @ref
       return type if type
-      return EditType::CHOICE if @choices
+      return @json ? EditType::MULTI_CHOICE : EditType::CHOICE if @choices || @fetch
       return EditType::INPUT if kind.nil?
 
       KINDS.find { |k, _| k == kind || (k.is_a?(Class) && kind.is_a?(Class) && kind <= k) }&.last ||
@@ -249,6 +282,10 @@ module Erupt
     end
   end
 
+  # A drill: +erupt+ the linked model, +column+ the source row's column, +join+ the linked model's field holding
+  # it, +condition+ the linkCondition (SQL as written).
+  Drill = Struct.new(:erupt, :column, :join, :condition)
+
   # A business error shown to the user as a message: raise it from a DataProxy hook or an operation.
   class Fail < StandardError; end
 
@@ -281,11 +318,13 @@ module Erupt
   class ModelSpec
     # fields: stored and served; declared: all of them in order, virtual ones included, for the build
     attr_reader :cls, :name, :title, :power, :fields, :declared, :operations, :proxies
+    # drill code -> Drill, whose column and joinColumn stay here (@Transient in Java)
+    attr_reader :drills
 
     def initialize(cls)
       @cls, @name = cls, cls.name&.split("::")&.last
       @title, @power, @raw, @order_by, @views = @name, DEFAULTS["power"].dup, {}, nil, {}
-      @fields, @declared, @operations, @proxies = {}, [], {}, []
+      @fields, @declared, @operations, @proxies, @drills = {}, [], {}, [], {}
     end
 
     def configure(title, name, power, order_by, data_proxy, raw)
@@ -294,6 +333,7 @@ module Erupt
       raise ArgumentError, "#{@name}: data_proxy must be a DataProxy" unless @proxies.all?(DataProxy)
       @power = DEFAULTS["power"].merge(Erupt.stringify(power || {}))
       @raw, @views = pull_vis(Erupt.stringify(raw))
+      @raw, @drills = pull_drills(@raw)
       Schema.check("Erupt", @raw, "erupt #{@name}")
       raise ArgumentError, "erupt name '#{@name}' must be an identifier" unless IDENTIFIER.match?(@name)
     end
@@ -321,6 +361,15 @@ module Erupt
     # View code -> [filters, order] the node applies to that view's table queries.
     def vis = @vis ||= @views.transform_values { |filters, order_by| [filters.map { |f| [f, []] }, parse_order(order_by)] }
 
+    # [field, dependNode] of a @LinkTree: the reference the tree beside the table filters.
+    def link_tree
+      tree = @raw["linkTree"] || {}
+      return unless tree["field"]
+      raise ArgumentError, "#{@name}: linkTree.field '#{tree["field"]}' must be a reference field" unless @fields[tree["field"]]&.reference?
+
+      [tree["field"], tree["dependNode"] == true]
+    end
+
     # Run one DataProxy hook on every proxy, in declaration order.
     def hook(name, *args) = @proxies.each { |p| p.public_send(name, *args) }
 
@@ -338,6 +387,7 @@ module Erupt
 
       order
       vis
+      link_tree
       self
     end
 
@@ -383,6 +433,28 @@ module Erupt
         entry
       end
       [raw.merge("vis" => entries), views]
+    end
+
+    # +link.column+ / +link.joinColumn+ of a drill: the source row's column (+id+ by default) and the linked
+    # model's field holding it, applied by the node and kept out of the build. A drill without a +code+ is
+    # addressed by its title.
+    def pull_drills(raw)
+      return [raw, {}] unless raw["drills"].is_a?(Array)
+
+      drills = {}
+      entries = raw["drills"].map do |entry|
+        next entry unless entry.is_a?(Hash)
+
+        link = entry["link"].is_a?(Hash) ? entry["link"].dup : {}
+        column, join = link.delete("column") || "id", link.delete("joinColumn")
+        raise ArgumentError, "#{@name}: drill '#{entry["title"]}' needs link.linkErupt and link.joinColumn" unless join && link["linkErupt"]
+
+        entry = Schema.defaults("Drill").merge("code" => entry["title"].to_s).merge(entry)
+        entry["link"] = Schema.defaults("Link").merge(link)
+        drills[entry["code"]] = Drill.new(link["linkErupt"], column, join.to_s.split(".").first, link["linkCondition"].to_s)
+        entry
+      end
+      [raw.merge("drills" => entries), drills]
     end
   end
 

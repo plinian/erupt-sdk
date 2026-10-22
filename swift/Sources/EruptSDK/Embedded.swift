@@ -2184,6 +2184,125 @@ enum Embedded {
     "visRawTable": true
   },
   "fields": {
+    "ATTACHMENT": {
+      "eruptFieldJson": {
+        "edit": {
+          "attachmentType": {
+            "fileSeparator": "|",
+            "fileTypes": [],
+            "imageType": {
+              "maxHeight": 2147483647,
+              "maxWidth": 2147483647,
+              "minHeight": 0,
+              "minWidth": 0
+            },
+            "maxLimit": 1,
+            "path": "",
+            "size": -1,
+            "type": "BASE"
+          },
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "ATTACHMENT"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
+    "AUTO_COMPLETE": {
+      "eruptFieldJson": {
+        "edit": {
+          "autoCompleteType": {
+            "triggerLength": 1
+          },
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": true
+          },
+          "show": true,
+          "title": "-",
+          "type": "AUTO_COMPLETE"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
     "BOOLEAN": {
       "eruptFieldJson": {
         "edit": {
@@ -2240,6 +2359,91 @@ enum Embedded {
       },
       "fieldReturnName": "Boolean"
     },
+    "BUTTON": {
+      "eruptFieldJson": {
+        "edit": {
+          "buttonType": {
+            "confirm": "",
+            "danger": false,
+            "fullSpan": false,
+            "icon": "",
+            "style": "default"
+          },
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "BUTTON"
+        },
+        "views": []
+      },
+      "fieldReturnName": "String"
+    },
+    "CHECKBOX": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "CHECKBOX"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "name",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "NodeDefaultsRef"
+    },
     "CHOICE": {
       "eruptFieldJson": {
         "edit": {
@@ -2268,6 +2472,120 @@ enum Embedded {
           "show": true,
           "title": "-",
           "type": "CHOICE"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
+    "CODE_EDITOR": {
+      "eruptFieldJson": {
+        "edit": {
+          "ai": true,
+          "cellEdit": true,
+          "codeEditType": {
+            "height": 300,
+            "hintHandler": [],
+            "hints": [],
+            "language": "text"
+          },
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "CODE_EDITOR"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
+    "COLOR": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "colorType": {
+            "alpha": false,
+            "presets": [],
+            "showText": true
+          },
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "COLOR"
         },
         "views": [
           {
@@ -2411,6 +2729,140 @@ enum Embedded {
       },
       "fieldReturnName": "Date"
     },
+    "HIDDEN": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "HIDDEN"
+        },
+        "views": []
+      },
+      "fieldReturnName": "String"
+    },
+    "HTML_EDITOR": {
+      "eruptFieldJson": {
+        "edit": {
+          "ai": true,
+          "cellEdit": true,
+          "desc": "",
+          "htmlEditorType": {
+            "path": "",
+            "value": "CKEDITOR"
+          },
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "HTML_EDITOR"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
+    "ICON": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "ICON"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
     "INPUT": {
       "eruptFieldJson": {
         "edit": {
@@ -2471,6 +2923,166 @@ enum Embedded {
       },
       "fieldReturnName": "String"
     },
+    "MAP": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "MAP"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
+    "MARKDOWN": {
+      "eruptFieldJson": {
+        "edit": {
+          "ai": true,
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "MARKDOWN"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
+    "MULTI_CHOICE": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "multiChoiceType": {
+            "dependField": "",
+            "fetchHandler": [],
+            "type": "CHECKBOX",
+            "validate": true
+          },
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": true
+          },
+          "show": true,
+          "title": "-",
+          "type": "MULTI_CHOICE"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
     "NUMBER": {
       "eruptFieldJson": {
         "edit": {
@@ -2502,6 +3114,62 @@ enum Embedded {
           "show": true,
           "title": "-",
           "type": "NUMBER"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "NUMBER",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "number"
+    },
+    "RATE": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "rateType": {
+            "allowHalf": false,
+            "character": "",
+            "count": 5
+          },
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "RATE"
         },
         "views": [
           {
@@ -2648,6 +3316,224 @@ enum Embedded {
       },
       "fieldReturnName": "NodeDefaultsRef"
     },
+    "SIGNATURE": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "SIGNATURE"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
+    "SLIDER": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "sliderType": {
+            "dots": false,
+            "markPoints": [],
+            "max": 999,
+            "min": 0,
+            "step": 1.0
+          },
+          "title": "-",
+          "type": "SLIDER"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "NUMBER",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "number"
+    },
+    "TAB_TREE": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "TAB_TREE"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "name",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "NodeDefaultsRef"
+    },
+    "TAGS": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": true
+          },
+          "show": true,
+          "tagsType": {
+            "allowExtension": true,
+            "fetchHandler": [],
+            "joinSeparator": "[]",
+            "maxTagCount": 9999,
+            "tags": []
+          },
+          "title": "-",
+          "type": "TAGS"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "String"
+    },
     "TEXTAREA": {
       "eruptFieldJson": {
         "edit": {
@@ -2707,6 +3593,57 @@ enum Embedded {
       },
       "fieldReturnName": "String"
     },
+    "TRANSFER": {
+      "eruptFieldJson": {
+        "edit": {
+          "cellEdit": true,
+          "desc": "",
+          "notNull": false,
+          "onchange": "OnChange",
+          "placeHolder": "",
+          "readOnly": {
+            "add": false,
+            "allowChange": true,
+            "edit": false
+          },
+          "search": {
+            "lockOperator": false,
+            "notNull": false,
+            "operator": "EQ",
+            "value": false
+          },
+          "show": true,
+          "title": "-",
+          "type": "TRANSFER"
+        },
+        "views": [
+          {
+            "className": "",
+            "column": "name",
+            "desc": "",
+            "export": true,
+            "group": "",
+            "show": true,
+            "sortable": false,
+            "statistic": "NONE",
+            "template": "",
+            "title": "-",
+            "tpl": {
+              "drawerPlacement": "RIGHT",
+              "embedType": "IFRAME",
+              "enable": false,
+              "height": "",
+              "openWay": "MODAL",
+              "path": "",
+              "width": ""
+            },
+            "type": "TEXT",
+            "width": ""
+          }
+        ]
+      },
+      "fieldReturnName": "NodeDefaultsRef"
+    },
     "id": {
       "eruptFieldJson": {
         "edit": {
@@ -2747,6 +3684,7 @@ enum Embedded {
   "power": {
     "add": true,
     "ai": true,
+    "batchEdit": true,
     "cellEdit": true,
     "comment": true,
     "copy": true,
